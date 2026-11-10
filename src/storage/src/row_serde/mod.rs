@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,7 +50,6 @@ pub struct ColumnMapping {
     output_indices: Vec<usize>,
 }
 
-#[allow(clippy::len_without_is_empty)]
 impl ColumnMapping {
     /// Create a mapping with given `table_columns` projected on the `column_ids`.
     pub fn new(output_indices: Vec<usize>) -> Self {
@@ -67,7 +66,7 @@ impl ColumnMapping {
 mod test {
     use std::fmt::Debug;
 
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
     use risingwave_common::types::DataType;
 
     use super::*;
@@ -95,27 +94,27 @@ mod test {
                             data_type: Int64,
                             column_id: #2,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
                             additional_column: AdditionalColumn {
                                 column_type: None,
                             },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                         ColumnDesc {
                             data_type: Int16,
                             column_id: #3,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
                             additional_column: AdditionalColumn {
                                 column_type: None,
                             },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                     ],
                     [
@@ -141,27 +140,27 @@ mod test {
                             data_type: Int64,
                             column_id: #2,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
                             additional_column: AdditionalColumn {
                                 column_type: None,
                             },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                         ColumnDesc {
                             data_type: Varchar,
                             column_id: #1,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
                             additional_column: AdditionalColumn {
                                 column_type: None,
                             },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                     ],
                     [

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
 
 use std::collections::BTreeMap;
 
-use itertools::Itertools as _;
+use anyhow::Context as _;
 use prost_reflect::{DescriptorPool, FileDescriptor, MessageDescriptor};
+use prost_types::FileDescriptorSet;
+use risingwave_connector_codec::common::protobuf::compile_pb;
 
 use super::loader::{LoadedSchema, SchemaLoader};
 use super::schema_registry::Subject;
 use super::{
-    invalid_option_error, InvalidOptionError, SchemaFetchError, MESSAGE_NAME_KEY,
-    SCHEMA_LOCATION_KEY, SCHEMA_REGISTRY_KEY,
+    InvalidOptionError, MESSAGE_NAME_KEY, SCHEMA_LOCATION_KEY, SCHEMA_REGISTRY_KEY,
+    SchemaFetchError, invalid_option_error,
 };
 use crate::connector_common::AwsAuthProps;
 use crate::parser::{EncodingProperties, ProtobufParserConfig, ProtobufProperties};
@@ -34,7 +36,7 @@ pub async fn fetch_descriptor(
 ) -> Result<(MessageDescriptor, Option<i32>), SchemaFetchError> {
     let message_name = format_options
         .get(MESSAGE_NAME_KEY)
-        .ok_or_else(|| invalid_option_error!("{MESSAGE_NAME_KEY} required"))?
+        .ok_or_else(|| invalid_option_error!("`{MESSAGE_NAME_KEY}` is required"))?
         .clone();
     let schema_location = format_options.get(SCHEMA_LOCATION_KEY);
     let schema_registry = format_options.get(SCHEMA_REGISTRY_KEY);
@@ -43,13 +45,13 @@ pub async fn fetch_descriptor(
             return Err(invalid_option_error!(
                 "cannot use {SCHEMA_LOCATION_KEY} and {SCHEMA_REGISTRY_KEY} together"
             )
-            .into())
+            .into());
         }
         (None, None) => {
             return Err(invalid_option_error!(
                 "requires one of {SCHEMA_LOCATION_KEY} or {SCHEMA_REGISTRY_KEY}"
             )
-            .into())
+            .into());
         }
         (None, Some(_)) => {
             let (md, sid) = fetch_from_registry(&message_name, format_options, topic).await?;
@@ -59,14 +61,15 @@ pub async fn fetch_descriptor(
     };
 
     if row_schema_location.starts_with("s3") && aws_auth_props.is_none() {
-        return Err(invalid_option_error!("s3 URL not supported yet").into());
+        return Err(invalid_option_error!("`s3://` schema locations are not supported yet").into());
     }
 
     let enc = EncodingProperties::Protobuf(ProtobufProperties {
-        use_schema_registry: false,
-        row_schema_location,
+        schema_location: crate::parser::SchemaLocation::File {
+            url: row_schema_location,
+            aws_auth_props: aws_auth_props.cloned(),
+        },
         message_name,
-        aws_auth_props: aws_auth_props.cloned(),
         // name_strategy, topic, key_message_name, enable_upsert, client_config
         ..Default::default()
     });
@@ -85,104 +88,56 @@ pub async fn fetch_from_registry(
     format_options: &BTreeMap<String, String>,
     topic: &str,
 ) -> Result<(MessageDescriptor, i32), SchemaFetchError> {
-    let loader = SchemaLoader::from_format_options(topic, format_options)?;
+    let loader = SchemaLoader::from_format_options(topic, format_options).await?;
 
     let (vid, vpb) = loader.load_val_schema::<FileDescriptor>().await?;
+    let vid = match vid {
+        super::SchemaVersion::Confluent(vid) => vid,
+        super::SchemaVersion::Glue(_) => {
+            return Err(invalid_option_error!(
+                "Protobuf with Glue Schema Registry is not supported"
+            )
+            .into());
+        }
+    };
+    let message_descriptor = vpb
+        .parent_pool()
+        .get_message_by_name(message_name)
+        .ok_or_else(|| {
+            invalid_option_error!("message `{message_name}` is not defined in the Protobuf schema")
+        })?;
 
-    Ok((
-        vpb.parent_pool().get_message_by_name(message_name).unwrap(),
-        vid,
-    ))
+    Ok((message_descriptor, vid))
 }
 
 impl LoadedSchema for FileDescriptor {
     fn compile(primary: Subject, references: Vec<Subject>) -> Result<Self, SchemaFetchError> {
         let primary_name = primary.name.clone();
-        match compile_pb(primary, references) {
+
+        match compile_pb_subject(primary, references)
+            .context("failed to compile protobuf schema into fd set")
+        {
             Err(e) => Err(SchemaFetchError::SchemaCompile(e.into())),
-            Ok(b) => {
-                let pool = DescriptorPool::decode(b.as_slice())
-                    .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))?;
-                pool.get_file_by_name(&primary_name).ok_or_else(|| {
-                    SchemaFetchError::SchemaCompile(
-                        anyhow::anyhow!("{primary_name} lost after compilation").into(),
-                    )
+            Ok(fd_set) => DescriptorPool::from_file_descriptor_set(fd_set)
+                .context("failed to convert fd set to descriptor pool")
+                .and_then(|pool| {
+                    pool.get_file_by_name(&primary_name)
+                        .context("file lost after compilation")
                 })
-            }
+                .map_err(|e| SchemaFetchError::SchemaCompile(e.into())),
         }
     }
 }
 
-macro_rules! embed_wkts {
-    [$( $path:literal ),+ $(,)?] => {
-        &[$(
-            (
-                concat!("google/protobuf/", $path),
-                include_bytes!(concat!(env!("PROTO_INCLUDE"), "/google/protobuf/", $path)).as_slice(),
-            )
-        ),+]
-    };
-}
-const WELL_KNOWN_TYPES: &[(&str, &[u8])] = embed_wkts![
-    "any.proto",
-    "api.proto",
-    "compiler/plugin.proto",
-    "descriptor.proto",
-    "duration.proto",
-    "empty.proto",
-    "field_mask.proto",
-    "source_context.proto",
-    "struct.proto",
-    "timestamp.proto",
-    "type.proto",
-    "wrappers.proto",
-];
-
-#[derive(Debug, thiserror::Error)]
-pub enum PbCompileError {
-    #[error("build_file_descriptor_set failed\n{}", errs.iter().map(|e| format!("\t{e}")).join("\n"))]
-    Build {
-        errs: Vec<protobuf_native::compiler::FileLoadError>,
-    },
-    #[error("serialize descriptor set failed")]
-    Serialize,
-}
-
-pub fn compile_pb(
+fn compile_pb_subject(
     primary_subject: Subject,
     dependency_subjects: Vec<Subject>,
-) -> Result<Vec<u8>, PbCompileError> {
-    use std::iter;
-    use std::path::Path;
-
-    use protobuf_native::compiler::{
-        SimpleErrorCollector, SourceTreeDescriptorDatabase, VirtualSourceTree,
-    };
-    use protobuf_native::MessageLite;
-
-    let mut source_tree = VirtualSourceTree::new();
-    for subject in iter::once(&primary_subject).chain(dependency_subjects.iter()) {
-        source_tree.as_mut().add_file(
-            Path::new(&subject.name),
-            subject.schema.content.as_bytes().to_vec(),
-        );
-    }
-    for (path, bytes) in WELL_KNOWN_TYPES {
-        source_tree
-            .as_mut()
-            .add_file(Path::new(path), bytes.to_vec());
-    }
-
-    let mut error_collector = SimpleErrorCollector::new();
-    // `db` needs to be dropped before we can iterate on `error_collector`.
-    let fds = {
-        let mut db = SourceTreeDescriptorDatabase::new(source_tree.as_mut());
-        db.as_mut().record_errors_to(error_collector.as_mut());
-        db.as_mut()
-            .build_file_descriptor_set(&[Path::new(&primary_subject.name)])
-    }
-    .map_err(|_| PbCompileError::Build {
-        errs: error_collector.as_mut().collect(),
-    })?;
-    fds.serialize().map_err(|_| PbCompileError::Serialize)
+) -> Result<FileDescriptorSet, SchemaFetchError> {
+    compile_pb(
+        (primary_subject.name.clone(), primary_subject.schema.content),
+        dependency_subjects
+            .into_iter()
+            .map(|s| (s.name.clone(), s.schema.content)),
+    )
+    .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))
 }

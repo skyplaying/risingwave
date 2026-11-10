@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,22 +14,27 @@
 
 use risingwave_sqlparser::ast::Query;
 
-use crate::binder::Binder;
-use crate::error::{ErrorCode, Result};
+use crate::binder::{Binder, Clause};
+use crate::error::{ErrorCode, Result, bail_bind_error};
 use crate::expr::{ExprImpl, Subquery, SubqueryKind};
 
 impl Binder {
-    pub(super) fn bind_subquery_expr(
-        &mut self,
-        query: Query,
-        kind: SubqueryKind,
-    ) -> Result<ExprImpl> {
-        let query = self.bind_query(query)?;
-        if !matches!(kind, SubqueryKind::Existential) && query.data_types().len() != 1 {
-            return Err(
-                ErrorCode::BindError("Subquery must return only one column".to_string()).into(),
-            );
+    pub fn bind_subquery_expr(&mut self, query: &Query, kind: SubqueryKind) -> Result<ExprImpl> {
+        // A generated column expression is serialized directly without planning, so a subquery
+        // in it can never be unnested.
+        if let Some(clause @ Clause::GeneratedColumn) = self.context.clause {
+            return Err(ErrorCode::InvalidInputSyntax(format!(
+                "subqueries are not allowed in {}",
+                clause
+            ))
+            .into());
         }
-        Ok(Subquery::new(query, kind).into())
+        let query = self.bind_query(query)?;
+        if !matches!(kind, SubqueryKind::Existential | SubqueryKind::UpdateSet)
+            && query.data_types().len() != 1
+        {
+            bail_bind_error!("Subquery must return only one column");
+        }
+        Ok(Subquery::new(query, kind, self.context.scope).into())
     }
 }

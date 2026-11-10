@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 use futures::{Stream, StreamExt, TryStreamExt};
 use futures_async_stream::try_stream;
 use risingwave_common::array::StreamChunk;
 
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::ParserConfig;
-use crate::source::{SourceContextRef, SourceMessage};
+use crate::source::{
+    BoxSourceMessageEventStream, SourceContextRef, SourceMessage, SourceMessageEvent,
+    SourceReaderEvent,
+};
 
 /// Utility function to convert [`SourceMessage`] stream (got from specific connector's [`SplitReader`](super::SplitReader))
 /// into [`StreamChunk`] stream (by invoking [`ByteStreamSourceParserImpl`](crate::parser::ByteStreamSourceParserImpl)).
@@ -28,34 +33,79 @@ pub(crate) async fn into_chunk_stream(
     parser_config: ParserConfig,
     source_ctx: SourceContextRef,
 ) {
+    let event_stream = into_chunk_event_stream(
+        data_stream.map_ok(SourceMessageEvent::Data),
+        parser_config,
+        source_ctx,
+    )
+    .try_filter_map(|event| async move {
+        Ok(match event {
+            SourceReaderEvent::DataChunk(chunk) => Some(chunk),
+            SourceReaderEvent::SplitProgress(_) => None,
+        })
+    });
+    #[for_await]
+    for chunk in event_stream {
+        yield chunk?;
+    }
+}
+
+#[try_stream(boxed, ok = SourceReaderEvent, error = ConnectorError)]
+pub(crate) async fn into_chunk_event_stream(
+    data_stream: impl Stream<Item = ConnectorResult<SourceMessageEvent>> + Send + 'static,
+    parser_config: ParserConfig,
+    source_ctx: SourceContextRef,
+) {
     let actor_id = source_ctx.actor_id.to_string();
     let fragment_id = source_ctx.fragment_id.to_string();
     let source_id = source_ctx.source_id.to_string();
-    let source_name = source_ctx.source_name.to_string();
+    let source_name = source_ctx.source_name.clone();
     let metrics = source_ctx.metrics.clone();
+    let mut partition_input_count = HashMap::new();
+    let mut partition_bytes_count = HashMap::new();
 
     // add metrics to the data stream
     let data_stream = data_stream
-        .inspect_ok(move |data_batch| {
+        .inspect_ok(move |event| {
+            let SourceMessageEvent::Data(data_batch) = event else {
+                return;
+            };
+
             let mut by_split_id = std::collections::HashMap::new();
 
             for msg in data_batch {
+                let split_id: String = msg.split_id.as_ref().to_owned();
                 by_split_id
-                    .entry(msg.split_id.as_ref())
+                    .entry(split_id.clone())
                     .or_insert_with(Vec::new)
                     .push(msg);
+                partition_input_count
+                    .entry(split_id.clone())
+                    .or_insert_with(|| {
+                        metrics.partition_input_count.with_guarded_label_values(&[
+                            &actor_id,
+                            &source_id,
+                            &split_id.clone(),
+                            &source_name,
+                            &fragment_id,
+                        ])
+                    });
+                partition_bytes_count
+                    .entry(split_id.clone())
+                    .or_insert_with(|| {
+                        metrics.partition_input_bytes.with_guarded_label_values(&[
+                            &actor_id,
+                            &source_id,
+                            &split_id,
+                            &source_name,
+                            &fragment_id,
+                        ])
+                    });
             }
-
             for (split_id, msgs) in by_split_id {
-                metrics
-                    .partition_input_count
-                    .with_label_values(&[
-                        &actor_id,
-                        &source_id,
-                        split_id,
-                        &source_name,
-                        &fragment_id,
-                    ])
+                partition_input_count
+                    .get_mut(&split_id)
+                    .unwrap()
                     .inc_by(msgs.len() as u64);
 
                 let sum_bytes = msgs
@@ -63,24 +113,19 @@ pub(crate) async fn into_chunk_stream(
                     .flat_map(|msg| msg.payload.as_ref().map(|p| p.len() as u64))
                     .sum();
 
-                metrics
-                    .partition_input_bytes
-                    .with_label_values(&[
-                        &actor_id,
-                        &source_id,
-                        split_id,
-                        &source_name,
-                        &fragment_id,
-                    ])
+                partition_bytes_count
+                    .get_mut(&split_id)
+                    .unwrap()
                     .inc_by(sum_bytes);
             }
         })
         .boxed();
+    let data_stream: BoxSourceMessageEventStream = data_stream;
 
     let parser =
         crate::parser::ByteStreamSourceParserImpl::create(parser_config, source_ctx).await?;
     #[for_await]
-    for msg_batch in parser.into_stream(data_stream) {
-        yield msg_batch?;
+    for event in parser.parse_stream_with_events(data_stream) {
+        yield event?;
     }
 }

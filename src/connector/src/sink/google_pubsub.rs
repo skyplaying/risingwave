@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::usize;
+use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use google_cloud_gax::conn::Environment;
+use google_cloud_gax::grpc::Status;
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::apiv1;
 use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
@@ -26,30 +26,60 @@ use google_cloud_pubsub::client::{Client, ClientConfig};
 use google_cloud_pubsub::publisher::Publisher;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::catalog::Schema;
-use risingwave_common::session_config::sink_decouple::SinkDecouple;
-use serde_derive::Deserialize;
+use risingwave_common::util::env_var::env_var_is_true;
+use serde::Deserialize;
 use serde_with::serde_as;
-use tonic::Status;
 use with_options::WithOptions;
 
-use super::catalog::desc::SinkDesc;
 use super::catalog::SinkFormatDesc;
 use super::formatter::SinkFormatterImpl;
 use super::log_store::DeliveryFutureManagerAddFuture;
 use super::writer::{
     AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt, FormattedSink,
 };
-use super::{DummySinkCommitCoordinator, Result, Sink, SinkError, SinkParam, SinkWriterParam};
+use super::{Result, Sink, SinkError, SinkParam, SinkWriterParam};
+use crate::connector_common::{DISABLE_DEFAULT_CREDENTIAL, resolve_pubsub_project_id};
 use crate::dispatch_sink_formatter_str_key_impl;
+use crate::enforce_secret::EnforceSecret;
 
 pub const PUBSUB_SINK: &str = "google_pubsub";
+const PUBSUB_SEND_FUTURE_BUFFER_MAX_SIZE: usize = 65536;
+
+mod delivery_future {
+    use anyhow::Context;
+    use futures::future::try_join_all;
+    use futures::{FutureExt, TryFuture, TryFutureExt};
+    use google_cloud_pubsub::publisher::Awaiter;
+
+    use crate::sink::SinkError;
+
+    pub type GooglePubSubSinkDeliveryFuture =
+        impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
+
+    #[define_opaque(GooglePubSubSinkDeliveryFuture)]
+    pub(super) fn may_delivery_future(awaiter: Vec<Awaiter>) -> GooglePubSubSinkDeliveryFuture {
+        try_join_all(awaiter.into_iter().map(|awaiter| {
+            awaiter.get().map(|result| {
+                result
+                    .context("Google Pub/Sub sink error")
+                    .map_err(SinkError::GooglePubSub)
+                    .map(|_| ())
+            })
+        }))
+        .map_ok(|_: Vec<()>| ())
+        .boxed()
+    }
+}
+
+use delivery_future::*;
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, WithOptions)]
 pub struct GooglePubSubConfig {
-    /// The Google Pub/Sub Project ID
+    /// The Google Pub/Sub project ID. If omitted, the connector uses the project ID from
+    /// the credentials or Application Default Credentials.
     #[serde(rename = "pubsub.project_id")]
-    pub project_id: String,
+    pub project_id: Option<String>,
 
     /// Specifies the Pub/Sub topic to publish messages
     #[serde(rename = "pubsub.topic")]
@@ -64,16 +94,29 @@ pub struct GooglePubSubConfig {
     #[serde(rename = "pubsub.emulator_host")]
     pub emulator_host: Option<String>,
 
-    /// A JSON string containing the service account credentials for authorization,
+    /// A JSON string containing the service account credentials for authorization. If omitted,
+    /// the connector uses Google Application Default Credentials (ADC) when allowed by the
+    /// deployment environment.
     /// see the [service-account](https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account) credentials guide.
     /// The provided account credential must have the
     /// `pubsub.publisher` [role](https://cloud.google.com/pubsub/docs/access-control#roles)
     #[serde(rename = "pubsub.credentials")]
     pub credentials: Option<String>,
+
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::HashMap<String, String>,
+}
+
+crate::impl_sink_unknown_fields!(GooglePubSubConfig);
+
+impl EnforceSecret for GooglePubSubConfig {
+    const ENFORCE_SECRET_PROPERTIES: phf::Set<&'static str> = phf::phf_set! {
+        "pubsub.credentials",
+    };
 }
 
 impl GooglePubSubConfig {
-    fn from_hashmap(values: HashMap<String, String>) -> Result<Self> {
+    fn from_btreemap(values: BTreeMap<String, String>) -> Result<Self> {
         serde_json::from_value::<GooglePubSubConfig>(serde_json::to_value(values).unwrap())
             .map_err(|e| SinkError::Config(anyhow!(e)))
     }
@@ -91,19 +134,22 @@ pub struct GooglePubSubSink {
     sink_from_name: String,
 }
 
+impl EnforceSecret for GooglePubSubSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            GooglePubSubConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
 impl Sink for GooglePubSubSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<GooglePubSubSinkWriter>;
 
     const SINK_NAME: &'static str = PUBSUB_SINK;
 
-    fn is_sink_decouple(desc: &SinkDesc, user_specified: &SinkDecouple) -> Result<bool> {
-        match user_specified {
-            SinkDecouple::Default => Ok(desc.sink_type.is_append_only()),
-            SinkDecouple::Disable => Ok(false),
-            SinkDecouple::Enable => Ok(true),
-        }
-    }
+    crate::impl_validate_sink_unknown_fields!();
 
     async fn validate(&self) -> Result<()> {
         if !self.is_append_only {
@@ -113,9 +159,11 @@ impl Sink for GooglePubSubSink {
         }
 
         let conf = &self.config;
-        if matches!((&conf.emulator_host, &conf.credentials), (None, None)) {
+        if matches!((&conf.emulator_host, &conf.credentials), (None, None))
+            && env_var_is_true(DISABLE_DEFAULT_CREDENTIAL)
+        {
             return Err(SinkError::GooglePubSub(anyhow!(
-                "Configure at least one of `pubsub.emulator_host` and `pubsub.credentials` in the Google Pub/Sub sink"
+                "Google Application Default Credentials are disabled; configure `pubsub.credentials` or `pubsub.emulator_host`"
             )));
         }
 
@@ -132,7 +180,7 @@ impl Sink for GooglePubSubSink {
             self.sink_from_name.clone(),
         )
         .await?
-        .into_log_sinker(usize::MAX))
+        .into_log_sinker(PUBSUB_SEND_FUTURE_BUFFER_MAX_SIZE))
     }
 }
 
@@ -141,17 +189,16 @@ impl TryFrom<SinkParam> for GooglePubSubSink {
 
     fn try_from(param: SinkParam) -> std::result::Result<Self, Self::Error> {
         let schema = param.schema();
-        let config = GooglePubSubConfig::from_hashmap(param.properties)?;
-
+        let pk_indices = param.downstream_pk_or_empty();
+        let config = GooglePubSubConfig::from_btreemap(param.properties)?;
         let format_desc = param
             .format_desc
             .ok_or_else(|| SinkError::Config(anyhow!("missing FORMAT ... ENCODE ...")))?;
         Ok(Self {
             config,
             is_append_only: param.sink_type.is_append_only(),
-
             schema,
-            pk_indices: param.downstream_pk,
+            pk_indices,
             format_desc,
             db_name: param.db_name,
             sink_from_name: param.sink_from_name,
@@ -159,8 +206,10 @@ impl TryFrom<SinkParam> for GooglePubSubSink {
     }
 }
 
-struct GooglePubSubPayloadWriter {
-    publisher: Publisher,
+struct GooglePubSubPayloadWriter<'w> {
+    publisher: &'w mut Publisher,
+    message_vec: Vec<PubsubMessage>,
+    add_future: DeliveryFutureManagerAddFuture<'w, GooglePubSubSinkDeliveryFuture>,
 }
 
 impl GooglePubSubSinkWriter {
@@ -172,12 +221,10 @@ impl GooglePubSubSinkWriter {
         db_name: String,
         sink_from_name: String,
     ) -> Result<Self> {
-        let environment = if let Some(ref cred) = config.credentials {
-            let auth_config = project::Config {
-                audience: Some(apiv1::conn_pool::AUDIENCE),
-                scopes: Some(&apiv1::conn_pool::SCOPES),
-                sub: None,
-            };
+        let (environment, detected_project_id) = if let Some(ref cred) = config.credentials {
+            let mut auth_config = project::Config::default();
+            auth_config = auth_config.with_audience(apiv1::conn_pool::AUDIENCE);
+            auth_config = auth_config.with_scopes(&apiv1::conn_pool::SCOPES);
             let cred_file = CredentialsFile::new_from_str(cred).await.map_err(|e| {
                 SinkError::GooglePubSub(
                     anyhow!(e).context("Failed to create Google Cloud Pub/Sub credentials file"),
@@ -193,18 +240,44 @@ impl GooglePubSubSinkWriter {
                             ),
                         )
                     })?;
-            Environment::GoogleCloud(Box::new(provider))
+            let project_id = provider.project_id.clone();
+            (Environment::GoogleCloud(Box::new(provider)), project_id)
         } else if let Some(emu_host) = config.emulator_host {
-            Environment::Emulator(emu_host)
+            (Environment::Emulator(emu_host), None)
         } else {
-            return Err(SinkError::GooglePubSub(anyhow!(
-                "Missing emulator_host or credentials in Google Pub/Sub sink"
-            )));
+            if env_var_is_true(DISABLE_DEFAULT_CREDENTIAL) {
+                return Err(SinkError::GooglePubSub(anyhow!(
+                    "Google Application Default Credentials are disabled; configure `pubsub.credentials` or `pubsub.emulator_host`"
+                )));
+            }
+
+            let auth_config = project::Config::default()
+                .with_audience(apiv1::conn_pool::AUDIENCE)
+                .with_scopes(&apiv1::conn_pool::SCOPES);
+            let provider = DefaultTokenSourceProvider::new(auth_config)
+                .await
+                .map_err(|e| {
+                    SinkError::GooglePubSub(anyhow!(e).context(
+                        "failed to initialize Google Cloud Pub/Sub ADC; provide `pubsub.credentials`, configure ADC, or use `pubsub.emulator_host`",
+                    ))
+                })?;
+            let project_id = provider.project_id.clone();
+            (Environment::GoogleCloud(Box::new(provider)), project_id)
         };
 
+        let project_id = resolve_pubsub_project_id(
+            config.project_id.as_deref(),
+            detected_project_id.as_deref(),
+            matches!(&environment, Environment::Emulator(_)),
+        )
+        .ok_or_else(|| {
+            SinkError::Config(anyhow!(
+                "Google Cloud Pub/Sub project ID is unavailable; configure `pubsub.project_id` or provide credentials/ADC with a project ID"
+            ))
+        })?;
         let client_config = ClientConfig {
             endpoint: config.endpoint,
-            project_id: Some(config.project_id),
+            project_id: Some(project_id),
             environment,
             ..Default::default()
         };
@@ -233,35 +306,51 @@ impl GooglePubSubSinkWriter {
         .await?;
 
         let publisher = topic.new_publisher(None);
-        let payload_writer = GooglePubSubPayloadWriter { publisher };
 
         Ok(Self {
-            payload_writer,
             formatter,
+            publisher,
         })
     }
 }
 
 pub struct GooglePubSubSinkWriter {
-    payload_writer: GooglePubSubPayloadWriter,
     formatter: SinkFormatterImpl,
+    publisher: Publisher,
 }
 
 impl AsyncTruncateSinkWriter for GooglePubSubSinkWriter {
+    type DeliveryFuture = GooglePubSubSinkDeliveryFuture;
+
     async fn write_chunk<'a>(
         &'a mut self,
         chunk: StreamChunk,
-        _add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
+        add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
     ) -> Result<()> {
-        dispatch_sink_formatter_str_key_impl!(
-            &self.formatter,
-            formatter,
-            self.payload_writer.write_chunk(chunk, formatter).await
-        )
+        let mut payload_writer = GooglePubSubPayloadWriter {
+            publisher: &mut self.publisher,
+            message_vec: Vec::with_capacity(chunk.cardinality()),
+            add_future,
+        };
+        dispatch_sink_formatter_str_key_impl!(&self.formatter, formatter, {
+            payload_writer.write_chunk(chunk, formatter).await
+        })?;
+        payload_writer.finish().await
     }
 }
 
-impl FormattedSink for GooglePubSubPayloadWriter {
+impl GooglePubSubPayloadWriter<'_> {
+    pub async fn finish(&mut self) -> Result<()> {
+        let message_vec = std::mem::take(&mut self.message_vec);
+        let awaiters = self.publisher.publish_bulk(message_vec).await;
+        self.add_future
+            .add_future_may_await(may_delivery_future(awaiters))
+            .await?;
+        Ok(())
+    }
+}
+
+impl FormattedSink for GooglePubSubPayloadWriter<'_> {
     type K = String;
     type V = Vec<u8>;
 
@@ -274,13 +363,8 @@ impl FormattedSink for GooglePubSubPayloadWriter {
                     ordering_key,
                     ..Default::default()
                 };
-                let awaiter = self.publisher.publish(msg).await;
-                awaiter
-                    .get()
-                    .await
-                    .context("Google Pub/Sub sink error")
-                    .map_err(SinkError::GooglePubSub)
-                    .map(|_| ())
+                self.message_vec.push(msg);
+                Ok(())
             }
             None => Err(SinkError::GooglePubSub(anyhow!(
                 "Google Pub/Sub sink error: missing value to publish"

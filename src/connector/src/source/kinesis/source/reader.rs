@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
+use aws_sdk_kinesis::Client as KinesisClient;
 use aws_sdk_kinesis::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_kinesis::operation::get_records::{GetRecordsError, GetRecordsOutput};
 use aws_sdk_kinesis::primitives::DateTime;
 use aws_sdk_kinesis::types::ShardIteratorType;
-use aws_sdk_kinesis::Client as KinesisClient;
 use futures_async_stream::try_stream;
 use risingwave_common::bail;
+use risingwave_common::metrics::{LabelGuardedHistogram, LabelGuardedIntCounter};
+use risingwave_common::util::retry::exponential_backoff;
 use thiserror_ext::AsReport;
 
 use crate::error::ConnectorResult as Result;
 use crate::parser::ParserConfig;
+use crate::source::kinesis::KinesisProperties;
 use crate::source::kinesis::source::message::from_kinesis_record;
 use crate::source::kinesis::split::{KinesisOffset, KinesisSplit};
-use crate::source::kinesis::KinesisProperties;
 use crate::source::{
-    into_chunk_stream, BoxChunkSourceStream, Column, SourceContextRef, SourceMessage, SplitId,
-    SplitMetaData, SplitReader,
+    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SplitId, SplitMetaData,
+    SplitReader, into_chunk_stream,
 };
 
 #[derive(Debug, Clone)]
@@ -42,13 +44,22 @@ pub struct KinesisSplitReader {
     shard_id: SplitId,
     latest_offset: Option<String>,
     shard_iter: Option<String>,
-    start_position: KinesisOffset,
+    next_offset: KinesisOffset,
     #[expect(dead_code)]
-    end_position: KinesisOffset,
+    end_offset: KinesisOffset,
 
     split_id: SplitId,
     parser_config: ParserConfig,
     source_ctx: SourceContextRef,
+
+    eof_retry_interval: Duration,
+    error_retry_interval: Duration,
+
+    kinesis_throughput_exceeded_count: LabelGuardedIntCounter,
+    kinesis_timeout_count: LabelGuardedIntCounter,
+    kinesis_rebuild_shard_iter_count: LabelGuardedIntCounter,
+    kinesis_early_terminate_shard_count: LabelGuardedIntCounter,
+    kinesis_lag_latency_ms: LabelGuardedHistogram,
 }
 
 #[async_trait]
@@ -67,35 +78,66 @@ impl SplitReader for KinesisSplitReader {
 
         let split = splits.into_iter().next().unwrap();
 
-        let start_position = match &split.start_position {
+        let next_offset = match &split.next_offset {
             KinesisOffset::None => match &properties.scan_startup_mode {
                 None => KinesisOffset::Earliest,
                 Some(mode) => match mode.as_str() {
                     "earliest" => KinesisOffset::Earliest,
                     "latest" => KinesisOffset::Latest,
                     "timestamp" => {
-                        if let Some(ts) = &properties.timestamp_offset {
+                        if let Some(ts) = &properties.start_timestamp_millis {
                             KinesisOffset::Timestamp(*ts)
                         } else {
                             bail!("scan.startup.timestamp.millis is required");
                         }
                     }
                     _ => {
-                        bail!("invalid scan_startup_mode, accept earliest/latest/timestamp")
+                        bail!("invalid scan.startup.mode, accept earliest/latest/timestamp")
                     }
                 },
             },
-            start_position => start_position.to_owned(),
+            next_offset => next_offset.to_owned(),
         };
 
-        if !matches!(start_position, KinesisOffset::Timestamp(_))
-            && properties.timestamp_offset.is_some()
+        if !matches!(next_offset, KinesisOffset::Timestamp(_))
+            && properties.start_timestamp_millis.is_some()
         {
-            bail!("scan.startup.mode need to be set to 'timestamp' if you want to start with a specific timestamp");
+            // cannot bail! here because all new split readers will fail to start if user set 'scan.startup.mode' to 'timestamp'
+            tracing::warn!(
+                "scan.startup.mode needs to be set to 'timestamp' if you want to start with a specific timestamp, starting shard {} from the beginning",
+                split.id()
+            );
         }
 
         let stream_name = properties.common.stream_name.clone();
         let client = properties.common.build_client().await?;
+
+        let metrics_labels = [
+            source_ctx.source_id.to_string(),
+            source_ctx.source_name.clone(),
+            source_ctx.fragment_id.to_string(),
+            split.shard_id.to_string(),
+        ];
+        let kinesis_throughput_exceeded_count = source_ctx
+            .metrics
+            .kinesis_throughput_exceeded_count
+            .with_guarded_label_values(&metrics_labels);
+        let kinesis_timeout_count = source_ctx
+            .metrics
+            .kinesis_timeout_count
+            .with_guarded_label_values(&metrics_labels);
+        let kinesis_rebuild_shard_iter_count = source_ctx
+            .metrics
+            .kinesis_rebuild_shard_iter_count
+            .with_guarded_label_values(&metrics_labels);
+        let kinesis_early_terminate_shard_count = source_ctx
+            .metrics
+            .kinesis_early_terminate_shard_count
+            .with_guarded_label_values(&metrics_labels);
+        let kinesis_lag_latency_ms = source_ctx
+            .metrics
+            .kinesis_lag_latency_ms
+            .with_guarded_label_values(&metrics_labels);
 
         let split_id = split.id();
         Ok(Self {
@@ -104,15 +146,26 @@ impl SplitReader for KinesisSplitReader {
             shard_id: split.shard_id,
             shard_iter: None,
             latest_offset: None,
-            start_position,
-            end_position: split.end_position,
+            next_offset,
+            end_offset: split.end_offset,
             split_id,
             parser_config,
             source_ctx,
+            eof_retry_interval: Duration::from_millis(
+                properties.reader_config.eof_retry_interval_ms,
+            ),
+            error_retry_interval: Duration::from_millis(
+                properties.reader_config.error_retry_interval_ms,
+            ),
+            kinesis_throughput_exceeded_count,
+            kinesis_timeout_count,
+            kinesis_rebuild_shard_iter_count,
+            kinesis_early_terminate_shard_count,
+            kinesis_lag_latency_ms,
         })
     }
 
-    fn into_stream(self) -> BoxChunkSourceStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
         into_chunk_stream(self.into_data_stream(), parser_config, source_context)
@@ -123,24 +176,60 @@ impl KinesisSplitReader {
     #[try_stream(ok = Vec < SourceMessage >, error = crate::error::ConnectorError)]
     async fn into_data_stream(mut self) {
         self.new_shard_iter().await?;
+        let mut provisioned_throughput_exceeded_start_time: Option<Instant> = None;
+
         loop {
             if self.shard_iter.is_none() {
                 tracing::warn!(
                     "shard iterator is none unexpectedly, may reach the end of shard {}, latest seq {}, retrying in one second",
                     self.shard_id,
-                    self.latest_offset.as_ref().unwrap_or(&"None".to_string())
+                    self.latest_offset.as_ref().unwrap_or(&"None".to_owned())
                 );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(self.eof_retry_interval).await;
                 self.new_shard_iter().await?;
             }
             match self.get_records().await {
                 Ok(resp) => {
+                    self.kinesis_lag_latency_ms
+                        .observe(resp.millis_behind_latest().unwrap_or(0) as f64);
+
                     self.shard_iter = resp.next_shard_iterator().map(String::from);
                     let chunk = (resp.records().iter())
                         .map(|r| from_kinesis_record(r, self.split_id.clone()))
                         .collect::<Vec<SourceMessage>>();
+                    if let Some(shard) = &resp.child_shards
+                        && !shard.is_empty()
+                        && self.shard_iter.is_none()
+                    {
+                        // according to the doc https://docs.rs/aws-sdk-kinesis/latest/aws_sdk_kinesis/operation/get_records/struct.GetRecordsOutput.html
+                        //
+                        // > The list of the current shard's child shards, returned in the GetRecords API's response only when the end of the current shard is reached.
+
+                        // The response will be like:
+                        // {
+                        //     "Records": [], // empty
+                        //     "MillisBehindLatest": 2665000, // non-zero
+                        //     "ChildShards": [...] // non-empty
+                        //     // no NextShardIterator
+                        // }
+
+                        // Other executors are going to read the child shards.
+
+                        if !chunk.is_empty() {
+                            // This should not happen. But be extra safe here.
+                            yield chunk;
+                        }
+
+                        tracing::info!(
+                            "shard {:?} reaches the end and is inactive, stop reading",
+                            self.shard_id
+                        );
+                        self.kinesis_early_terminate_shard_count.inc();
+
+                        break;
+                    }
                     if chunk.is_empty() {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        tokio::time::sleep(self.error_retry_interval).await;
                         continue;
                     }
                     self.latest_offset = Some(chunk.last().unwrap().offset.clone());
@@ -149,6 +238,9 @@ impl KinesisSplitReader {
                         self.shard_id,
                         self.latest_offset
                     );
+
+                    // reset the provisioned throughput exceeded time
+                    provisioned_throughput_exceeded_start_time = None;
                     yield chunk;
                 }
                 Err(SdkError::ServiceError(e)) if e.err().is_resource_not_found_exception() => {
@@ -162,19 +254,29 @@ impl KinesisSplitReader {
                         self.shard_id
                     );
                     self.new_shard_iter().await?;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(self.error_retry_interval).await;
                     continue;
                 }
                 Err(SdkError::ServiceError(e))
                     if e.err().is_provisioned_throughput_exceeded_exception() =>
                 {
-                    tracing::warn!(
-                        "stream {:?} shard {:?} throughput exceeded, retry",
-                        self.stream_name,
-                        self.shard_id
-                    );
+                    self.kinesis_throughput_exceeded_count.inc();
+
+                    if let Some(start_time) = provisioned_throughput_exceeded_start_time
+                        && start_time.elapsed() > Duration::from_secs(5)
+                    {
+                        tracing::warn!(
+                            "stream {:?} shard {:?} has been throttled for {} seconds, retry",
+                            self.stream_name,
+                            self.shard_id,
+                            start_time.elapsed().as_secs()
+                        );
+                    } else if provisioned_throughput_exceeded_start_time.is_none() {
+                        provisioned_throughput_exceeded_start_time = Some(Instant::now());
+                    }
+
                     self.new_shard_iter().await?;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(self.error_retry_interval).await;
                     continue;
                 }
                 Err(SdkError::DispatchFailure(e)) => {
@@ -194,15 +296,28 @@ impl KinesisSplitReader {
                         self.shard_id
                     );
                     self.new_shard_iter().await?;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(self.error_retry_interval).await;
+                    continue;
+                }
+                Err(SdkError::TimeoutError(_)) => {
+                    self.kinesis_timeout_count.inc();
+
+                    // according to sdk doc:
+                    // The request failed due to a timeout. The request MAY have been sent and received.
+                    tracing::warn!(
+                        "shard {:?} request timeout, rolling back to previous offset",
+                        self.shard_id
+                    );
+                    self.new_shard_iter().await?;
+                    tokio::time::sleep(self.error_retry_interval).await;
                     continue;
                 }
                 Err(e) => {
                     let error = anyhow!(e).context(format!(
-                        "Kinesis got a unhandled error on stream {:?}, shard {:?}",
+                        "Kinesis got an unhandled error on stream {:?}, shard {:?}",
                         self.stream_name, self.shard_id
                     ));
-                    tracing::error!(error = %error.as_report());
+                    tracing::warn!(error = %error.as_report()); // change to warn as user has no action to take
                     return Err(error.into());
                 }
             }
@@ -218,9 +333,9 @@ impl KinesisSplitReader {
                 ShardIteratorType::AfterSequenceNumber,
             )
         } else {
-            match &self.start_position {
+            match &self.next_offset {
                 KinesisOffset::Earliest => (None, None, ShardIteratorType::TrimHorizon),
-                KinesisOffset::SequenceNumber(seq) => (
+                KinesisOffset::AfterSequenceNumber(seq) => (
                     Some(seq.clone()),
                     None,
                     ShardIteratorType::AfterSequenceNumber,
@@ -264,7 +379,7 @@ impl KinesisSplitReader {
 
         self.shard_iter = Some(
             tokio_retry::Retry::spawn(
-                tokio_retry::strategy::ExponentialBackoff::from_millis(100).take(3),
+                exponential_backoff(Duration::from_millis(100), 2, Duration::MAX).take(3),
                 || {
                     get_shard_iter_inner(
                         &self.client,
@@ -278,6 +393,8 @@ impl KinesisSplitReader {
             )
             .await?,
         );
+
+        self.kinesis_rebuild_shard_iter_count.inc();
 
         tracing::info!(
             "resetting kinesis to: stream {:?} shard {:?} starting from {:?}",
@@ -302,45 +419,12 @@ impl KinesisSplitReader {
 
 #[cfg(test)]
 mod tests {
-    use futures::{pin_mut, StreamExt};
+    use futures::{StreamExt, pin_mut};
 
     use super::*;
     use crate::connector_common::KinesisCommon;
     use crate::source::SourceContext;
-
-    #[tokio::test]
-    async fn test_reject_redundant_seq_props() {
-        let properties = KinesisProperties {
-            common: KinesisCommon {
-                assume_role_arn: None,
-                credentials_access_key: None,
-                credentials_secret_access_key: None,
-                stream_name: "kinesis_debug".to_string(),
-                stream_region: "cn-northwest-1".to_string(),
-                endpoint: None,
-                session_token: None,
-                assume_role_external_id: None,
-            },
-
-            scan_startup_mode: None,
-            timestamp_offset: Some(123456789098765432),
-
-            unknown_fields: Default::default(),
-        };
-        let client = KinesisSplitReader::new(
-            properties,
-            vec![KinesisSplit {
-                shard_id: "shardId-000000000001".to_string().into(),
-                start_position: KinesisOffset::Earliest,
-                end_position: KinesisOffset::None,
-            }],
-            Default::default(),
-            SourceContext::dummy().into(),
-            None,
-        )
-        .await;
-        assert!(client.is_err());
-    }
+    use crate::source::kinesis::KinesisReaderConfig;
 
     #[tokio::test]
     #[ignore]
@@ -350,15 +434,22 @@ mod tests {
                 assume_role_arn: None,
                 credentials_access_key: None,
                 credentials_secret_access_key: None,
-                stream_name: "kinesis_debug".to_string(),
-                stream_region: "cn-northwest-1".to_string(),
+                stream_name: "kinesis_debug".to_owned(),
+                stream_region: "cn-northwest-1".to_owned(),
                 endpoint: None,
                 session_token: None,
                 assume_role_external_id: None,
+                sdk_connect_timeout_ms: 1000,
+                sdk_read_timeout_ms: 1000,
+                sdk_operation_timeout_ms: 1000,
+                sdk_operation_attempt_timeout_ms: 1000,
+                sdk_max_retry_limit: 3,
+                sdk_init_backoff_ms: 100,
+                sdk_max_backoff_ms: 1000,
             },
-
+            reader_config: KinesisReaderConfig::default(),
             scan_startup_mode: None,
-            timestamp_offset: None,
+            start_timestamp_millis: None,
 
             unknown_fields: Default::default(),
         };
@@ -366,9 +457,9 @@ mod tests {
         let trim_horizen_reader = KinesisSplitReader::new(
             properties.clone(),
             vec![KinesisSplit {
-                shard_id: "shardId-000000000001".to_string().into(),
-                start_position: KinesisOffset::Earliest,
-                end_position: KinesisOffset::None,
+                shard_id: "shardId-000000000001".to_owned().into(),
+                next_offset: KinesisOffset::Earliest,
+                end_offset: KinesisOffset::None,
             }],
             Default::default(),
             SourceContext::dummy().into(),
@@ -382,11 +473,11 @@ mod tests {
         let offset_reader = KinesisSplitReader::new(
             properties.clone(),
             vec![KinesisSplit {
-                shard_id: "shardId-000000000001".to_string().into(),
-                start_position: KinesisOffset::SequenceNumber(
-                    "49629139817504901062972448413535783695568426186596941842".to_string(),
+                shard_id: "shardId-000000000001".to_owned().into(),
+                next_offset: KinesisOffset::AfterSequenceNumber(
+                    "49629139817504901062972448413535783695568426186596941842".to_owned(),
                 ),
-                end_position: KinesisOffset::None,
+                end_offset: KinesisOffset::None,
             }],
             Default::default(),
             SourceContext::dummy().into(),

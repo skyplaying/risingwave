@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 use risingwave_common::array::ArrayError;
 use risingwave_common::error::{BoxedError, NotImplemented};
+use risingwave_common::id::SinkId;
 use risingwave_common::util::value_encoding::error::ValueEncodingError;
 use risingwave_connector::error::ConnectorError;
 use risingwave_connector::sink::SinkError;
@@ -24,8 +25,8 @@ use risingwave_rpc_client::error::RpcError;
 use risingwave_storage::error::StorageError;
 use strum_macros::AsRefStr;
 
-use super::exchange::error::ExchangeChannelClosed;
 use super::Barrier;
+use super::exchange::error::ExchangeChannelClosed;
 
 /// A specialized Result type for streaming executors.
 pub type StreamExecutorResult<T> = std::result::Result<T, StreamExecutorError>;
@@ -66,11 +67,12 @@ pub enum ErrorKind {
         BoxedError,
     ),
 
-    #[error("Sink error: {0}")]
+    #[error("Sink error: sink_id={1}, error: {0}")]
     SinkError(
-        #[from]
+        #[source]
         #[backtrace]
         SinkError,
+        SinkId,
     ),
 
     #[error(transparent)]
@@ -152,6 +154,12 @@ impl From<String> for StreamExecutorError {
     }
 }
 
+impl From<(SinkError, SinkId)> for StreamExecutorError {
+    fn from((err, sink_id): (SinkError, SinkId)) -> Self {
+        ErrorKind::SinkError(err, sink_id).into()
+    }
+}
+
 impl StreamExecutorError {
     pub fn variant_name(&self) -> &str {
         self.0.inner().as_ref()
@@ -172,14 +180,14 @@ mod tests {
 
     #[test]
     #[should_panic]
-    #[ignore]
+    #[ignore = "manual UI check: only prints the error/backtrace for human inspection"]
     fn executor_error_ui_test_1() {
         // For this test, ensure that we have only one backtrace from error when panic.
         func_return_error().unwrap();
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual UI check: only prints the error/backtrace for human inspection"]
     fn executor_error_ui_test_2() {
         // For this test, ensure that we have only one backtrace from error when panic.
         func_return_error().map_err(|e| println!("{:?}", e)).ok();

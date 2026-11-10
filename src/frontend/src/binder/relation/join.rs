@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ use risingwave_sqlparser::ast::{
 
 use crate::binder::bind_context::BindContext;
 use crate::binder::statement::RewriteExprsRecursive;
-use crate::binder::{Binder, Clause, Relation, COLUMN_GROUP_PREFIX};
+use crate::binder::{Binder, COLUMN_GROUP_PREFIX, Clause, Relation};
 use crate::error::{ErrorCode, Result};
-use crate::expr::ExprImpl;
+use crate::expr::{ExprImpl, ScopeId};
 
 #[derive(Debug, Clone)]
 pub struct BoundJoin {
@@ -29,6 +29,9 @@ pub struct BoundJoin {
     pub left: Relation,
     pub right: Relation,
     pub cond: ExprImpl,
+    /// The scope holding the columns of `left` while `right` was bound. References from `right`
+    /// owned by it make this join an `Apply`.
+    pub left_scope: ScopeId,
 }
 
 impl RewriteExprsRecursive for BoundJoin {
@@ -42,9 +45,9 @@ impl RewriteExprsRecursive for BoundJoin {
 impl Binder {
     pub(crate) fn bind_vec_table_with_joins(
         &mut self,
-        from: Vec<TableWithJoins>,
+        from: &[TableWithJoins],
     ) -> Result<Option<Relation>> {
-        let mut from_iter = from.into_iter();
+        let mut from_iter = from.iter();
         let first = match from_iter.next() {
             Some(t) => t,
             None => return Ok(None),
@@ -54,21 +57,17 @@ impl Binder {
         self.pop_and_merge_lateral_context()?;
         for t in from_iter {
             self.push_lateral_context();
-            let right = self.bind_table_with_joins(t.clone())?;
+            let right = self.bind_table_with_joins(t)?;
             self.pop_and_merge_lateral_context()?;
 
-            let is_lateral = match &right {
-                Relation::Subquery(subquery) if subquery.lateral => true,
-                Relation::TableFunction { .. } => true,
-                _ => false,
-            };
-
-            root = if is_lateral {
+            let left_scope = self.context.scope;
+            root = if Self::requires_apply(&right, left_scope) {
                 Relation::Apply(Box::new(BoundJoin {
                     join_type: JoinType::Inner,
                     left: root,
                     right,
                     cond: ExprImpl::literal_bool(true),
+                    left_scope,
                 }))
             } else {
                 Relation::Join(Box::new(BoundJoin {
@@ -76,22 +75,31 @@ impl Binder {
                     left: root,
                     right,
                     cond: ExprImpl::literal_bool(true),
+                    left_scope,
                 }))
             }
         }
         Ok(Some(root))
     }
 
-    pub(crate) fn bind_table_with_joins(&mut self, table: TableWithJoins) -> Result<Relation> {
-        let mut root = self.bind_table_factor(table.relation)?;
-        for join in table.joins {
-            let (constraint, join_type) = match join.join_operator {
+    fn requires_apply(relation: &Relation, left_scope: ScopeId) -> bool {
+        matches!(relation, Relation::Subquery(subquery) if subquery.lateral)
+            || matches!(relation, Relation::TableFunction { .. })
+            || relation.is_correlated_by_scope(left_scope)
+    }
+
+    pub(crate) fn bind_table_with_joins(&mut self, table: &TableWithJoins) -> Result<Relation> {
+        let mut root = self.bind_table_factor(&table.relation)?;
+        for join in &table.joins {
+            let (constraint, join_type) = match &join.join_operator {
                 JoinOperator::Inner(constraint) => (constraint, JoinType::Inner),
                 JoinOperator::LeftOuter(constraint) => (constraint, JoinType::LeftOuter),
                 JoinOperator::RightOuter(constraint) => (constraint, JoinType::RightOuter),
                 JoinOperator::FullOuter(constraint) => (constraint, JoinType::FullOuter),
                 // Cross join equals to inner join with with no constraint.
-                JoinOperator::CrossJoin => (JoinConstraint::None, JoinType::Inner),
+                JoinOperator::CrossJoin => (&JoinConstraint::None, JoinType::Inner),
+                JoinOperator::AsOfInner(constraint) => (constraint, JoinType::AsofInner),
+                JoinOperator::AsOfLeft(constraint) => (constraint, JoinType::AsofLeftOuter),
             };
             let right: Relation;
             let cond: ExprImpl;
@@ -101,24 +109,19 @@ impl Binder {
             ) {
                 let option_rel: Option<Relation>;
                 (cond, option_rel) =
-                    self.bind_join_constraint(constraint, Some(join.relation), join_type)?;
+                    self.bind_join_constraint(constraint, Some(&join.relation), join_type)?;
                 right = option_rel.unwrap();
             } else {
-                right = self.bind_table_factor(join.relation.clone())?;
+                right = self.bind_table_factor(&join.relation)?;
                 (cond, _) = self.bind_join_constraint(constraint, None, join_type)?;
             }
 
-            let is_lateral = match &right {
-                Relation::Subquery(subquery) if subquery.lateral => true,
-                Relation::TableFunction { .. } => true,
-                _ => false,
-            };
-
-            root = if is_lateral {
+            let left_scope = self.context.scope;
+            root = if Self::requires_apply(&right, left_scope) {
                 match join_type {
                     JoinType::Inner | JoinType::LeftOuter => {}
                     _ => {
-                        return Err(ErrorCode::InvalidInputSyntax("The combining JOIN type must be INNER or LEFT for a LATERAL reference.".to_string())
+                        return Err(ErrorCode::InvalidInputSyntax("The combining JOIN type must be INNER or LEFT for a LATERAL reference.".to_owned())
                             .into());
                     }
                 }
@@ -128,6 +131,7 @@ impl Binder {
                     left: root,
                     right,
                     cond,
+                    left_scope,
                 }))
             } else {
                 Relation::Join(Box::new(BoundJoin {
@@ -135,6 +139,7 @@ impl Binder {
                     left: root,
                     right,
                     cond,
+                    left_scope,
                 }))
             };
         }
@@ -144,8 +149,8 @@ impl Binder {
 
     fn bind_join_constraint(
         &mut self,
-        constraint: JoinConstraint,
-        table_factor: Option<TableFactor>,
+        constraint: &JoinConstraint,
+        table_factor: Option<&TableFactor>,
         join_type: JoinType,
     ) -> Result<(ExprImpl, Option<Relation>)> {
         Ok(match constraint {
@@ -163,7 +168,7 @@ impl Binder {
                     JoinConstraint::Natural => None,
                     JoinConstraint::Using(cols) => {
                         // sanity check
-                        for col in &cols {
+                        for col in cols {
                             if !old_context.indices_of.contains_key(&col.real_value()) {
                                 return Err(ErrorCode::ItemNotFound(format!("column \"{}\" specified in USING clause does not exist in left table", col.real_value())).into());
                             }
@@ -181,9 +186,9 @@ impl Binder {
                     .indices_of
                     .iter()
                     .filter(|(_, idxs)| idxs.iter().all(|i| !self.context.columns[*i].is_hidden))
-                    .map(|(s, idxes)| (Ident::new_unchecked(s.to_owned()), idxes))
+                    .map(|(s, idxes)| (Ident::from_real_value(s), idxes))
                     .collect::<Vec<_>>();
-                columns.sort_by(|a, b| a.0.real_value().cmp(&b.0.real_value()));
+                columns.sort_by_key(|a| a.0.real_value());
 
                 let mut col_indices = Vec::new();
                 let mut binary_expr = Expr::Value(Value::Boolean(true));
@@ -234,7 +239,7 @@ impl Binder {
                 self.pop_and_merge_lateral_context()?;
                 // Bind the expression first, before allowing disambiguation of the columns involved
                 // in the join
-                let expr = self.bind_expr(binary_expr)?;
+                let expr = self.bind_expr(&binary_expr)?;
                 for (l, r) in col_indices {
                     let non_nullable = match join_type {
                         JoinType::LeftOuter | JoinType::Inner => Some(l),
@@ -264,14 +269,14 @@ impl Binder {
         column: Ident,
     ) -> Result<Expr> {
         if indices.len() == 1 {
-            let right_table = context.columns[indices[0]].table_name.clone();
+            let right_table = context.columns[indices[0]].table_name.as_ref();
             Ok(Expr::CompoundIdentifier(vec![
-                Ident::new_unchecked(right_table),
+                Ident::from_real_value(right_table),
                 column,
             ]))
         } else if let Some(group_id) = context.column_group_context.mapping.get(&indices[0]) {
             Ok(Expr::CompoundIdentifier(vec![
-                Ident::new_unchecked(format!("{COLUMN_GROUP_PREFIX}{}", group_id)),
+                Ident::from_real_value(&format!("{COLUMN_GROUP_PREFIX}{}", group_id)),
                 column,
             ]))
         } else {

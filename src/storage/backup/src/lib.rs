@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,6 @@
 // limitations under the License.
 
 #![allow(clippy::derive_partial_eq_without_eq)]
-#![feature(trait_alias)]
-#![feature(type_alias_impl_trait)]
-#![feature(extract_if)]
-#![feature(custom_test_frameworks)]
-#![feature(lint_reasons)]
-#![feature(map_try_insert)]
-#![feature(hash_extract_if)]
-#![feature(btree_extract_if)]
-#![feature(lazy_cell)]
-#![feature(let_chains)]
 #![feature(error_generic_member_access)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
@@ -32,13 +22,15 @@ pub mod meta_snapshot_v1;
 pub mod meta_snapshot_v2;
 pub mod storage;
 
-use std::collections::HashSet;
-use std::hash::Hasher;
+use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
+use risingwave_common::RW_VERSION;
+use risingwave_hummock_sdk::state_table_info::StateTableInfo;
 use risingwave_hummock_sdk::version::HummockVersion;
-use risingwave_hummock_sdk::{HummockSstableObjectId, HummockVersionId};
+use risingwave_hummock_sdk::{HummockRawObjectId, HummockVersionId};
 use risingwave_pb::backup_service::{PbMetaSnapshotManifest, PbMetaSnapshotMetadata};
+use risingwave_pb::id::TableId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BackupError, BackupResult};
@@ -51,12 +43,15 @@ pub type MetaBackupJobId = u64;
 pub struct MetaSnapshotMetadata {
     pub id: MetaSnapshotId,
     pub hummock_version_id: HummockVersionId,
-    pub ssts: HashSet<HummockSstableObjectId>,
-    pub max_committed_epoch: u64,
-    pub safe_epoch: u64,
+    // rename to `ssts` for backward compatibility
+    #[serde(rename = "ssts")]
+    pub objects: HashSet<HummockRawObjectId>,
     #[serde(default)]
     pub format_version: u32,
     pub remarks: Option<String>,
+    #[serde(default)]
+    pub state_table_info: HashMap<TableId, StateTableInfo>,
+    pub rw_version: Option<String>,
 }
 
 impl MetaSnapshotMetadata {
@@ -65,15 +60,25 @@ impl MetaSnapshotMetadata {
         v: &HummockVersion,
         format_version: u32,
         remarks: Option<String>,
+        table_change_log_object_ids: impl Iterator<Item = HummockRawObjectId>,
     ) -> Self {
         Self {
             id,
             hummock_version_id: v.id,
-            ssts: v.get_object_ids(),
-            max_committed_epoch: v.max_committed_epoch,
-            safe_epoch: v.safe_epoch,
+            objects: v
+                .get_object_ids()
+                .map(|object_id| object_id.as_raw())
+                .chain(table_change_log_object_ids)
+                .collect(),
             format_version,
             remarks,
+            state_table_info: v
+                .state_table_info
+                .info()
+                .iter()
+                .map(|(id, info)| (*id, info.into()))
+                .collect(),
+            rw_version: Some(RW_VERSION.to_owned()),
         }
     }
 }
@@ -85,11 +90,8 @@ pub struct MetaSnapshotManifest {
     pub snapshot_metadata: Vec<MetaSnapshotMetadata>,
 }
 
-// Code is copied from storage crate. TODO #6482: extract method.
 pub fn xxhash64_checksum(data: &[u8]) -> u64 {
-    let mut hasher = twox_hash::XxHash64::with_seed(0);
-    hasher.write(data);
-    hasher.finish()
+    twox_hash::XxHash64::oneshot(0, data)
 }
 
 pub fn xxhash64_verify(data: &[u8], checksum: u64) -> BackupResult<()> {
@@ -108,10 +110,14 @@ impl From<&MetaSnapshotMetadata> for PbMetaSnapshotMetadata {
         Self {
             id: m.id,
             hummock_version_id: m.hummock_version_id,
-            max_committed_epoch: m.max_committed_epoch,
-            safe_epoch: m.safe_epoch,
             format_version: Some(m.format_version),
             remarks: m.remarks.clone(),
+            state_table_info: m
+                .state_table_info
+                .iter()
+                .map(|(t, i)| ((*t), i.into()))
+                .collect(),
+            rw_version: m.rw_version.clone(),
         }
     }
 }

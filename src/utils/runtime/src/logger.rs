@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,24 +12,67 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::env;
 use std::path::PathBuf;
 
 use either::Either;
-use risingwave_common::metrics::MetricsLayer;
+use fastrace_opentelemetry::OpenTelemetryReporter;
+use opentelemetry::InstrumentationScope;
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::SpanExporter;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::TracerProviderBuilder;
 use risingwave_common::util::deployment::Deployment;
 use risingwave_common::util::env_var::env_var_is_true;
 use risingwave_common::util::query_log::*;
 use risingwave_common::util::tracing::layer::set_toggle_otel_layer_fn;
 use thiserror_ext::AsReport;
 use tracing::level_filters::LevelFilter as Level;
-use tracing_subscriber::filter::{FilterFn, Targets};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::fmt::time::OffsetTime;
-use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter, reload, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter, reload};
+
+/// Parse a comma-separated list of `key=value` pairs into `OpenTelemetry` `KeyValue` attributes.
+///
+/// - Splits by comma to get pairs.
+/// - Each pair must contain exactly one `=`.
+/// - Trims whitespace around key and value.
+/// - Ignores invalid pairs but logs a warning.
+/// - Returns an empty vec for empty or unset input.
+fn parse_extra_tracing_attributes(input: &str) -> Vec<opentelemetry::KeyValue> {
+    use opentelemetry::KeyValue;
+
+    if input.trim().is_empty() {
+        return vec![];
+    }
+
+    input
+        .split(',')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                return None;
+            }
+            let parts: Vec<&str> = pair.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                eprintln!("warning: ignoring invalid tracing attribute pair (no '='): {pair:?}");
+                return None;
+            }
+            let key = parts[0].trim();
+            let value = parts[1].trim();
+            if key.is_empty() {
+                eprintln!("warning: ignoring tracing attribute with empty key: {pair:?}");
+                return None;
+            }
+            Some(KeyValue::new(key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
 
 pub struct LoggerSettings {
     /// The name of the service. Used to identify the service in distributed tracing.
@@ -48,6 +91,8 @@ pub struct LoggerSettings {
     default_level: Option<tracing::metadata::LevelFilter>,
     /// The endpoint of the tracing collector in OTLP gRPC protocol.
     tracing_endpoint: Option<String>,
+    /// Extra key/value attributes to attach to `OpenTelemetry` trace resources.
+    extra_tracing_attributes: Vec<opentelemetry::KeyValue>,
 }
 
 impl Default for LoggerSettings {
@@ -87,6 +132,10 @@ impl LoggerSettings {
             targets: vec![],
             default_level: None,
             tracing_endpoint: std::env::var("RW_TRACING_ENDPOINT").ok(),
+            extra_tracing_attributes: std::env::var("RW_TRACING_EXTRA_ATTRIBUTES")
+                .ok()
+                .map(|v| parse_extra_tracing_attributes(&v))
+                .unwrap_or_default(),
         }
     }
 
@@ -172,7 +221,7 @@ fn disabled_filter() -> filter::Targets {
 /// `RW_QUERY_LOG_TRUNCATE_LEN` configures the max length of the SQLs logged in the query log,
 /// to avoid the log file growing too large. The default value is 1024 in production.
 ///
-/// ### `RW_ENABLE_PRETTY_LOG`
+/// ### `ENABLE_PRETTY_LOG`
 ///
 /// If it is set to `true`, enable pretty log output, which contains line numbers and prints spans in multiple lines.
 /// This can be helpful for development and debugging.
@@ -180,7 +229,7 @@ fn disabled_filter() -> filter::Targets {
 /// Hint: Also turn off other uninteresting logs to make the most of the pretty log.
 /// e.g.,
 /// ```bash
-/// RUST_LOG="risingwave_storage::hummock::event_handler=off,batch_execute=off,risingwave_batch::task=off" RW_ENABLE_PRETTY_LOG=true risedev d
+/// RUST_LOG="risingwave_storage::hummock::event_handler=off,batch_execute=off,risingwave_batch::task=off" ENABLE_PRETTY_LOG=true risedev d
 /// ```
 pub fn init_risingwave_logger(settings: LoggerSettings) {
     let deployment = Deployment::current();
@@ -201,9 +250,10 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
     let default_filter = {
         let mut filter = filter::Targets::new();
 
-        // Configure levels for some RisingWave crates.
+        // Configure levels for some RisingWave crates. Can still be overridden by `RUST_LOG`.
         // Other RisingWave crates like `stream` and `storage` will follow the default level.
         filter = filter
+            .with_target("auto_schema_change", Level::INFO)
             .with_target("risingwave_sqlparser", Level::INFO)
             .with_target("risingwave_connector_node", Level::INFO)
             .with_target("pgwire", Level::INFO)
@@ -211,7 +261,8 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             // debug-purposed events are disabled unless `RUST_LOG` overrides
             .with_target("events", Level::OFF);
 
-        // Configure levels for external crates.
+        // Configure levels for external crates. Can still be overridden by `RUST_LOG`.
+        // Other external crates will follow the default level.
         filter = filter
             .with_target("foyer", Level::INFO)
             .with_target("aws", Level::INFO)
@@ -228,7 +279,11 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             .with_target("sled", Level::INFO)
             .with_target("cranelift", Level::INFO)
             .with_target("wasmtime", Level::INFO)
-            .with_target("sqlx", Level::WARN);
+            .with_target("sqlx", Level::WARN)
+            .with_target("opendal", Level::INFO)
+            .with_target("reqsign", Level::INFO)
+            .with_target("jni", Level::INFO)
+            .with_target("async_nats", Level::WARN);
 
         // For all other crates, apply default level depending on the deployment and `debug_assertions` flag.
         let default_level = match deployment {
@@ -280,16 +335,13 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             });
 
         let fmt_layer = match deployment {
-            Deployment::Ci => fmt_layer
-                .compact()
-                .with_filter(FilterFn::new(|metadata| metadata.is_event())) // filter-out all span-related info
-                .boxed(),
+            Deployment::Ci => fmt_layer.compact().boxed(),
             Deployment::Cloud => fmt_layer
                 .json()
                 .map_event_format(|e| e.with_current_span(false)) // avoid duplication as there's a span list field
                 .boxed(),
             Deployment::Other => {
-                if env_var_is_true("RW_ENABLE_PRETTY_LOG") {
+                if env_var_is_true("ENABLE_PRETTY_LOG") {
                     fmt_layer.pretty().boxed()
                 } else {
                     fmt_layer.boxed()
@@ -413,7 +465,6 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
 
         use opentelemetry::KeyValue;
         use opentelemetry_otlp::WithExportConfig;
-        use opentelemetry_sdk as sdk;
         use opentelemetry_semantic_conventions::resource;
 
         let id = format!(
@@ -425,7 +476,18 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             std::process::id()
         );
 
-        let otel_tracer = {
+        let extra_attributes = &settings.extra_tracing_attributes;
+        if !extra_attributes.is_empty() {
+            println!(
+                "extra tracing resource attributes: {:?}",
+                extra_attributes
+                    .iter()
+                    .map(|kv| format!("{}={}", kv.key, kv.value))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let (otel_tracer, exporter) = {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("rw-otel")
@@ -437,26 +499,39 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             // Installing the exporter requires a tokio runtime.
             let _entered = runtime.enter();
 
-            opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(
-                    opentelemetry_otlp::new_exporter()
-                        .tonic()
-                        .with_endpoint(endpoint),
+            // TODO(bugen): better service name
+            // https://github.com/jaegertracing/jaeger-ui/issues/336
+            let service_name = format!("{}-{}", settings.name, id);
+
+            let mut resource_attrs = vec![
+                KeyValue::new(resource::SERVICE_NAME, service_name.clone()),
+                KeyValue::new(resource::SERVICE_INSTANCE_ID, id.clone()),
+                KeyValue::new(resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+                KeyValue::new(resource::PROCESS_PID, std::process::id().to_string()),
+            ];
+            resource_attrs.extend(extra_attributes.iter().cloned());
+
+            let otel_tracer = TracerProviderBuilder::default()
+                .with_batch_exporter(
+                    SpanExporter::builder()
+                        .with_tonic()
+                        .with_endpoint(&endpoint)
+                        .build()
+                        .unwrap(),
                 )
-                .with_trace_config(sdk::trace::config().with_resource(sdk::Resource::new([
-                    KeyValue::new(
-                        resource::SERVICE_NAME,
-                        // TODO(bugen): better service name
-                        // https://github.com/jaegertracing/jaeger-ui/issues/336
-                        format!("{}-{}", settings.name, id),
-                    ),
-                    KeyValue::new(resource::SERVICE_INSTANCE_ID, id),
-                    KeyValue::new(resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-                    KeyValue::new(resource::PROCESS_PID, std::process::id().to_string()),
-                ])))
-                .install_batch(sdk::runtime::Tokio)
-                .unwrap()
+                .with_resource(Resource::builder().with_attributes(resource_attrs).build())
+                .build()
+                .tracer(service_name);
+
+            let exporter = SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(&endpoint)
+                .with_protocol(opentelemetry_otlp::Protocol::Grpc)
+                .with_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+                .build()
+                .unwrap();
+
+            (otel_tracer, exporter)
         };
 
         // Disable by filtering out all events or spans by default.
@@ -492,14 +567,110 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             .with_filter(reload_filter);
 
         layers.push(layer.boxed());
+
+        // The reporter is used by fastrace in foyer for dynamically tail-based tracing.
+        //
+        // Code here only setup the OpenTelemetry reporter. To enable/disable the function, please use risectl.
+        //
+        // e.g.
+        //
+        // ```bash
+        // risectl hummock tiered-cache-tracing -h
+        // ```
+        let mut fastrace_resource_attrs: Vec<opentelemetry::KeyValue> =
+            vec![opentelemetry::KeyValue::new(
+                opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                format!("fastrace-{id}"),
+            )];
+        fastrace_resource_attrs.extend(extra_attributes.iter().cloned());
+
+        let reporter = OpenTelemetryReporter::new(
+            exporter,
+            Cow::Owned(
+                Resource::builder()
+                    .with_attributes(fastrace_resource_attrs)
+                    .build(),
+            ),
+            InstrumentationScope::builder("opentelemetry-instrumentation-foyer").build(),
+        );
+        fastrace::set_reporter(reporter, fastrace::collector::Config::default());
+        tracing::info!("opentelemetry exporter for fastrace is set at {endpoint}");
     }
 
-    // Metrics layer
-    {
-        let filter = filter::Targets::new().with_target("aws_smithy_client::retry", Level::DEBUG);
-
-        layers.push(Box::new(MetricsLayer::new().with_filter(filter)));
-    }
     tracing_subscriber::registry().with(layers).init();
     // TODO: add file-appender tracing subscriber in the future
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_normal() {
+        let attrs =
+            parse_extra_tracing_attributes("cluster=prod,region=us-east-1,namespace=terry-dev");
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs[0].key.as_str(), "cluster");
+        assert_eq!(attrs[0].value.as_str(), "prod");
+        assert_eq!(attrs[1].key.as_str(), "region");
+        assert_eq!(attrs[1].value.as_str(), "us-east-1");
+        assert_eq!(attrs[2].key.as_str(), "namespace");
+        assert_eq!(attrs[2].value.as_str(), "terry-dev");
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_whitespace() {
+        let attrs = parse_extra_tracing_attributes("  key1 = val1 , key2=val2  ");
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].key.as_str(), "key1");
+        assert_eq!(attrs[0].value.as_str(), "val1");
+        assert_eq!(attrs[1].key.as_str(), "key2");
+        assert_eq!(attrs[1].value.as_str(), "val2");
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_empty() {
+        assert!(parse_extra_tracing_attributes("").is_empty());
+        assert!(parse_extra_tracing_attributes("  ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_invalid_pairs() {
+        // No '=' sign — should be skipped
+        let attrs = parse_extra_tracing_attributes("good=value,badpair,also_good=123");
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].key.as_str(), "good");
+        assert_eq!(attrs[1].key.as_str(), "also_good");
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_empty_key() {
+        // "=value" has empty key — should be skipped
+        let attrs = parse_extra_tracing_attributes("=value,key=val");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].key.as_str(), "key");
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_value_with_equals() {
+        // value itself contains '=' — only first '=' is the delimiter
+        let attrs = parse_extra_tracing_attributes("expr=a=b");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].key.as_str(), "expr");
+        assert_eq!(attrs[0].value.as_str(), "a=b");
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_trailing_comma() {
+        let attrs = parse_extra_tracing_attributes("k1=v1,k2=v2,");
+        assert_eq!(attrs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_extra_tracing_attributes_empty_value() {
+        let attrs = parse_extra_tracing_attributes("key=");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].key.as_str(), "key");
+        assert_eq!(attrs[0].value.as_str(), "");
+    }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,11 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use reqwest::Method;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_derive::Deserialize;
 use url::{ParseError, Url};
 
-use crate::schema::{bail_invalid_option_error, InvalidOptionError};
+use crate::schema::{InvalidOptionError, bail_invalid_option_error};
 
 pub fn handle_sr_list(addr: &str) -> Result<Vec<Url>, InvalidOptionError> {
     let segment = addr.split(',').collect::<Vec<&str>>();
@@ -45,19 +45,23 @@ pub fn handle_sr_list(addr: &str) -> Result<Vec<Url>, InvalidOptionError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireFormatError {
-    #[error("fail to match a magic byte of 0")]
+    #[error("failed to match the magic byte 0")]
     NoMagic,
-    #[error("fail to read 4-byte schema ID")]
+    #[error("failed to read the 4-byte schema ID")]
     NoSchemaId,
     #[error("failed to parse message indexes")]
     ParseMessageIndexes,
 }
 
-/// extract the magic number and `schema_id` at the front of payload
+/// Returns `(schema_id, payload)`
 ///
-/// 0 -> magic number
-/// 1-4 -> schema id
-/// 5-... -> message payload
+/// Refer to [Confluent schema registry wire format](https://docs.confluent.io/platform/7.6/schema-registry/fundamentals/serdes-develop/index.html#wire-format)
+///
+/// | Bytes | Area        | Description                                                                                        |
+/// |-------|-------------|----------------------------------------------------------------------------------------------------|
+/// | 0     | Magic Byte  | Confluent serialization format version number; currently always `0`.                               |
+/// | 1-4   | Schema ID   | 4-byte schema ID as returned by Schema Registry.                                                   |
+/// | 5-... | Data        | Serialized data for the specified schema format (for example, binary encoding for Avro or Protobuf.|
 pub(crate) fn extract_schema_id(payload: &[u8]) -> Result<(i32, &[u8]), WireFormatError> {
     use byteorder::{BigEndian, ReadBytesExt as _};
 
@@ -100,7 +104,6 @@ where
 {
     url.path_segments_mut()
         .expect("constructor validated URL can be a base")
-        .clear()
         .extend(&ctx.path);
     tracing::debug!("request to url: {}, method {}", &url, &method);
     let mut request_builder = ctx.client.request(method, url);
@@ -150,6 +153,7 @@ pub struct Subject {
 #[derive(Debug, Deserialize)]
 pub struct SchemaReference {
     /// The name of the reference.
+    #[expect(dead_code)]
     pub name: String,
     /// The subject that the referenced schema belongs to
     pub subject: String,

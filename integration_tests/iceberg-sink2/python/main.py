@@ -66,6 +66,7 @@ def init_risingwave_mv(docker):
     sink_config = config['sink']
     sink_param = ",\n".join([f"{k}='{v}'" for k, v in sink_config.items()])
     sqls = [
+        "set sink_decouple = false",
         "set streaming_parallelism = 4",
         """
         CREATE SOURCE bid (
@@ -136,7 +137,8 @@ def run_case(case):
 
 
 if __name__ == "__main__":
-    case_names = ["rest", "storage", "jdbc", "hive"]
+    # Hive case is temporarily skipped due unstable metastore bootstrap in CI.
+    case_names = ["rest", "storage", "jdbc"]
     for case_name in case_names:
         print(f"Running test case: {case_name}")
         run_case(case_name)

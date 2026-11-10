@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Write;
-
-use chrono::LocalResult;
+use chrono::{LocalResult, Utc};
+use chrono_tz::Tz;
 use num_traits::CheckedNeg;
 use risingwave_common::types::{
-    write_date_time_tz, CheckedAdd, Interval, IntoOrdered, Timestamp, Timestamptz, F64,
+    CheckedAdd, F64, Interval, IntoOrdered, Timestamp, Timestamptz, write_date_time_tz,
 };
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 use thiserror_ext::AsReport;
 
 /// Just a wrapper to reuse the `map_err` logic.
@@ -31,6 +30,15 @@ pub fn time_zone_err(inner_err: String) -> ExprError {
     }
 }
 
+/// Returns the wall-clock timestamp at evaluation time.
+///
+/// `volatile` tells the function registry this result can change across evaluations with the same
+/// inputs, so stream planning treats it as an impure expression.
+#[function("clock_timestamp() -> timestamptz", volatile)]
+fn clock_timestamp() -> Timestamptz {
+    Utc::now().into()
+}
+
 #[function("sec_to_timestamptz(float8) -> timestamptz")]
 pub fn f64_sec_to_timestamptz(elem: F64) -> Result<Timestamptz> {
     // TODO(#4515): handle +/- infinity
@@ -38,12 +46,28 @@ pub fn f64_sec_to_timestamptz(elem: F64) -> Result<Timestamptz> {
         .into_ordered()
         .try_into()
         .map_err(|_| ExprError::NumericOutOfRange)?;
-    Ok(Timestamptz::from_micros(micros))
+    Timestamptz::from_micros(micros).ok_or(ExprError::NumericOutOfRange)
+}
+
+#[function("at_time_zone(timestamptz, varchar) -> timestamp")]
+pub fn timestamptz_at_time_zone(input: Timestamptz, time_zone: &str) -> Result<Timestamp> {
+    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    Ok(timestamptz_at_time_zone_internal(input, time_zone))
+}
+
+pub fn timestamptz_at_time_zone_internal(input: Timestamptz, time_zone: Tz) -> Timestamp {
+    let instant_local = input.to_datetime_in_zone(time_zone);
+    let naive = instant_local.naive_local();
+    Timestamp(naive)
 }
 
 #[function("at_time_zone(timestamp, varchar) -> timestamptz")]
 pub fn timestamp_at_time_zone(input: Timestamp, time_zone: &str) -> Result<Timestamptz> {
     let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    timestamp_at_time_zone_internal(input, time_zone)
+}
+
+pub fn timestamp_at_time_zone_internal(input: Timestamp, time_zone: Tz) -> Result<Timestamptz> {
     // https://www.postgresql.org/docs/current/datetime-invalid-input.html
     let instant_local = match input.0.and_local_timezone(time_zone) {
         LocalResult::Single(t) => t,
@@ -69,14 +93,14 @@ pub fn timestamp_at_time_zone(input: Timestamp, time_zone: &str) -> Result<Times
         LocalResult::Ambiguous(_, latest) => latest,
     };
     let usec = instant_local.timestamp_micros();
-    Ok(Timestamptz::from_micros(usec))
+    Ok(Timestamptz::from_micros_uncheck(usec))
 }
 
 #[function("cast_with_time_zone(timestamptz, varchar) -> varchar")]
 pub fn timestamptz_to_string(
     elem: Timestamptz,
     time_zone: &str,
-    writer: &mut impl Write,
+    writer: &mut impl std::fmt::Write,
 ) -> Result<()> {
     let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
     let instant_local = elem.to_datetime_in_zone(time_zone);
@@ -94,14 +118,6 @@ pub fn str_to_timestamptz(elem: &str, time_zone: &str) -> Result<Timestamptz> {
             time_zone,
         )
     })
-}
-
-#[function("at_time_zone(timestamptz, varchar) -> timestamp")]
-pub fn timestamptz_at_time_zone(input: Timestamptz, time_zone: &str) -> Result<Timestamp> {
-    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
-    let instant_local = input.to_datetime_in_zone(time_zone);
-    let naive = instant_local.naive_local();
-    Ok(Timestamp(naive))
 }
 
 /// This operation is zone agnostic.
@@ -136,6 +152,15 @@ pub fn timestamptz_interval_add(
     interval: Interval,
     time_zone: &str,
 ) -> Result<Timestamptz> {
+    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    timestamptz_interval_add_internal(input, interval, time_zone)
+}
+
+pub fn timestamptz_interval_add_internal(
+    input: Timestamptz,
+    interval: Interval,
+    time_zone: Tz,
+) -> Result<Timestamptz> {
     use num_traits::Zero as _;
 
     // A month may have 28-31 days, a day may have 23 or 25 hours during Daylight Saving switch.
@@ -148,11 +173,11 @@ pub fn timestamptz_interval_add(
     if !qualitative.is_zero() {
         // Only convert into and from naive local when necessary because it is lossy.
         // See `e2e_test/batch/functions/issue_12072.slt.part` for the difference.
-        let naive = timestamptz_at_time_zone(t, time_zone)?;
+        let naive = timestamptz_at_time_zone_internal(t, time_zone);
         let naive = naive
             .checked_add(qualitative)
             .ok_or(ExprError::NumericOverflow)?;
-        t = timestamp_at_time_zone(naive, time_zone)?;
+        t = timestamp_at_time_zone_internal(naive, time_zone)?;
     }
     let t = timestamptz_interval_quantitative(t, quantitative, i64::checked_add)?;
     Ok(t)
@@ -189,7 +214,7 @@ fn timestamptz_interval_quantitative(
     }
     let delta_usecs = r.usecs();
     let usecs = f(l.timestamp_micros(), delta_usecs).ok_or(ExprError::NumericOutOfRange)?;
-    Ok(Timestamptz::from_micros(usecs))
+    Timestamptz::from_micros(usecs).ok_or(ExprError::NumericOutOfRange)
 }
 
 #[cfg(test)]
@@ -291,13 +316,13 @@ mod tests {
 
     #[test]
     fn test_timestamptz_to_and_from_string() {
-        let str1 = "1600-11-15 15:35:40.999999+08:00";
+        let str1 = "0001-11-15 15:35:40.999999+08:00";
         let timestamptz1 = str_to_timestamptz(str1, "UTC").unwrap();
-        assert_eq!(timestamptz1.timestamp_micros(), -11648507059000001);
+        assert_eq!(timestamptz1.timestamp_micros(), -62108094259000001);
 
         let mut writer = String::new();
         timestamptz_to_string(timestamptz1, "UTC", &mut writer).unwrap();
-        assert_eq!(writer, "1600-11-15 07:35:40.999999+00:00");
+        assert_eq!(writer, "0001-11-15 07:35:40.999999+00:00");
 
         let str2 = "1969-12-31 23:59:59.999999+00:00";
         let timestamptz2 = str_to_timestamptz(str2, "UTC").unwrap();

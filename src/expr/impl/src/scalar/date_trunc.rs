@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use risingwave_common::types::{Interval, Timestamp, Timestamptz};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 use super::timestamptz::timestamp_at_time_zone;
 
@@ -79,7 +79,9 @@ pub fn date_trunc_timestamptz_at_timezone(
             let fixed = instant_local.offset().fix();
             // `unwrap` is okay because `FixedOffset` always returns single unique conversion result.
             let truncated_local = truncated_naive.0.and_local_timezone(fixed).unwrap();
-            Ok(Timestamptz::from_micros(truncated_local.timestamp_micros()))
+            Ok(Timestamptz::from_micros_uncheck(
+                truncated_local.timestamp_micros(),
+            ))
         }
         _ => timestamp_at_time_zone(truncated_naive, timezone),
     }

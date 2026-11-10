@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -99,22 +99,14 @@ impl BoolAndUpdatable {
     // state is the number of false values
 
     fn accumulate(&self, state: i64, input: bool) -> i64 {
-        if input {
-            state
-        } else {
-            state + 1
-        }
+        if input { state } else { state + 1 }
     }
 
     fn retract(&self, state: i64, input: bool) -> i64 {
-        if input {
-            state
-        } else {
-            state - 1
-        }
+        if input { state } else { state - 1 }
     }
 
-    #[allow(dead_code)] // TODO: support merge
+    #[expect(dead_code)] // TODO: support merge
     fn merge(&self, state1: i64, state2: i64) -> i64 {
         state1 + state2
     }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
 
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::services::Oss;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
 
-use super::{EngineType, OpendalObjectStore};
+use super::{MediaType, OpendalObjectStore, new_operator};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
 
 impl OpendalObjectStore {
     /// create opendal oss engine.
@@ -28,13 +29,10 @@ impl OpendalObjectStore {
         bucket: String,
         root: String,
         config: Arc<ObjectStoreConfig>,
+        metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Create oss backend builder.
-        let mut builder = Oss::default();
-
-        builder.bucket(&bucket);
-
-        builder.root(&root);
+        let mut builder = Oss::default().bucket(&bucket).root(&root);
 
         let endpoint = std::env::var("OSS_ENDPOINT")
             .unwrap_or_else(|_| panic!("OSS_ENDPOINT not found from environment variables"));
@@ -44,17 +42,21 @@ impl OpendalObjectStore {
             panic!("OSS_ACCESS_KEY_SECRET not found from environment variables")
         });
 
-        builder.endpoint(&endpoint);
-        builder.access_key_id(&access_key_id);
-        builder.access_key_secret(&access_key_secret);
+        builder = builder
+            .endpoint(&endpoint)
+            .access_key_id(&access_key_id)
+            .access_key_secret(&access_key_secret);
 
-        let op: Operator = Operator::new(builder)?
-            .layer(LoggingLayer::default())
-            .finish();
+        let op = new_operator(
+            &config,
+            Operator::new(builder)?.layer(LoggingLayer::default()),
+        );
+
         Ok(Self {
             op,
-            engine_type: EngineType::Oss,
+            media_type: MediaType::Oss,
             config,
+            metrics,
         })
     }
 }

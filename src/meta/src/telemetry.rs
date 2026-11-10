@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,19 @@
 
 use prost::Message;
 use risingwave_common::config::MetaBackend;
+use risingwave_common::id::TableId;
 use risingwave_common::telemetry::pb_compatible::TelemetryToProtobuf;
 use risingwave_common::telemetry::report::{TelemetryInfoFetcher, TelemetryReportCreator};
 use risingwave_common::telemetry::{
-    current_timestamp, SystemData, TelemetryNodeType, TelemetryReportBase, TelemetryResult,
+    SystemData, TelemetryNodeType, TelemetryReportBase, TelemetryResult, current_timestamp,
+    report_event_common, telemetry_cluster_type_from_env_var,
 };
 use risingwave_common::{GIT_SHA, RW_VERSION};
+use risingwave_license::LicenseManager;
 use risingwave_pb::common::WorkerType;
+use risingwave_pb::telemetry::{
+    PbTelemetryClusterType, PbTelemetryDatabaseObject, PbTelemetryEventStage,
+};
 use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport;
 
@@ -28,6 +34,25 @@ use crate::manager::MetadataManager;
 use crate::model::ClusterId;
 
 const TELEMETRY_META_REPORT_TYPE: &str = "meta";
+
+pub(crate) fn report_event(
+    event_stage: PbTelemetryEventStage,
+    event_name: &str,
+    catalog_id: i64,
+    connector_name: Option<String>,
+    component: Option<PbTelemetryDatabaseObject>,
+    attributes: Option<jsonbb::Value>, // any json string
+) {
+    report_event_common(
+        event_stage,
+        event_name,
+        catalog_id,
+        connector_name,
+        component,
+        attributes,
+        TELEMETRY_META_REPORT_TYPE.to_owned(),
+    );
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NodeCount {
@@ -51,7 +76,7 @@ pub enum PlanOptimization {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MetaTelemetryJobDesc {
-    pub table_id: i32,
+    pub table_id: TableId,
     pub connector: Option<String>,
     pub optimization: Vec<PlanOptimization>,
 }
@@ -62,16 +87,21 @@ pub struct MetaTelemetryReport {
     base: TelemetryReportBase,
     node_count: NodeCount,
     streaming_job_count: u64,
-    // At this point, it will always be etcd, but we will enable telemetry when using memory.
     meta_backend: MetaBackend,
     rw_version: RwVersion,
     job_desc: Vec<MetaTelemetryJobDesc>,
+
+    // Get the ENV from key `TELEMETRY_CLUSTER_TYPE`
+    cluster_type: PbTelemetryClusterType,
+    object_store_media_type: &'static str,
+    connector_usage_json_str: String,
+    license_info_json_str: String,
 }
 
 impl From<MetaTelemetryJobDesc> for risingwave_pb::telemetry::StreamJobDesc {
     fn from(val: MetaTelemetryJobDesc) -> Self {
         risingwave_pb::telemetry::StreamJobDesc {
-            table_id: val.table_id,
+            table_id: val.table_id.as_i32_id(),
             connector_name: val.connector,
             plan_optimizations: val
                 .optimization
@@ -92,9 +122,11 @@ impl TelemetryToProtobuf for MetaTelemetryReport {
         let pb_report = risingwave_pb::telemetry::MetaReport {
             base: Some(self.base.into()),
             meta_backend: match self.meta_backend {
-                MetaBackend::Etcd => risingwave_pb::telemetry::MetaBackend::Etcd as i32,
                 MetaBackend::Mem => risingwave_pb::telemetry::MetaBackend::Memory as i32,
-                MetaBackend::Sql => risingwave_pb::telemetry::MetaBackend::Rdb as i32,
+                MetaBackend::Sql
+                | MetaBackend::Sqlite
+                | MetaBackend::Postgres
+                | MetaBackend::Mysql => risingwave_pb::telemetry::MetaBackend::Rdb as i32,
             },
             node_count: Some(risingwave_pb::telemetry::NodeCount {
                 meta: self.node_count.meta_count as u32,
@@ -108,6 +140,10 @@ impl TelemetryToProtobuf for MetaTelemetryReport {
             }),
             stream_job_count: self.streaming_job_count as u32,
             stream_jobs: self.job_desc.into_iter().map(|job| job.into()).collect(),
+            cluster_type: self.cluster_type as i32,
+            object_store_media_type: self.object_store_media_type.to_owned(),
+            connector_usage_json_str: self.connector_usage_json_str,
+            license_info_json_str: self.license_info_json_str,
         };
         pb_report.encode_to_vec()
     }
@@ -126,6 +162,10 @@ impl MetaTelemetryInfoFetcher {
 #[async_trait::async_trait]
 impl TelemetryInfoFetcher for MetaTelemetryInfoFetcher {
     async fn fetch_telemetry_info(&self) -> TelemetryResult<Option<String>> {
+        // the err here means building cluster on test env, so we don't need to report telemetry
+        if telemetry_cluster_type_from_env_var().is_err() {
+            return Ok(None);
+        }
         Ok(Some(self.tracking_id.clone().into()))
     }
 }
@@ -133,21 +173,20 @@ impl TelemetryInfoFetcher for MetaTelemetryInfoFetcher {
 #[derive(Clone)]
 pub struct MetaReportCreator {
     metadata_manager: MetadataManager,
-    meta_backend: MetaBackend,
+    object_store_media_type: &'static str,
 }
 
 impl MetaReportCreator {
-    pub fn new(metadata_manager: MetadataManager, meta_backend: MetaBackend) -> Self {
+    pub fn new(metadata_manager: MetadataManager, object_store_media_type: &'static str) -> Self {
         Self {
             metadata_manager,
-            meta_backend,
+            object_store_media_type,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl TelemetryReportCreator for MetaReportCreator {
-    #[expect(refining_impl_trait)]
     async fn create_report(
         &self,
         tracking_id: String,
@@ -170,11 +209,26 @@ impl TelemetryReportCreator for MetaReportCreator {
             .list_stream_job_desc()
             .await
             .map_err(|err| err.as_report().to_string())?;
+        let connector_usage = self
+            .metadata_manager
+            .catalog_controller
+            .get_connector_usage()
+            .await
+            .map_err(|err| err.as_report().to_string())?
+            .to_string();
+
+        let license_info_json_str = match LicenseManager::get().license() {
+            Ok(license) => serde_json::to_string(&license).unwrap(),
+            Err(err) => serde_json::json!({
+                "error": err.to_report_string(),
+            })
+            .to_string(),
+        };
 
         Ok(MetaTelemetryReport {
             rw_version: RwVersion {
-                version: RW_VERSION.to_string(),
-                git_sha: GIT_SHA.to_string(),
+                version: RW_VERSION.to_owned(),
+                git_sha: GIT_SHA.to_owned(),
             },
             base: TelemetryReportBase {
                 tracking_id,
@@ -192,62 +246,17 @@ impl TelemetryReportCreator for MetaReportCreator {
                 compactor_count: *node_map.get(&WorkerType::Compactor).unwrap_or(&0),
             },
             streaming_job_count,
-            meta_backend: self.meta_backend,
+            meta_backend: MetaBackend::Sql,
             job_desc: stream_job_desc,
+            // it blocks the report if the cluster type is not valid or leak from test env
+            cluster_type: telemetry_cluster_type_from_env_var()?,
+            object_store_media_type: self.object_store_media_type,
+            connector_usage_json_str: connector_usage,
+            license_info_json_str,
         })
     }
 
     fn report_type(&self) -> &str {
         TELEMETRY_META_REPORT_TYPE
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use risingwave_common::config::MetaBackend;
-    use risingwave_common::telemetry::{
-        current_timestamp, SystemData, TelemetryNodeType, TelemetryReportBase,
-    };
-
-    use crate::telemetry::{MetaTelemetryReport, NodeCount, RwVersion};
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn test_meta_telemetry_report() {
-        use risingwave_common::telemetry::pb_compatible::TelemetryToProtobuf;
-        use risingwave_common::telemetry::{post_telemetry_report_pb, TELEMETRY_REPORT_URL};
-
-        use crate::telemetry::TELEMETRY_META_REPORT_TYPE;
-
-        // we don't call `create_report` here because it rely on the metadata manager
-        let report = MetaTelemetryReport {
-            base: TelemetryReportBase {
-                tracking_id: "7d45669c-08c7-4571-ae3d-d3a3e70a2f7e".to_owned(),
-                session_id: "7d45669c-08c7-4571-ae3d-d3a3e70a2f7e".to_owned(),
-                system_data: SystemData::new(),
-                up_time: 100,
-                time_stamp: current_timestamp(),
-                node_type: TelemetryNodeType::Meta,
-                is_test: true,
-            },
-            node_count: NodeCount {
-                meta_count: 1,
-                compute_count: 2,
-                frontend_count: 3,
-                compactor_count: 4,
-            },
-            streaming_job_count: 5,
-            meta_backend: MetaBackend::Etcd,
-            rw_version: RwVersion {
-                version: "version".to_owned(),
-                git_sha: "git_sha".to_owned(),
-            },
-            job_desc: vec![],
-        };
-
-        let pb_bytes = report.to_pb_bytes();
-        let url = (TELEMETRY_REPORT_URL.to_owned() + "/" + TELEMETRY_META_REPORT_TYPE).to_owned();
-        let result = post_telemetry_report_pb(&url, pb_bytes).await;
-        assert!(result.is_ok());
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod pretty_serde;
+pub use pretty_serde::PrettySerde;
 mod column_index_mapping;
 use std::any::Any;
 use std::hash::{Hash, Hasher};
+use std::sync::LazyLock;
 
 pub use column_index_mapping::*;
 mod condition;
+pub mod data_type;
 pub use condition::*;
 mod connected_components;
 pub(crate) use connected_components::*;
 mod stream_graph_formatter;
 pub use stream_graph_formatter::*;
 mod with_options;
+use tokio::runtime::Runtime;
 pub use with_options::*;
 mod rewrite_index;
 pub use rewrite_index::*;
@@ -33,8 +38,22 @@ pub(crate) mod group_by;
 pub mod overwrite_options;
 pub use group_by::*;
 pub use overwrite_options::*;
+mod iceberg_predicate;
+pub use iceberg_predicate::*;
+#[cfg(feature = "datafusion")]
+mod drop_guard;
+#[cfg(feature = "datafusion")]
+pub use drop_guard::DropGuard;
 
 use crate::expr::{Expr, ExprImpl, ExprRewriter, InputRef};
+
+pub static FRONTEND_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("rw-frontend")
+        .enable_all()
+        .build()
+        .expect("failed to build frontend runtime")
+});
 
 /// Substitute `InputRef` with corresponding `ExprImpl`.
 pub struct Substitute {
@@ -43,12 +62,15 @@ pub struct Substitute {
 
 impl ExprRewriter for Substitute {
     fn rewrite_input_ref(&mut self, input_ref: InputRef) -> ExprImpl {
-        assert_eq!(
-            input_ref.return_type(),
-            self.mapping[input_ref.index()].return_type(),
-            "Type mismatch when substituting {:?} with {:?}",
+        assert!(
+            input_ref
+                .return_type()
+                .equals_datatype(&self.mapping[input_ref.index()].return_type()),
+            "Type mismatch when substituting {:?} of {:?} with {:?} of {:?}",
             input_ref,
+            input_ref.return_type(),
             self.mapping[input_ref.index()],
+            self.mapping[input_ref.index()].return_type()
         );
         self.mapping[input_ref.index()].clone()
     }
@@ -117,7 +139,7 @@ pub trait Endo<T: Tree> {
 
 /// A similar trait to generate traversal over tree-like structure.
 /// See `Endo` for more details.
-#[allow(unused_variables)]
+#[expect(unused_variables)]
 pub trait Visit<T: Tree> {
     fn pre(&mut self, t: &T) {}
 
@@ -159,6 +181,7 @@ impl PartialEq<dyn DynEq + 'static> for dyn DynEq {
     }
 }
 
+#[expect(internal_eq_trait_method_impls)]
 impl Eq for dyn DynEq {
     fn assert_receiver_is_total_eq(&self) {}
 }
@@ -185,4 +208,18 @@ impl Hash for dyn DynHash {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.dyn_hash(state);
     }
+}
+
+pub fn ordinal(i: usize) -> String {
+    let s = i.to_string();
+    let suffix = if s.ends_with('1') && !s.ends_with("11") {
+        "st"
+    } else if s.ends_with('2') && !s.ends_with("12") {
+        "nd"
+    } else if s.ends_with('3') && !s.ends_with("13") {
+        "rd"
+    } else {
+        "th"
+    };
+    s + suffix
 }

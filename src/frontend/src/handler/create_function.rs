@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,20 +13,58 @@
 // limitations under the License.
 
 use anyhow::Context;
+use either::Either;
 use risingwave_common::catalog::FunctionId;
-use risingwave_common::types::DataType;
-use risingwave_expr::sig::{CreateFunctionOptions, UdfKind};
+use risingwave_expr::sig::{CreateOptions, UdfKind};
+use risingwave_pb::catalog::PbFunction;
 use risingwave_pb::catalog::function::{Kind, ScalarFunction, TableFunction};
-use risingwave_pb::catalog::Function;
 
 use super::*;
-use crate::catalog::CatalogError;
-use crate::{bind_data_type, Binder};
+use crate::binder::bind_struct_type;
+use crate::{Binder, bind_data_type};
+
+/// Non-SQL UDFs exchange data via Arrow, which does not support VARIANT yet.
+pub(crate) fn reject_variant_in_udf_signature(
+    return_type: &risingwave_common::types::DataType,
+    arg_types: &[risingwave_common::types::DataType],
+    kind: &str,
+) -> Result<()> {
+    if return_type.contains_variant() || arg_types.iter().any(|t| t.contains_variant()) {
+        return Err(ErrorCode::NotSupported(
+            format!("VARIANT type in {kind} signature"),
+            "VARIANT is not supported in UDFs yet".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `IMMUTABLE` is currently supported only for scalar UDFs, so every other kind of function
+/// rejects it. `STABLE` and `VOLATILE` are always treated as no-ops and pass through unchanged.
+///
+/// TODO: revisit `STABLE` and `VOLATILE` once they get a meaning in RisingWave.
+pub(crate) fn should_reject_function_behavior(behavior: &FunctionBehavior, kind: UdfKind) -> bool {
+    match (behavior, kind) {
+        (FunctionBehavior::Immutable, UdfKind::Table | UdfKind::Aggregate) => true,
+        (FunctionBehavior::Immutable, UdfKind::Scalar) => false,
+        (FunctionBehavior::Stable | FunctionBehavior::Volatile, _) => false,
+    }
+}
+
+/// `unsafe_skip_materializing_exprs` is read only when a scalar UDF call is planned, so every
+/// other kind of function rejects it instead of ignoring it.
+pub(crate) fn should_reject_unsafe_skip_materializing_exprs(kind: UdfKind) -> bool {
+    match kind {
+        UdfKind::Scalar => false,
+        UdfKind::Table | UdfKind::Aggregate => true,
+    }
+}
 
 pub async fn handle_create_function(
     handler_args: HandlerArgs,
     or_replace: bool,
     temporary: bool,
+    if_not_exists: bool,
     name: ObjectName,
     args: Option<Vec<OperateFunctionArg>>,
     returns: Option<CreateFunctionReturns>,
@@ -39,36 +77,45 @@ pub async fn handle_create_function(
     if temporary {
         bail_not_implemented!("CREATE TEMPORARY FUNCTION");
     }
-    // e.g., `language [ python / java / ...etc]`
+
+    let udf_config = handler_args.session.env().udf_config();
+
+    // e.g., `language [ python / javascript / ...etc]`
     let language = match params.language {
         Some(lang) => {
             let lang = lang.real_value().to_lowercase();
             match &*lang {
-                "python" | "java" | "wasm" | "rust" | "javascript" => lang,
+                "java" => lang, // only support external UDF for Java
+                "python" if udf_config.enable_embedded_python_udf => lang,
+                "javascript" if udf_config.enable_embedded_javascript_udf => lang,
+                "rust" | "wasm" if udf_config.enable_embedded_wasm_udf => lang,
+                "python" | "javascript" | "rust" | "wasm" => {
+                    return Err(ErrorCode::InvalidParameterValue(format!(
+                        "{} UDF is not enabled in configuration",
+                        lang
+                    ))
+                    .into());
+                }
                 _ => {
                     return Err(ErrorCode::InvalidParameterValue(format!(
                         "language {} is not supported",
                         lang
                     ))
-                    .into())
+                    .into());
                 }
             }
         }
         // Empty language is acceptable since we only require the external server implements the
         // correct protocol.
-        None => "".to_string(),
+        None => "".to_owned(),
     };
 
     let runtime = match params.runtime {
-        Some(runtime) => {
-            if language == "javascript" {
-                Some(runtime.real_value())
-            } else {
-                return Err(ErrorCode::InvalidParameterValue(
-                    "runtime is only supported for javascript".to_string(),
-                )
-                .into());
-            }
+        Some(_) => {
+            return Err(ErrorCode::InvalidParameterValue(
+                "runtime selection is currently not supported".to_owned(),
+            )
+            .into());
         }
         None => None,
     };
@@ -87,44 +134,78 @@ pub async fn handle_create_function(
                 // return type is a struct for multiple columns
                 let it = columns
                     .into_iter()
-                    .map(|c| bind_data_type(&c.data_type).map(|ty| (ty, c.name.real_value())));
-                let (datatypes, names) = itertools::process_results(it, |it| it.unzip())?;
-                return_type = DataType::new_struct(datatypes, names);
+                    .map(|c| bind_data_type(&c.data_type).map(|ty| (c.name.real_value(), ty)));
+                let fields = it.try_collect::<_, Vec<_>, _>()?;
+                return_type = bind_struct_type(fields)?.into();
             }
             Kind::Table(TableFunction {})
         }
         None => {
             return Err(ErrorCode::InvalidParameterValue(
-                "return type must be specified".to_string(),
+                "return type must be specified".to_owned(),
             )
-            .into())
+            .into());
         }
     };
+
+    let udf_kind = match kind {
+        Kind::Scalar(_) => UdfKind::Scalar,
+        Kind::Table(_) => UdfKind::Table,
+        // Aggregate UDFs are created through `CREATE AGGREGATE` and
+        // `handle_create_aggregate`, not this `CREATE FUNCTION` handler.
+        Kind::Aggregate(_) => unreachable!(),
+    };
+    if let Some(behavior) = &params.behavior
+        && should_reject_function_behavior(behavior, udf_kind)
+    {
+        return Err(ErrorCode::InvalidParameterValue(format!(
+            "`{behavior}` is not supported for table functions"
+        ))
+        .into());
+    }
+    if with_options.unsafe_skip_materializing_exprs.is_some()
+        && should_reject_unsafe_skip_materializing_exprs(udf_kind)
+    {
+        return Err(ErrorCode::InvalidParameterValue(
+            "`unsafe_skip_materializing_exprs` is not supported for table functions".to_owned(),
+        )
+        .into());
+    }
+    let is_immutable = matches!(params.behavior, Some(FunctionBehavior::Immutable));
+    let unsafe_skip_materializing_exprs = with_options
+        .unsafe_skip_materializing_exprs
+        .unwrap_or_default();
+    if unsafe_skip_materializing_exprs && !is_immutable {
+        return Err(ErrorCode::InvalidParameterValue(
+            "`IMMUTABLE` must be specified when `unsafe_skip_materializing_exprs` is true"
+                .to_owned(),
+        )
+        .into());
+    }
 
     let mut arg_names = vec![];
     let mut arg_types = vec![];
     for arg in args.unwrap_or_default() {
-        arg_names.push(arg.name.map_or("".to_string(), |n| n.real_value()));
+        arg_names.push(arg.name.map_or("".to_owned(), |n| n.real_value()));
         arg_types.push(bind_data_type(&arg.data_type)?);
     }
 
+    reject_variant_in_udf_signature(&return_type, &arg_types, "function")?;
+
     // resolve database and schema id
     let session = &handler_args.session;
-    let db_name = session.database();
-    let (schema_name, function_name) = Binder::resolve_schema_qualified_name(db_name, name)?;
+    let db_name = &session.database();
+    let (schema_name, function_name) = Binder::resolve_schema_qualified_name(db_name, &name)?;
     let (database_id, schema_id) = session.get_database_and_schema_id_for_create(schema_name)?;
 
     // check if the function exists in the catalog
-    if (session.env().catalog_reader().read_guard())
-        .get_schema_by_id(&database_id, &schema_id)?
-        .get_function_by_name_args(&function_name, &arg_types)
-        .is_some()
-    {
-        let name = format!(
-            "{function_name}({})",
-            arg_types.iter().map(|t| t.to_string()).join(",")
-        );
-        return Err(CatalogError::Duplicated("function", name).into());
+    if let Either::Right(resp) = session.check_function_name_duplicated(
+        StatementType::CREATE_FUNCTION,
+        name,
+        &arg_types,
+        if_not_exists,
+    )? {
+        return Ok(resp);
     }
 
     let link = match &params.using {
@@ -133,7 +214,7 @@ pub async fn handle_create_function(
     };
     let base64_decoded = match &params.using {
         Some(CreateFunctionUsing::Base64(encoded)) => {
-            use base64::prelude::{Engine, BASE64_STANDARD};
+            use base64::prelude::{BASE64_STANDARD, Engine};
             let bytes = BASE64_STANDARD
                 .decode(encoded)
                 .context("invalid base64 encoding")?;
@@ -141,22 +222,29 @@ pub async fn handle_create_function(
         }
         _ => None,
     };
-    let function_type = match params.function_type {
-        Some(CreateFunctionType::Sync) => Some("sync".to_string()),
-        Some(CreateFunctionType::Async) => Some("async".to_string()),
-        Some(CreateFunctionType::Generator) => Some("generator".to_string()),
-        Some(CreateFunctionType::AsyncGenerator) => Some("async_generator".to_string()),
-        None => None,
-    };
 
-    let create_fn =
-        risingwave_expr::sig::find_udf_impl(&language, runtime.as_deref(), link)?.create_fn;
-    let output = create_fn(CreateFunctionOptions {
-        kind: match kind {
-            Kind::Scalar(_) => UdfKind::Scalar,
-            Kind::Table(_) => UdfKind::Table,
-            Kind::Aggregate(_) => unreachable!(),
-        },
+    let udf_impl = risingwave_expr::sig::find_udf_impl(&language, runtime.as_deref(), link)?;
+    let always_retry_on_network_error = with_options
+        .always_retry_on_network_error
+        .unwrap_or_default();
+    let supports_always_retry_on_network_error =
+        (udf_impl.supports_always_retry_on_network_error)(udf_kind);
+    if always_retry_on_network_error && !supports_always_retry_on_network_error {
+        return Err(ErrorCode::InvalidParameterValue(
+            "`always_retry_on_network_error` is not supported by this UDF implementation"
+                .to_owned(),
+        )
+        .into());
+    }
+    if is_immutable && supports_always_retry_on_network_error && !always_retry_on_network_error {
+        return Err(ErrorCode::InvalidParameterValue(
+            "`always_retry_on_network_error` must be true for an `IMMUTABLE` UDF whose implementation supports it"
+                .to_owned(),
+        )
+        .into());
+    }
+    let output = (udf_impl.create_fn)(CreateOptions {
+        kind: udf_kind,
         name: &function_name,
         arg_names: &arg_names,
         arg_types: &arg_types,
@@ -166,8 +254,8 @@ pub async fn handle_create_function(
         using_base64_decoded: base64_decoded.as_deref(),
     })?;
 
-    let function = Function {
-        id: FunctionId::placeholder().0,
+    let function = PbFunction {
+        id: FunctionId::placeholder(),
         schema_id,
         database_id,
         name: function_name,
@@ -176,16 +264,19 @@ pub async fn handle_create_function(
         arg_types: arg_types.into_iter().map(|t| t.into()).collect(),
         return_type: Some(return_type.into()),
         language,
-        identifier: Some(output.identifier),
-        link: link.map(|s| s.to_string()),
+        runtime,
+        name_in_runtime: Some(output.name_in_runtime),
+        link: link.map(|s| s.to_owned()),
         body: output.body,
         compressed_binary: output.compressed_binary,
         owner: session.user_id(),
-        always_retry_on_network_error: with_options
-            .always_retry_on_network_error
-            .unwrap_or_default(),
-        runtime,
-        function_type,
+        always_retry_on_network_error,
+        unsafe_skip_materializing_exprs,
+        is_immutable,
+        is_async: with_options.r#async,
+        is_batched: with_options.batch,
+        created_at_epoch: None,
+        created_at_cluster_version: None,
     };
 
     let catalog_writer = session.catalog_writer()?;

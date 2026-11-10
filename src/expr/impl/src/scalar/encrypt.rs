@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 use openssl::error::ErrorStack;
 use openssl::symm::{Cipher, Crypter, Mode as CipherMode};
 use regex::Regex;
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Algorithm {
@@ -79,7 +79,7 @@ impl CipherConfig {
                 return Err(ExprError::InvalidParam {
                     name: "mode",
                     reason: format!("expect aes for algorithm, but got: {:?}", algo).into(),
-                })
+                });
             }
         };
 
@@ -90,7 +90,7 @@ impl CipherConfig {
                 return Err(ExprError::InvalidParam {
                     name: "mode",
                     reason: format!("expect cbc or ecb for mode, but got: {}", mode).into(),
-                })
+                });
             }
         };
 
@@ -101,7 +101,7 @@ impl CipherConfig {
                 return Err(ExprError::InvalidParam {
                     name: "mode",
                     reason: format!("expect pkcs or none for padding, but got: {}", padding).into(),
-                })
+                });
             }
         };
 
@@ -116,7 +116,7 @@ impl CipherConfig {
                 return Err(ExprError::InvalidParam {
                     name: "key",
                     reason: format!("invalid key length: {}, expect 16, 24 or 32", n).into(),
-                })
+                });
             }
         };
 
@@ -143,7 +143,15 @@ impl CipherConfig {
         input: &[u8],
         operation: CipherMode,
     ) -> std::result::Result<Box<[u8]>, ErrorStack> {
-        let mut decrypter = Crypter::new(self.cipher, operation, self.crypt_key.as_ref(), None)?;
+        // Default the IV to all-zeros when the cipher requires one, to match pgcrypto:
+        // https://github.com/postgres/postgres/blob/REL_18_3/contrib/pgcrypto/pgcrypto.c#L325
+        let iv = self.cipher.iv_len().map(|len| vec![0u8; len]);
+        let mut decrypter = Crypter::new(
+            self.cipher,
+            operation,
+            self.crypt_key.as_ref(),
+            iv.as_deref(),
+        )?;
         let enable_padding = match self.padding {
             Padding::Pkcs => true,
             Padding::None => false,
@@ -203,6 +211,13 @@ mod test {
         )
         .unwrap();
         let encrypted = encrypt(data, &config).unwrap();
+
+        // Pin the zero-IV default: AES-128-CBC / PKCS, key 00..0F, IV all-zero.
+        let expected: &[u8] = &[
+            0x92, 0x76, 0xfd, 0xf3, 0x84, 0xf3, 0x85, 0x18, 0xfa, 0x6c, 0x83, 0x10, 0xf1, 0x91,
+            0x67, 0x8d,
+        ];
+        assert_eq!(encrypted.as_ref(), expected);
 
         let decrypted = decrypt(&encrypted, &config).unwrap();
         assert_eq!(decrypted, (*data).into());

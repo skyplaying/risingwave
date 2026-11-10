@@ -14,40 +14,37 @@
 
 #![deprecated = "will be replaced by new fs source (list + fetch)"]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
 use futures::stream::pending;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use risingwave_common::catalog::ColumnId;
 
-use crate::dispatch_source_prop;
+use crate::WithOptionsSecResolved;
 use crate::error::ConnectorResult;
 use crate::parser::{CommonParserConfig, ParserConfig, SpecificParserConfig};
 use crate::source::{
-    create_split_reader, BoxChunkSourceStream, ConnectorProperties, ConnectorState,
-    SourceColumnDesc, SourceContext, SplitReader,
+    BoxSourceChunkStream, ConnectorProperties, ConnectorState, SourceColumnDesc, SourceContext,
+    SourceReaderEvent,
 };
 
 #[derive(Clone, Debug)]
-pub struct FsSourceReader {
+pub struct LegacyFsSourceReader {
     pub config: ConnectorProperties,
     pub columns: Vec<SourceColumnDesc>,
-    pub properties: HashMap<String, String>,
+    pub properties: WithOptionsSecResolved,
     pub parser_config: SpecificParserConfig,
 }
 
-impl FsSourceReader {
-    #[allow(clippy::too_many_arguments)]
+impl LegacyFsSourceReader {
     pub fn new(
-        properties: HashMap<String, String>,
+        properties: WithOptionsSecResolved,
         columns: Vec<SourceColumnDesc>,
         parser_config: SpecificParserConfig,
     ) -> ConnectorResult<Self> {
         // Store the connector node address to properties for later use.
-        let source_props: HashMap<String, String> = HashMap::from_iter(properties.clone());
-        let config = ConnectorProperties::extract(source_props, false)?;
+        let config = ConnectorProperties::extract(properties.clone(), false)?;
 
         Ok(Self {
             config,
@@ -81,7 +78,7 @@ impl FsSourceReader {
         state: ConnectorState,
         column_ids: Vec<ColumnId>,
         source_ctx: Arc<SourceContext>,
-    ) -> ConnectorResult<BoxChunkSourceStream> {
+    ) -> ConnectorResult<BoxSourceChunkStream> {
         let config = self.config.clone();
         let columns = self.get_target_columns(column_ids)?;
 
@@ -93,13 +90,17 @@ impl FsSourceReader {
         };
         let stream = match state {
             None => pending().boxed(),
-            Some(splits) => {
-                dispatch_source_prop!(config, prop, {
-                    create_split_reader(*prop, splits, parser_config, source_ctx, None)
-                        .await?
-                        .into_stream()
+            Some(splits) => config
+                .create_split_reader(splits, parser_config, source_ctx, None, Default::default())
+                .await?
+                .0
+                .try_filter_map(|event| async move {
+                    Ok(match event {
+                        SourceReaderEvent::DataChunk(chunk) => Some(chunk),
+                        SourceReaderEvent::SplitProgress(_) => None,
+                    })
                 })
-            }
+                .boxed(),
         };
         Ok(stream)
     }

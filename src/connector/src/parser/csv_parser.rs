@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::{Date, Decimal, Time, Timestamp, Timestamptz};
+use risingwave_common::cast::str_to_bool;
+use risingwave_common::types::{DataType, Date, Decimal, ScalarImpl, Time, Timestamp, Timestamptz};
 
 use super::unified::{AccessError, AccessResult};
 use super::{ByteStreamSourceParser, CsvProperties};
 use crate::error::ConnectorResult;
 use crate::only_parse_payload;
 use crate::parser::{ParserFormat, SourceStreamChunkRowWriter};
-use crate::source::{DataType, SourceColumnDesc, SourceContext, SourceContextRef};
+use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef};
 
 macro_rules! parse {
     ($v:ident, $t:ty) => {
@@ -68,7 +69,7 @@ impl CsvParser {
             .next()
             .transpose()?;
         Ok(record
-            .map(|record| record.iter().map(|field| field.to_string()).collect())
+            .map(|record| record.iter().map(|field| field.to_owned()).collect())
             .unwrap_or_default())
     }
 
@@ -76,13 +77,20 @@ impl CsvParser {
     fn parse_string(dtype: &DataType, v: String) -> AccessResult {
         let v = match dtype {
             // mysql use tinyint to represent boolean
-            DataType::Boolean => (parse!(v, i16)? != 0).into(),
+            DataType::Boolean => {
+                str_to_bool(&v)
+                    .map(ScalarImpl::Bool)
+                    .map_err(|_| AccessError::TypeError {
+                        expected: "boolean".to_owned(),
+                        got: "string".to_owned(),
+                        value: v,
+                    })?
+            }
             DataType::Int16 => parse!(v, i16)?.into(),
             DataType::Int32 => parse!(v, i32)?.into(),
             DataType::Int64 => parse!(v, i64)?.into(),
             DataType::Float32 => parse!(v, f32)?.into(),
             DataType::Float64 => parse!(v, f64)?.into(),
-            // FIXME: decimal should have more precision than f64
             DataType::Decimal => parse!(v, Decimal)?.into(),
             DataType::Varchar => v.into(),
             DataType::Date => parse!(v, Date)?.into(),
@@ -92,13 +100,13 @@ impl CsvParser {
             _ => {
                 return Err(AccessError::UnsupportedType {
                     ty: dtype.to_string(),
-                })
+                });
             }
         };
         Ok(Some(v))
     }
 
-    #[allow(clippy::unused_async)]
+    #[expect(clippy::unused_async)]
     pub async fn parse_inner(
         &mut self,
         payload: Vec<u8>,
@@ -168,10 +176,12 @@ impl ByteStreamSourceParser for CsvParser {
 mod tests {
     use risingwave_common::array::Op;
     use risingwave_common::row::Row;
-    use risingwave_common::types::{DataType, ScalarImpl, ToOwnedDatum};
+    use risingwave_common::types::{DataType, ToOwnedDatum};
 
     use super::*;
     use crate::parser::SourceStreamChunkBuilder;
+    use crate::source::SourceCtrlOpts;
+
     #[tokio::test]
     async fn test_csv_without_headers() {
         let data = vec![
@@ -195,14 +205,15 @@ mod tests {
             SourceContext::dummy().into(),
         )
         .unwrap();
-        let mut builder = SourceStreamChunkBuilder::with_capacity(descs, 4);
+        let mut builder = SourceStreamChunkBuilder::new(descs, SourceCtrlOpts::for_test());
         for item in data {
             parser
                 .parse_inner(item.as_bytes().to_vec(), builder.row_writer())
                 .await
                 .unwrap();
         }
-        let chunk = builder.finish();
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
         let mut rows = chunk.rows();
         {
             let (op, row) = rows.next().unwrap();
@@ -302,13 +313,14 @@ mod tests {
             SourceContext::dummy().into(),
         )
         .unwrap();
-        let mut builder = SourceStreamChunkBuilder::with_capacity(descs, 4);
+        let mut builder = SourceStreamChunkBuilder::new(descs, SourceCtrlOpts::for_test());
         for item in data {
             let _ = parser
                 .parse_inner(item.as_bytes().to_vec(), builder.row_writer())
                 .await;
         }
-        let chunk = builder.finish();
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
         let mut rows = chunk.rows();
         {
             let (op, row) = rows.next().unwrap();
@@ -376,5 +388,64 @@ mod tests {
                 (Some(ScalarImpl::Int32(0)))
             );
         }
+    }
+
+    #[test]
+    fn test_parse_boolean() {
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "1".to_owned()).unwrap(),
+            Some(true.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "t".to_owned()).unwrap(),
+            Some(true.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "T".to_owned()).unwrap(),
+            Some(true.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "true".to_owned()).unwrap(),
+            Some(true.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "TRUE".to_owned()).unwrap(),
+            Some(true.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "True".to_owned()).unwrap(),
+            Some(true.into())
+        );
+
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "0".to_owned()).unwrap(),
+            Some(false.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "f".to_owned()).unwrap(),
+            Some(false.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "F".to_owned()).unwrap(),
+            Some(false.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "false".to_owned()).unwrap(),
+            Some(false.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "FALSE".to_owned()).unwrap(),
+            Some(false.into())
+        );
+        assert_eq!(
+            CsvParser::parse_string(&DataType::Boolean, "False".to_owned()).unwrap(),
+            Some(false.into())
+        );
+
+        assert!(CsvParser::parse_string(&DataType::Boolean, "2".to_owned()).is_err());
+        assert!(CsvParser::parse_string(&DataType::Boolean, "t1".to_owned()).is_err());
+        assert!(CsvParser::parse_string(&DataType::Boolean, "f1".to_owned()).is_err());
+        assert!(CsvParser::parse_string(&DataType::Boolean, "false1".to_owned()).is_err());
+        assert!(CsvParser::parse_string(&DataType::Boolean, "TRUE1".to_owned()).is_err());
     }
 }

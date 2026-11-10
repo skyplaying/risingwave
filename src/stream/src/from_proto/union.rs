@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ use super::*;
 use crate::executor::UnionExecutor;
 
 pub struct UnionExecutorBuilder;
+
+impl_stream_node_body!(Union(UnionNode) => UnionExecutorBuilder);
 
 impl ExecutorBuilder for UnionExecutorBuilder {
     type Node = UnionNode;

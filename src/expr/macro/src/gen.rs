@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ impl FunctionAttr {
                 FunctionAttr {
                     args: {
                         let mut args = self.args.clone();
-                        *args.last_mut().unwrap() = "...".to_string();
+                        *args.last_mut().unwrap() = "...".to_owned();
                         args
                     },
                     ..self.clone()
@@ -61,21 +61,14 @@ impl FunctionAttr {
         }
         let args = self.args.iter().map(|ty| types::expand_type_wildcard(ty));
         let ret = types::expand_type_wildcard(&self.ret);
-        // multi_cartesian_product should emit an empty set if the input is empty.
-        let args_cartesian_product =
-            args.multi_cartesian_product()
-                .chain(match self.args.is_empty() {
-                    true => vec![vec![]],
-                    false => vec![],
-                });
         let mut attrs = Vec::new();
-        for (args, mut ret) in args_cartesian_product.cartesian_product(ret) {
+        for (args, mut ret) in args.multi_cartesian_product().cartesian_product(ret) {
             if ret == "auto" {
                 ret = types::min_compatible_type(&args);
             }
             let attr = FunctionAttr {
                 args: args.iter().map(|s| s.to_string()).collect(),
-                ret: ret.to_string(),
+                ret: ret.to_owned(),
                 ..self.clone()
             };
             attrs.push(attr);
@@ -83,11 +76,13 @@ impl FunctionAttr {
         attrs
     }
 
-    /// Generate the type infer function.
+    /// Generate the type infer function: `fn(&[DataType]) -> Result<DataType>`
     fn generate_type_infer_fn(&self) -> Result<TokenStream2> {
         if let Some(func) = &self.type_infer {
-            if func == "panic" {
-                return Ok(quote! { |_| panic!("type inference function is not implemented") });
+            if func == "unreachable" {
+                return Ok(
+                    quote! { |_| unreachable!("type inference for this function should be specially handled in frontend, and should not call sig.type_infer") },
+                );
             }
             // use the user defined type inference function
             return Ok(func.parse().unwrap());
@@ -99,7 +94,7 @@ impl FunctionAttr {
             }
             if let Some(i) = self.args.iter().position(|t| t == "anyarray") {
                 // infer as the element type of "anyarray" argument
-                return Ok(quote! { |args| Ok(args[#i].as_list().clone()) });
+                return Ok(quote! { |args| Ok(args[#i].as_list_elem().clone()) });
             }
         } else if self.ret == "anyarray" {
             if let Some(i) = self.args.iter().position(|t| t == "anyarray") {
@@ -108,11 +103,16 @@ impl FunctionAttr {
             }
             if let Some(i) = self.args.iter().position(|t| t == "any") {
                 // infer as the array type of "any" argument
-                return Ok(quote! { |args| Ok(DataType::List(Box::new(args[#i].clone()))) });
+                return Ok(quote! { |args| Ok(DataType::list(args[#i].clone())) });
             }
         } else if self.ret == "struct" {
             if let Some(i) = self.args.iter().position(|t| t == "struct") {
                 // infer as the type of "struct" argument
+                return Ok(quote! { |args| Ok(args[#i].clone()) });
+            }
+        } else if self.ret == "anymap" {
+            if let Some(i) = self.args.iter().position(|t| t == "anymap") {
+                // infer as the type of "anymap" argument
                 return Ok(quote! { |args| Ok(args[#i].clone()) });
             }
         } else {
@@ -122,13 +122,17 @@ impl FunctionAttr {
         }
         Err(Error::new(
             Span::call_site(),
-            "type inference function is required",
+            "type inference function cannot be automatically derived. You should provide: `type_infer = \"|args| Ok(...)\"`",
         ))
     }
 
-    /// Generate a descriptor of the scalar or table function.
+    /// Generate a descriptor (`FuncSign`) of the scalar or table function.
     ///
     /// The types of arguments and return value should not contain wildcard.
+    ///
+    /// # Arguments
+    /// `build_fn`: whether the user provided a function is a build function.
+    /// (from the `#[build_function]` macro)
     pub fn generate_function_descriptor(
         &self,
         user_fn: &UserFunctionAttr,
@@ -156,10 +160,16 @@ impl FunctionAttr {
         } else if self.rewritten {
             quote! { |_, _| Err(ExprError::UnsupportedFunction(#name.into())) }
         } else {
+            // This is the core logic for `#[function]`
             self.generate_build_scalar_function(user_fn, true)?
         };
         let type_infer_fn = self.generate_type_infer_fn()?;
         let deprecated = self.deprecated;
+        let maybe_allow_deprecated = if deprecated {
+            quote! { #[allow(deprecated)] }
+        } else {
+            quote! {}
+        };
 
         Ok(quote! {
             #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
@@ -167,6 +177,7 @@ impl FunctionAttr {
                 use risingwave_common::types::{DataType, DataTypeName};
                 use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
+                #maybe_allow_deprecated
                 FuncSign {
                     name: risingwave_pb::expr::expr_node::Type::#pb_type.into(),
                     inputs_type: vec![#(#args),*],
@@ -196,6 +207,7 @@ impl FunctionAttr {
             true => format_ident!("{}OptimizeConst", utils::to_camel_case(&self.ident_name())),
             false => format_ident!("{}", utils::to_camel_case(&self.ident_name())),
         };
+        let async_struct_name = format_ident!("Async{}", struct_name);
 
         // we divide all arguments into two groups: prebuilt and non-prebuilt.
         // prebuilt arguments are collected from the "prebuild" field.
@@ -245,11 +257,13 @@ impl FunctionAttr {
         let arg_arrays = children_indices
             .iter()
             .map(|i| format_ident!("{}", types::array_type(&self.args[*i])));
+        let arg_arrays = arg_arrays.collect_vec();
         let arg_types = children_indices.iter().map(|i| {
             types::ref_type(&self.args[*i])
                 .parse::<TokenStream2>()
                 .unwrap()
         });
+        let arg_types = arg_types.collect_vec();
         let annotation: TokenStream2 = match user_fn.core_return_type.as_str() {
             // add type annotation for functions that return generic types
             "T" | "T1" | "T2" | "T3" => format!(": Option<{}>", types::owned_type(&self.ret))
@@ -288,10 +302,10 @@ impl FunctionAttr {
                     let #prebuilt_inputs = match &#prebuilt_inputs {
                         Some(s) => s.as_scalar_ref_impl().try_into()?,
                         // the function should always return null if any const argument is null
-                        None => return Ok(Box::new(risingwave_expr::expr::LiteralExpression::new(
+                        None => return Ok(risingwave_expr::expr::LiteralExpression::new(
                             return_type,
                             None,
-                        ))),
+                        ).boxed()),
                     };
                 )*
                 #prebuilt_arg_value
@@ -306,8 +320,18 @@ impl FunctionAttr {
             false => quote! { risingwave_expr::ensure!(children.len() == #num_args); },
         };
 
-        // evaluate variadic arguments in `eval`
-        let eval_variadic = variadic.then(|| {
+        // evaluate variadic arguments in sync `eval`
+        let eval_variadic_sync = variadic.then(|| {
+            quote! {
+                let mut columns = Vec::with_capacity(self.children.len() - #num_args);
+                for child in &self.children[#num_args..] {
+                    columns.push(child.eval(input)?);
+                }
+                let variadic_input = DataChunk::new(columns, input.visibility().clone());
+            }
+        });
+        // evaluate variadic arguments in async `eval`
+        let eval_variadic_async = variadic.then(|| {
             quote! {
                 let mut columns = Vec::with_capacity(self.children.len() - #num_args);
                 for child in &self.children[#num_args..] {
@@ -316,8 +340,18 @@ impl FunctionAttr {
                 let variadic_input = DataChunk::new(columns, input.visibility().clone());
             }
         });
-        // evaluate variadic arguments in `eval_row`
-        let eval_row_variadic = variadic.then(|| {
+        // evaluate variadic arguments in sync `eval_row`
+        let eval_row_variadic_sync = variadic.then(|| {
+            quote! {
+                let mut row = Vec::with_capacity(self.children.len() - #num_args);
+                for child in &self.children[#num_args..] {
+                    row.push(child.eval_row(input)?);
+                }
+                let variadic_row = OwnedRow::new(row);
+            }
+        });
+        // evaluate variadic arguments in async `eval_row`
+        let eval_row_variadic_async = variadic.then(|| {
             quote! {
                 let mut row = Vec::with_capacity(self.children.len() - #num_args);
                 for child in &self.children[#num_args..] {
@@ -344,7 +378,10 @@ impl FunctionAttr {
         };
         let variadic_args = variadic.then(|| quote! { &variadic_row, });
         let context = user_fn.context.then(|| quote! { &self.context, });
-        let writer = user_fn.write.then(|| quote! { &mut writer, });
+        let writer = user_fn
+            .writer_type_kind
+            .is_some()
+            .then(|| quote! { &mut writer, });
         let await_ = user_fn.async_.then(|| quote! { .await });
 
         let record_error = {
@@ -445,34 +482,63 @@ impl FunctionAttr {
             };
         };
         // now the `output` is: Option<impl ScalarRef or Scalar>
-        let append_output = match user_fn.write {
-            true => quote! {{
-                let mut writer = builder.writer().begin();
+        let append_output = match user_fn.writer_type_kind {
+            Some(WriterTypeKind::FmtWrite)
+            | Some(WriterTypeKind::IoWrite)
+            | Some(WriterTypeKind::ListWrite) => quote! {{
+                let mut writer = builder.writer();
                 if #output.is_some() {
                     writer.finish();
                 } else {
-                    drop(writer);
+                    writer.rollback();
                     builder.append_null();
                 }
             }},
-            false if user_fn.core_return_type == "impl AsRef < [u8] >" => quote! {
+            Some(WriterTypeKind::JsonbbBuilder) => quote! {{
+                let mut writer_wrapper = builder.writer();
+                let mut writer = writer_wrapper.inner();
+                if #output.is_some() {
+                    writer_wrapper.finish();
+                } else {
+                    writer_wrapper.rollback();
+                    builder.append_null();
+                }
+            }},
+            None if user_fn.core_return_type == "impl AsRef < [u8] >" => quote! {
                 builder.append(#output.as_ref().map(|s| s.as_ref()));
             },
-            false => quote! {
+            None => quote! {
                 let output #annotation = #output;
                 builder.append(output.as_ref().map(|s| s.as_scalar_ref()));
             },
         };
         // the output expression in `eval_row`
-        let row_output = match user_fn.write {
-            true => quote! {{
+        let row_output = match user_fn.writer_type_kind {
+            Some(WriterTypeKind::FmtWrite) => quote! {{
                 let mut writer = String::new();
                 #output.map(|_| writer.into())
             }},
-            false if user_fn.core_return_type == "impl AsRef < [u8] >" => quote! {
+            Some(WriterTypeKind::IoWrite) => quote! {{
+                let mut writer = Vec::new();
+                #output.map(|_| writer.into())
+            }},
+            Some(WriterTypeKind::JsonbbBuilder) => quote! {{
+                let mut writer = jsonbb::Builder::<Vec<u8>>::new();
+                #output.map(|_| JsonbVal::from(writer.finish()).into())
+            }},
+            Some(WriterTypeKind::ListWrite) => quote! {{
+                let mut writer = {
+                    let DataType::List(list_ty) = &self.context.return_type else {
+                        panic!("data type must be DataType::List");
+                    };
+                    list_ty.elem().create_array_builder(1)
+                };
+                #output.map(|_| ListValue::new(writer.finish()).into())
+            }},
+            None if user_fn.core_return_type == "impl AsRef < [u8] >" => quote! {
                 #output.map(|s| s.as_ref().into())
             },
-            false => quote! {{
+            None => quote! {{
                 let output #annotation = #output;
                 output.map(|s| s.into())
             }},
@@ -498,7 +564,7 @@ impl FunctionAttr {
             match self.args.len() {
                 0 => quote! {
                     let c = #ret_array_type::from_iter_bitmap(
-                        std::iter::repeat_with(|| #fn_name()).take(input.capacity())
+                        std::iter::repeat_with(|| #fn_name()).take(input.capacity()),
                         Bitmap::ones(input.capacity()),
                     );
                     Arc::new(c.into())
@@ -533,7 +599,7 @@ impl FunctionAttr {
             quote! {
                 let mut builder = #builder_type::with_type(input.capacity(), self.context.return_type.clone());
 
-                if input.is_compacted() {
+                if input.is_vis_compacted() {
                     for i in 0..input.capacity() {
                         #(let #inputs = unsafe { #arrays.value_at_unchecked(i) };)*
                         #let_variadic
@@ -554,6 +620,72 @@ impl FunctionAttr {
             }
         };
 
+        let sync_impl = if user_fn.async_ {
+            quote! {}
+        } else {
+            quote! {
+                #[derive(Debug)]
+                struct #struct_name {
+                    context: Context,
+                    children: Vec<Arc<dyn risingwave_expr::expr::SyncExpression>>,
+                    prebuilt_arg: #prebuilt_arg_type,
+                }
+                impl risingwave_expr::expr::ExpressionInfo for #struct_name {
+                    fn return_type(&self) -> DataType {
+                        self.context.return_type.clone()
+                    }
+                }
+                impl risingwave_expr::expr::SyncExpression for #struct_name {
+                    fn eval(&self, input: &DataChunk) -> Result<ArrayRef> {
+                        #(
+                            let #array_refs = self.children[#children_indices].eval(input)?;
+                            let #arrays: &#arg_arrays = #array_refs.as_ref().into();
+                        )*
+                        #eval_variadic_sync
+                        let mut errors = vec![];
+                        let array = { #eval };
+                        if errors.is_empty() {
+                            Ok(array)
+                        } else {
+                            Err(ExprError::Multiple(array, errors.into()))
+                        }
+                    }
+                    fn eval_row(&self, input: &OwnedRow) -> Result<Datum> {
+                        #(
+                            let #datums = self.children[#children_indices].eval_row(input)?;
+                            let #inputs: Option<#arg_types> = #datums.as_ref().map(|s| s.as_scalar_ref_impl().try_into().unwrap());
+                        )*
+                        #eval_row_variadic_sync
+                        let mut errors: Vec<ExprError> = vec![];
+                        let output = #row_output;
+                        if let Some(err) = errors.into_iter().next() {
+                            Err(err.into())
+                        } else {
+                            Ok(output)
+                        }
+                    }
+                }
+            }
+        };
+        let build_sync = if user_fn.async_ {
+            quote! {}
+        } else {
+            quote! {
+                use risingwave_expr::expr::try_into_sync_exprs;
+
+                let children = match try_into_sync_exprs(children) {
+                    Ok(children) => {
+                        return Ok(#struct_name {
+                            context,
+                            children,
+                            prebuilt_arg,
+                        }.boxed());
+                    }
+                    Err(children) => children,
+                };
+            }
+        };
+
         Ok(quote! {
             |return_type: DataType, children: Vec<risingwave_expr::expr::BoxedExpression>|
                 -> risingwave_expr::Result<risingwave_expr::expr::BoxedExpression>
@@ -561,11 +693,11 @@ impl FunctionAttr {
                 use std::sync::Arc;
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
-                use risingwave_common::buffer::Bitmap;
+                use risingwave_common::bitmap::Bitmap;
                 use risingwave_common::row::OwnedRow;
                 use risingwave_common::util::iter_util::ZipEqFast;
 
-                use risingwave_expr::expr::{Context, BoxedExpression};
+                use risingwave_expr::expr::{Context, BoxedExpression, SyncExpressionBoxExt, AsyncExpressionBoxExt};
                 use risingwave_expr::{ExprError, Result};
                 use risingwave_expr::codegen::*;
 
@@ -577,23 +709,26 @@ impl FunctionAttr {
                     variadic: #variadic,
                 };
 
+                #sync_impl
+
                 #[derive(Debug)]
-                struct #struct_name {
+                struct #async_struct_name {
                     context: Context,
                     children: Vec<BoxedExpression>,
                     prebuilt_arg: #prebuilt_arg_type,
                 }
-                #[async_trait]
-                impl risingwave_expr::expr::Expression for #struct_name {
+                impl risingwave_expr::expr::ExpressionInfo for #async_struct_name {
                     fn return_type(&self) -> DataType {
                         self.context.return_type.clone()
                     }
+                }
+                impl risingwave_expr::expr::AsyncExpression for #async_struct_name {
                     async fn eval(&self, input: &DataChunk) -> Result<ArrayRef> {
                         #(
                             let #array_refs = self.children[#children_indices].eval(input).await?;
                             let #arrays: &#arg_arrays = #array_refs.as_ref().into();
                         )*
-                        #eval_variadic
+                        #eval_variadic_async
                         let mut errors = vec![];
                         let array = { #eval };
                         if errors.is_empty() {
@@ -607,7 +742,7 @@ impl FunctionAttr {
                             let #datums = self.children[#children_indices].eval_row(input).await?;
                             let #inputs: Option<#arg_types> = #datums.as_ref().map(|s| s.as_scalar_ref_impl().try_into().unwrap());
                         )*
-                        #eval_row_variadic
+                        #eval_row_variadic_async
                         let mut errors: Vec<ExprError> = vec![];
                         let output = #row_output;
                         if let Some(err) = errors.into_iter().next() {
@@ -618,11 +753,13 @@ impl FunctionAttr {
                     }
                 }
 
-                Ok(Box::new(#struct_name {
+                #build_sync
+
+                Ok(#async_struct_name {
                     context,
                     children,
                     prebuilt_arg,
-                }))
+                }.boxed())
             }
         })
     }
@@ -656,7 +793,7 @@ impl FunctionAttr {
             true => self.append_only,
         };
 
-        let pb_type = format_ident!("{}", utils::to_camel_case(&name));
+        let pb_kind = format_ident!("{}", utils::to_camel_case(&name));
         let ctor_name = match append_only {
             false => format_ident!("{}", self.ident_name()),
             true => format_ident!("{}_append_only", self.ident_name()),
@@ -687,6 +824,11 @@ impl FunctionAttr {
         };
         let type_infer_fn = self.generate_type_infer_fn()?;
         let deprecated = self.deprecated;
+        let maybe_allow_deprecated = if deprecated {
+            quote! { #[allow(deprecated)] }
+        } else {
+            quote! {}
+        };
 
         Ok(quote! {
             #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
@@ -694,8 +836,9 @@ impl FunctionAttr {
                 use risingwave_common::types::{DataType, DataTypeName};
                 use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
+                #maybe_allow_deprecated
                 FuncSign {
-                    name: risingwave_expr::aggregate::AggKind::#pb_type.into(),
+                    name: risingwave_pb::expr::agg_call::PbKind::#pb_kind.into(),
                     inputs_type: vec![#(#args),*],
                     variadic: false,
                     ret_type: #ret,
@@ -914,7 +1057,7 @@ impl FunctionAttr {
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
                 use risingwave_common::bail;
-                use risingwave_common::buffer::Bitmap;
+                use risingwave_common::bitmap::Bitmap;
                 use risingwave_common_estimate_size::EstimateSize;
 
                 use risingwave_expr::expr::Context;
@@ -957,7 +1100,7 @@ impl FunctionAttr {
                         assert!(range.end <= input.capacity());
                         #(#let_arrays)*
                         #downcast_state
-                        if input.is_compacted() {
+                        if input.is_vis_compacted() {
                             for row_id in range {
                                 let op = unsafe { *input.ops().get_unchecked(row_id) };
                                 #(#let_values)*
@@ -1019,6 +1162,11 @@ impl FunctionAttr {
         };
         let type_infer_fn = self.generate_type_infer_fn()?;
         let deprecated = self.deprecated;
+        let maybe_allow_deprecated = if deprecated {
+            quote! { #[allow(deprecated)] }
+        } else {
+            quote! {}
+        };
 
         Ok(quote! {
             #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
@@ -1026,6 +1174,7 @@ impl FunctionAttr {
                 use risingwave_common::types::{DataType, DataTypeName};
                 use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
+                #maybe_allow_deprecated
                 FuncSign {
                     name: risingwave_pb::expr::table_function::Type::#pb_type.into(),
                     inputs_type: vec![#(#args),*],
@@ -1122,11 +1271,29 @@ impl FunctionAttr {
         let iter = quote! { #fn_name(#(#inputs,)* #prebuilt_arg #context) };
         let mut iter = match user_fn.return_type_kind {
             ReturnTypeKind::T => quote! { #iter },
-            ReturnTypeKind::Result => quote! { #iter? },
-            ReturnTypeKind::Option => quote! { if let Some(it) = #iter { it } else { continue; } },
-            ReturnTypeKind::ResultOption => {
-                quote! { if let Some(it) = #iter? { it } else { continue; } }
-            }
+            ReturnTypeKind::Option => quote! { match #iter {
+                Some(it) => it,
+                None => continue,
+            } },
+            ReturnTypeKind::Result => quote! { match #iter {
+                Ok(it) => it,
+                Err(e) => {
+                    index_builder.append(Some(i as i32));
+                    #(#builders.append_null();)*
+                    error_builder.append_display(Some(e.as_report()));
+                    continue;
+                }
+            } },
+            ReturnTypeKind::ResultOption => quote! { match #iter {
+                Ok(Some(it)) => it,
+                Ok(None) => continue,
+                Err(e) => {
+                    index_builder.append(Some(i as i32));
+                    #(#builders.append_null();)*
+                    error_builder.append_display(Some(e.as_report()));
+                    continue;
+                }
+            } },
         };
         // if user function accepts non-option arguments, we assume the function
         // returns empty on null input, so we need to unwrap the inputs before calling.
@@ -1153,18 +1320,31 @@ impl FunctionAttr {
                 "expect `impl Iterator` in return type",
             )
         })?;
-        let output = match iterator_item_type {
-            ReturnTypeKind::T => quote! { Some(output) },
-            ReturnTypeKind::Option => quote! { output },
-            ReturnTypeKind::Result => quote! { Some(output?) },
-            ReturnTypeKind::ResultOption => quote! { output? },
+        let append_output = match iterator_item_type {
+            ReturnTypeKind::T => quote! {
+                let (#(#outputs),*) = output;
+                #(#builders.append(#optioned_outputs);)* error_builder.append_null();
+            },
+            ReturnTypeKind::Option => quote! { match output {
+                Some((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                None => { #(#builders.append_null();)* error_builder.append_null(); }
+            } },
+            ReturnTypeKind::Result => quote! { match output {
+                Ok((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                Err(e) => { #(#builders.append_null();)* error_builder.append_display(Some(e.as_report())); }
+            } },
+            ReturnTypeKind::ResultOption => quote! { match output {
+                Ok(Some((#(#outputs),*))) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                Ok(None) => { #(#builders.append_null();)* error_builder.append_null(); }
+                Err(e) => { #(#builders.append_null();)* error_builder.append_display(Some(e.as_report())); }
+            } },
         };
 
         Ok(quote! {
             |return_type, chunk_size, children| {
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
-                use risingwave_common::buffer::Bitmap;
+                use risingwave_common::bitmap::Bitmap;
                 use risingwave_common::util::iter_util::ZipEqFast;
                 use risingwave_expr::expr::{BoxedExpression, Context};
                 use risingwave_expr::{Result, ExprError};
@@ -1215,6 +1395,7 @@ impl FunctionAttr {
 
                         let mut index_builder = I32ArrayBuilder::new(self.chunk_size);
                         #(let mut #builders = #builder_types::with_type(self.chunk_size, #return_types);)*
+                        let mut error_builder = Utf8ArrayBuilder::new(self.chunk_size);
 
                         for i in 0..input.capacity() {
                             if unsafe { !input.visibility().is_set_unchecked(i) } {
@@ -1223,17 +1404,19 @@ impl FunctionAttr {
                             #(let #inputs = unsafe { #arrays.value_at_unchecked(i) };)*
                             for output in #iter {
                                 index_builder.append(Some(i as i32));
-                                match #output {
-                                    Some((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* }
-                                    None => { #(#builders.append_null();)* }
-                                }
+                                #append_output
 
                                 if index_builder.len() == self.chunk_size {
                                     let len = index_builder.len();
                                     let index_array = std::mem::replace(&mut index_builder, I32ArrayBuilder::new(self.chunk_size)).finish().into_ref();
                                     let value_arrays = [#(std::mem::replace(&mut #builders, #builder_types::with_type(self.chunk_size, #return_types)).finish().into_ref()),*];
                                     #build_value_array
-                                    yield DataChunk::new(vec![index_array, value_array], self.chunk_size);
+                                    let error_array = std::mem::replace(&mut error_builder, Utf8ArrayBuilder::new(self.chunk_size)).finish().into_ref();
+                                    if error_array.null_bitmap().any() {
+                                        yield DataChunk::new(vec![index_array, value_array, error_array], self.chunk_size);
+                                    } else {
+                                        yield DataChunk::new(vec![index_array, value_array], self.chunk_size);
+                                    }
                                 }
                             }
                         }
@@ -1243,7 +1426,12 @@ impl FunctionAttr {
                             let index_array = index_builder.finish().into_ref();
                             let value_arrays = [#(#builders.finish().into_ref()),*];
                             #build_value_array
-                            yield DataChunk::new(vec![index_array, value_array], len);
+                            let error_array = error_builder.finish().into_ref();
+                            if error_array.null_bitmap().any() {
+                                yield DataChunk::new(vec![index_array, value_array, error_array], len);
+                            } else {
+                                yield DataChunk::new(vec![index_array, value_array], len);
+                            }
                         }
                     }
                 }
@@ -1263,6 +1451,8 @@ fn sig_data_type(ty: &str) -> TokenStream2 {
     match ty {
         "any" => quote! { SigDataType::Any },
         "anyarray" => quote! { SigDataType::AnyArray },
+        "anymap" => quote! { SigDataType::AnyMap },
+        "vector" => quote! { SigDataType::Vector },
         "struct" => quote! { SigDataType::AnyStruct },
         _ if ty.starts_with("struct") && ty.contains("any") => quote! { SigDataType::AnyStruct },
         _ => {
@@ -1275,12 +1465,18 @@ fn sig_data_type(ty: &str) -> TokenStream2 {
 fn data_type(ty: &str) -> TokenStream2 {
     if let Some(ty) = ty.strip_suffix("[]") {
         let inner_type = data_type(ty);
-        return quote! { DataType::List(Box::new(#inner_type)) };
+        return quote! { DataType::list(#inner_type) };
     }
     if ty.starts_with("struct<") {
         return quote! { DataType::Struct(#ty.parse().expect("invalid struct type")) };
     }
     let variant = format_ident!("{}", types::data_type(ty));
+    // TODO: enable the check
+    // assert!(
+    //     !matches!(ty, "any" | "anyarray" | "anymap" | "struct"),
+    //     "{ty}, {variant}"
+    // );
+
     quote! { DataType::#variant }
 }
 

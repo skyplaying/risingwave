@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,14 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use risingwave_common::catalog::FragmentTypeMask;
+use risingwave_pb::id::FragmentId;
 use risingwave_pb::stream_plan::stream_fragment_graph::{
     StreamFragment as StreamFragmentProto, StreamFragmentEdge as StreamFragmentEdgeProto,
 };
-use risingwave_pb::stream_plan::{
-    DispatchStrategy, FragmentTypeFlag, StreamContext,
-    StreamFragmentGraph as StreamFragmentGraphProto, StreamNode,
-};
-use thiserror_ext::AsReport;
+use risingwave_pb::stream_plan::{DispatchStrategy, StreamNode};
 
-pub type LocalFragmentId = u32;
+pub type LocalFragmentId = FragmentId;
 
 /// [`StreamFragment`] represent a fragment node in fragment DAG.
 #[derive(Clone, Debug)]
@@ -36,16 +34,10 @@ pub struct StreamFragment {
     pub node: Option<Box<StreamNode>>,
 
     /// Bitwise-OR of type Flags of this fragment.
-    pub fragment_type_mask: u32,
+    pub fragment_type_mask: FragmentTypeMask,
 
     /// Mark whether this fragment requires exactly one actor.
     pub requires_singleton: bool,
-
-    /// Number of table ids (stateful states) for this fragment.
-    pub table_ids_cnt: u32,
-
-    /// Mark the upstream table ids of this fragment.
-    pub upstream_table_ids: Vec<u32>,
 }
 
 /// An edge between the nodes in the fragment graph.
@@ -64,11 +56,9 @@ impl StreamFragment {
     pub fn new(fragment_id: LocalFragmentId) -> Self {
         Self {
             fragment_id,
-            fragment_type_mask: FragmentTypeFlag::FragmentUnspecified as u32,
+            fragment_type_mask: FragmentTypeMask::empty(),
             requires_singleton: false,
             node: None,
-            table_ids_cnt: 0,
-            upstream_table_ids: vec![],
         }
     }
 
@@ -76,10 +66,8 @@ impl StreamFragment {
         StreamFragmentProto {
             fragment_id: self.fragment_id,
             node: self.node.clone().map(|n| *n),
-            fragment_type_mask: self.fragment_type_mask,
+            fragment_type_mask: self.fragment_type_mask.into(),
             requires_singleton: self.requires_singleton,
-            table_ids_cnt: self.table_ids_cnt,
-            upstream_table_ids: self.upstream_table_ids.clone(),
         }
     }
 }
@@ -88,32 +76,14 @@ impl StreamFragment {
 #[derive(Default)]
 pub struct StreamFragmentGraph {
     /// stores all the fragments in the graph.
-    fragments: HashMap<LocalFragmentId, Rc<StreamFragment>>,
+    pub(in crate::stream_fragmenter) fragments: HashMap<LocalFragmentId, Rc<StreamFragment>>,
 
     /// stores edges between fragments: (upstream, downstream) => edge.
-    edges: HashMap<(LocalFragmentId, LocalFragmentId), StreamFragmentEdgeProto>,
-
-    /// Stores the streaming context for the streaming plan
-    ctx: StreamContext,
+    pub(in crate::stream_fragmenter) edges:
+        HashMap<(LocalFragmentId, LocalFragmentId), StreamFragmentEdgeProto>,
 }
 
 impl StreamFragmentGraph {
-    pub fn to_protobuf(&self) -> StreamFragmentGraphProto {
-        StreamFragmentGraphProto {
-            fragments: self
-                .fragments
-                .iter()
-                .map(|(k, v)| (*k, v.to_protobuf()))
-                .collect(),
-            edges: self.edges.values().cloned().collect(),
-            ctx: Some(self.ctx.clone()),
-            // To be filled later
-            dependent_table_ids: vec![],
-            table_ids_cnt: 0,
-            parallelism: None,
-        }
-    }
-
     /// Adds a fragment to the graph.
     pub fn add_fragment(&mut self, stream_fragment: Rc<StreamFragment>) {
         let id = stream_fragment.fragment_id;
@@ -156,10 +126,8 @@ impl StreamFragmentGraph {
             .map(|_| ())
             .map_err(|e| {
                 format!(
-                    "edge between {} and {} already exists: {}",
-                    upstream_id,
-                    downstream_id,
-                    e.to_report_string()
+                    "edge between {upstream_id} and {downstream_id} already exists (existing: {:?})",
+                    e.entry.get(),
                 )
             })
     }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use anyhow::Result;
 use itertools::Itertools;
-use rand::{thread_rng, Rng};
+use rand::{RngExt as _, rng as thread_rng};
+use risingwave_common::hash::WorkerSlotId;
 use risingwave_simulation::cluster::{Cluster, KillOpts};
 use risingwave_simulation::ctl_ext::predicate::identity_contains;
 use tokio::time::sleep;
 
-use crate::sink::utils::{
-    start_sink_test_cluster, SimulationTestSink, SimulationTestSource, CREATE_SINK, CREATE_SOURCE,
-    DROP_SINK, DROP_SOURCE,
-};
+use crate::sink::utils::*;
 use crate::{assert_eq_with_err_returned as assert_eq, assert_with_err_returned as assert};
 
 async fn scale_and_check(
@@ -41,10 +39,10 @@ async fn scale_and_check(
         if prev_count == target_count {
             return Ok(());
         }
-        cluster.reschedule(plan).await?;
+        cluster.run(plan).await?;
         let after_count = test_sink.store.id_count();
         sleep(Duration::from_secs(10)).await;
-        if thread_rng().gen_bool(0.5) {
+        if thread_rng().random_bool(0.5) {
             sleep(Duration::from_secs(10)).await;
             let before_kill_count = test_sink.store.id_count();
             cluster.kill_node(&KillOpts::ALL).await;
@@ -54,12 +52,15 @@ async fn scale_and_check(
     Ok(())
 }
 
-async fn scale_test_inner(is_decouple: bool) -> Result<()> {
+async fn scale_test_inner(is_decouple: bool, test_type: TestSinkType) -> Result<()> {
+    init_logger();
     let mut cluster = start_sink_test_cluster().await?;
+
+    let total_cores = 6;
 
     let source_parallelism = 6;
 
-    let test_sink = SimulationTestSink::register_new();
+    let test_sink = SimulationTestSink::register_new(test_type);
     let test_source = SimulationTestSource::register_new(source_parallelism, 0..100000, 0.2, 20);
 
     let mut session = cluster.start_session();
@@ -72,26 +73,36 @@ async fn scale_test_inner(is_decouple: bool) -> Result<()> {
     }
     session.run(CREATE_SOURCE).await?;
     session.run(CREATE_SINK).await?;
-    assert_eq!(6, test_sink.parallelism_counter.load(Relaxed));
+    test_sink.wait_initial_parallelism(6).await?;
 
     let mut sink_fragments = cluster
         .locate_fragments([identity_contains("Sink")])
         .await?;
 
     assert_eq!(sink_fragments.len(), 1);
-    let framgment = sink_fragments.pop().unwrap();
-    let id = framgment.id();
+    let fragment = sink_fragments.pop().unwrap();
+    let id = fragment.id();
 
     let count = test_source.id_list.len();
+    let workers = fragment.all_worker_count().into_keys().collect_vec();
 
     scale_and_check(
         &mut cluster,
         &test_sink,
         count,
         vec![
-            (format!("{id}-[1,2,3]"), 3),
-            (format!("{id}-[4,5]+[1,2]"), 3),
-            (format!("{id}+[3,4,5]"), 6),
+            (
+                format!("alter sink test_sink set parallelism = {}", total_cores - 3),
+                3,
+            ),
+            (
+                format!("alter sink test_sink set parallelism = {}", total_cores - 4),
+                2,
+            ),
+            (
+                format!("alter sink test_sink set parallelism = {}", total_cores),
+                6,
+            ),
         ]
         .into_iter(),
     )
@@ -106,20 +117,42 @@ async fn scale_test_inner(is_decouple: bool) -> Result<()> {
     assert!(source_parallelism <= test_source.create_stream_count.load(Relaxed));
 
     assert_eq!(0, test_sink.parallelism_counter.load(Relaxed));
-    assert!(test_sink.store.inner().checkpoint_count > 0);
+    assert!(test_sink.store.checkpoint_count() > 0);
 
     test_sink.store.check_simple_result(&test_source.id_list)?;
-    assert!(test_sink.store.inner().checkpoint_count > 0);
+    assert!(test_sink.store.checkpoint_count() > 0);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_sink_scale() -> Result<()> {
-    scale_test_inner(false).await
+fn init_logger() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .try_init();
 }
 
-#[tokio::test]
-async fn test_sink_decouple_scale() -> Result<()> {
-    scale_test_inner(true).await
+macro_rules! define_tests {
+    ($($test_type:ident,)+) => {
+        $(
+            paste::paste! {
+                #[tokio::test]
+                async fn [<test_ $test_type:snake _scale>]() -> Result<()> {
+                    scale_test_inner(false, TestSinkType::$test_type).await
+                }
+
+                #[tokio::test]
+                async fn [<test_ $test_type:snake _decouple_scale>]() -> Result<()> {
+                    scale_test_inner(true, TestSinkType::$test_type).await
+                }
+            }
+        )+
+    };
+    () => {
+        $crate::for_all_sink_types! {
+            define_tests
+        }
+    }
 }
+
+define_tests!();

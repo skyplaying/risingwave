@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,21 @@ use risingwave_expr::window_function::WindowFuncKind;
 use risingwave_pb::expr::expr_node::Type;
 use risingwave_pb::plan_common::JoinType;
 
-use super::Rule;
+use super::prelude::{PlanRef, *};
 use crate::expr::{AggCall, ExprImpl, FunctionCall, InputRef, OrderBy};
 use crate::optimizer::plan_node::{
     LogicalAgg, LogicalJoin, LogicalProject, LogicalShare, PlanTreeNodeUnary,
 };
 use crate::utils::{Condition, GroupBy};
-use crate::PlanRef;
 pub struct OverWindowToAggAndJoinRule;
 
 impl OverWindowToAggAndJoinRule {
-    pub fn create() -> Box<dyn Rule> {
+    pub fn create() -> BoxedRule {
         Box::new(OverWindowToAggAndJoinRule)
     }
 }
 
-impl Rule for OverWindowToAggAndJoinRule {
+impl Rule<Logical> for OverWindowToAggAndJoinRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let over_window = plan.as_logical_over_window()?;
         let window_functions = over_window.window_functions();
@@ -51,9 +50,9 @@ impl Rule for OverWindowToAggAndJoinRule {
             .collect_vec();
         let mut select_exprs = group_exprs.clone();
         for func in window_functions {
-            if let WindowFuncKind::Aggregate(kind) = func.kind {
+            if let WindowFuncKind::Aggregate(kind) = &func.kind {
                 let agg_call = AggCall::new(
-                    kind,
+                    kind.clone(),
                     func.args.iter().map(|x| x.clone().into()).collect_vec(),
                     false,
                     OrderBy::any(),
@@ -85,7 +84,7 @@ impl Rule for OverWindowToAggAndJoinRule {
             |on_clause, (idx, x)| {
                 on_clause.and(Condition::with_expr(
                     FunctionCall::new(
-                        Type::Equal,
+                        Type::IsNotDistinctFrom,
                         vec![
                             x.clone().into(),
                             InputRef::new(idx + input_len, x.data_type.clone()).into(),

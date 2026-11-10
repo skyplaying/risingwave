@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,16 +17,19 @@
 //! See [this post](https://matklad.github.io/2021/02/27/delete-cargo-integration-tests.html)
 //! for the rationale behind this approach.
 
-#![feature(stmt_expr_attributes)]
-#![feature(lazy_cell)]
-#![feature(extract_if)]
+#![cfg_attr(madsim, feature(stmt_expr_attributes))]
+#![cfg_attr(madsim, feature(impl_trait_in_assoc_type))]
 
 mod backfill_tests;
 mod batch;
+mod compaction;
+mod default_parallelism;
+mod license_cpu_limit;
+mod log_store;
 mod recovery;
 mod scale;
 mod sink;
 mod storage;
+mod table_cache_refill;
 mod throttle;
-
 mod utils;

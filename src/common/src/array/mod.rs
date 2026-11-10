@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ pub mod interval_array;
 mod iterator;
 mod jsonb_array;
 pub mod list_array;
+mod map_array;
 mod num256_array;
 mod primitive_array;
 mod proto_reader;
@@ -35,7 +36,8 @@ mod stream_chunk_iter;
 pub mod stream_record;
 pub mod struct_array;
 mod utf8_array;
-mod value_reader;
+mod variant_array;
+mod vector_array;
 
 use std::convert::From;
 use std::hash::{Hash, Hasher};
@@ -53,7 +55,8 @@ pub use decimal_array::{DecimalArray, DecimalArrayBuilder};
 pub use interval_array::{IntervalArray, IntervalArrayBuilder};
 pub use iterator::ArrayIterator;
 pub use jsonb_array::{JsonbArray, JsonbArrayBuilder};
-pub use list_array::{ListArray, ListArrayBuilder, ListRef, ListValue};
+pub use list_array::{ListArray, ListArrayBuilder, ListRef, ListValue, ListWrite, ListWriter};
+pub use map_array::{MapArray, MapArrayBuilder, MapRef, MapValue};
 use paste::paste;
 pub use primitive_array::{PrimitiveArray, PrimitiveArrayBuilder, PrimitiveArrayItemType};
 use risingwave_common_estimate_size::EstimateSize;
@@ -62,12 +65,17 @@ pub use stream_chunk::{Op, StreamChunk, StreamChunkTestExt};
 pub use stream_chunk_builder::StreamChunkBuilder;
 pub use struct_array::{StructArray, StructArrayBuilder, StructRef, StructValue};
 pub use utf8_array::*;
+pub use variant_array::{VariantArray, VariantArrayBuilder};
+pub use vector_array::{
+    Finite32, VECTOR_AS_LIST_TYPE, VECTOR_DISTANCE_TYPE, VECTOR_ITEM_TYPE, VectorArray,
+    VectorArrayBuilder, VectorDistanceType, VectorItemType, VectorRef, VectorVal,
+};
 
 pub use self::error::ArrayError;
 pub use crate::array::num256_array::{Int256Array, Int256ArrayBuilder};
-use crate::buffer::Bitmap;
+use crate::bitmap::Bitmap;
 use crate::types::*;
-use crate::{dispatch_array_builder_variants, dispatch_array_variants, for_all_array_variants};
+use crate::{dispatch_array_builder_variants, dispatch_array_variants, for_all_variants};
 pub type ArrayResult<T> = Result<T, ArrayError>;
 
 pub type I64Array = PrimitiveArray<i64>;
@@ -105,6 +113,7 @@ pub trait ArrayBuilder: Send + Sync + Sized + 'static {
     type ArrayType: Array<Builder = Self>;
 
     /// Create a new builder with `capacity`.
+    /// TODO: remove this function from the trait. Let it be methods of each concrete builders.
     fn new(capacity: usize) -> Self;
 
     /// # Panics
@@ -135,6 +144,8 @@ pub trait ArrayBuilder: Send + Sync + Sized + 'static {
     fn append_array(&mut self, other: &Self::ArrayType);
 
     /// Pop an element from the builder.
+    ///
+    /// It's used in `rollback` in source parser.
     ///
     /// # Returns
     ///
@@ -217,10 +228,12 @@ pub trait Array:
     /// Retrieve a reference to value without checking the index boundary.
     #[inline]
     unsafe fn value_at_unchecked(&self, idx: usize) -> Option<Self::RefItem<'_>> {
-        if !self.is_null_unchecked(idx) {
-            Some(self.raw_value_at_unchecked(idx))
-        } else {
-            None
+        unsafe {
+            if !self.is_null_unchecked(idx) {
+                Some(self.raw_value_at_unchecked(idx))
+            } else {
+                None
+            }
         }
     }
 
@@ -259,7 +272,7 @@ pub trait Array:
     /// The unchecked version of `is_null`, ignore index out of bound check. It is
     /// the caller's responsibility to ensure the index is valid.
     unsafe fn is_null_unchecked(&self, idx: usize) -> bool {
-        !self.null_bitmap().is_set_unchecked(idx)
+        unsafe { !self.null_bitmap().is_set_unchecked(idx) }
     }
 
     fn set_bitmap(&mut self, bitmap: Bitmap);
@@ -299,15 +312,12 @@ pub trait Array:
     }
 }
 
-/// Implement `compact` on array, which removes element according to `visibility`.
-trait CompactableArray: Array {
+/// Implement `compact_vis` on array, which removes element according to `visibility`.
+#[easy_ext::ext(ArrayCompactVisExt)]
+impl<A: Array> A {
     /// Select some elements from `Array` based on `visibility` bitmap.
     /// `cardinality` is only used to decide capacity of the new `Array`.
-    fn compact(&self, visibility: &Bitmap, cardinality: usize) -> Self;
-}
-
-impl<A: Array> CompactableArray for A {
-    fn compact(&self, visibility: &Bitmap, cardinality: usize) -> Self {
+    pub fn compact_vis(&self, visibility: &Bitmap, cardinality: usize) -> Self {
         let mut builder = A::Builder::with_type(cardinality, self.data_type());
         for idx in visibility.iter_ones() {
             // SAFETY(value_at_unchecked): the idx is always in bound.
@@ -321,7 +331,7 @@ impl<A: Array> CompactableArray for A {
 
 /// Define `ArrayImpl` with macro.
 macro_rules! array_impl_enum {
-    ( $( { $variant_name:ident, $suffix_name:ident, $array:ty, $builder:ty } ),*) => {
+    ( $( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty } ),*) => {
         /// `ArrayImpl` embeds all possible array in `array` module.
         #[derive(Debug, Clone, EstimateSize)]
         pub enum ArrayImpl {
@@ -330,7 +340,11 @@ macro_rules! array_impl_enum {
     };
 }
 
-for_all_array_variants! { array_impl_enum }
+for_all_variants! { array_impl_enum }
+
+// We cannot put the From implementations in impl_convert,
+// because then we can't prove for all `T: PrimitiveArrayItemType`,
+// it's implemented.
 
 impl<T: PrimitiveArrayItemType> From<PrimitiveArray<T>> for ArrayImpl {
     fn from(arr: PrimitiveArray<T>) -> Self {
@@ -362,6 +376,12 @@ impl From<JsonbArray> for ArrayImpl {
     }
 }
 
+impl From<VariantArray> for ArrayImpl {
+    fn from(arr: VariantArray) -> Self {
+        Self::Variant(arr)
+    }
+}
+
 impl From<StructArray> for ArrayImpl {
     fn from(arr: StructArray) -> Self {
         Self::Struct(arr)
@@ -374,9 +394,21 @@ impl From<ListArray> for ArrayImpl {
     }
 }
 
+impl From<VectorArray> for ArrayImpl {
+    fn from(arr: VectorArray) -> Self {
+        Self::Vector(arr)
+    }
+}
+
 impl From<BytesArray> for ArrayImpl {
     fn from(arr: BytesArray) -> Self {
         Self::Bytea(arr)
+    }
+}
+
+impl From<MapArray> for ArrayImpl {
+    fn from(arr: MapArray) -> Self {
+        Self::Map(arr)
     }
 }
 
@@ -387,17 +419,23 @@ impl From<BytesArray> for ArrayImpl {
 /// * `ArrayImpl -> Array` with `From` trait.
 /// * `ArrayBuilder -> ArrayBuilderImpl` with `From` trait.
 macro_rules! impl_convert {
-    ($( { $variant_name:ident, $suffix_name:ident, $array:ty, $builder:ty } ),*) => {
+    ($( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty } ),*) => {
         $(
             paste! {
                 impl ArrayImpl {
+                    /// # Panics
+                    ///
+                    /// Panics if type mismatches.
                     pub fn [<as_ $suffix_name>](&self) -> &$array {
                         match self {
-                            Self::$variant_name(ref array) => array,
+                            Self::$variant_name(array) => array,
                             other_array => panic!("cannot convert ArrayImpl::{} to concrete type {}", other_array.get_ident(), stringify!($variant_name))
                         }
                     }
 
+                    /// # Panics
+                    ///
+                    /// Panics if type mismatches.
                     pub fn [<into_ $suffix_name>](self) -> $array {
                         match self {
                             Self::$variant_name(array) => array,
@@ -406,6 +444,7 @@ macro_rules! impl_convert {
                     }
                 }
 
+                // FIXME: panic in From here is not proper.
                 impl <'a> From<&'a ArrayImpl> for &'a $array {
                     fn from(array: &'a ArrayImpl) -> Self {
                         match array {
@@ -434,11 +473,11 @@ macro_rules! impl_convert {
     };
 }
 
-for_all_array_variants! { impl_convert }
+for_all_variants! { impl_convert }
 
 /// Define `ArrayImplBuilder` with macro.
 macro_rules! array_builder_impl_enum {
-    ($( { $variant_name:ident, $suffix_name:ident, $array:ty, $builder:ty } ),*) => {
+    ($( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty } ),*) => {
         /// `ArrayBuilderImpl` embeds all possible array in `array` module.
         #[derive(Debug, Clone, EstimateSize)]
         pub enum ArrayBuilderImpl {
@@ -447,7 +486,7 @@ macro_rules! array_builder_impl_enum {
     };
 }
 
-for_all_array_variants! { array_builder_impl_enum }
+for_all_variants! { array_builder_impl_enum }
 
 /// Implements all `ArrayBuilder` functions with `for_all_variant`.
 impl ArrayBuilderImpl {
@@ -554,9 +593,9 @@ impl ArrayImpl {
     }
 
     /// Select some elements from `Array` based on `visibility` bitmap.
-    pub fn compact(&self, visibility: &Bitmap, cardinality: usize) -> Self {
+    pub fn compact_vis(&self, visibility: &Bitmap, cardinality: usize) -> Self {
         dispatch_array_variants!(self, inner, {
-            inner.compact(visibility, cardinality).into()
+            inner.compact_vis(visibility, cardinality).into()
         })
     }
 
@@ -589,9 +628,11 @@ impl ArrayImpl {
     ///
     /// Unsafe version of getting the enum-wrapped `ScalarRefImpl` out of the `Array`.
     pub unsafe fn value_at_unchecked(&self, idx: usize) -> DatumRef<'_> {
-        dispatch_array_variants!(self, inner, {
-            inner.value_at_unchecked(idx).map(ScalarRefImpl::from)
-        })
+        unsafe {
+            dispatch_array_variants!(self, inner, {
+                inner.value_at_unchecked(idx).map(ScalarRefImpl::from)
+            })
+        }
     }
 
     pub fn set_bitmap(&mut self, bitmap: Bitmap) {
@@ -706,14 +747,14 @@ mod test_util {
     use std::hash::{BuildHasher, Hasher};
 
     use super::Array;
-    use crate::buffer::Bitmap;
+    use crate::bitmap::Bitmap;
     use crate::util::iter_util::ZipEqFast;
 
     pub fn hash_finish<H: Hasher>(hashers: &[H]) -> Vec<u64> {
-        return hashers
+        hashers
             .iter()
             .map(|hasher| hasher.finish())
-            .collect::<Vec<u64>>();
+            .collect::<Vec<u64>>()
     }
 
     pub fn test_hash<H: BuildHasher, A: Array>(arrs: Vec<A>, expects: Vec<u64>, hasher_builder: H) {

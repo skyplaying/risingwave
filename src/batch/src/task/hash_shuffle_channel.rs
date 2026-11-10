@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use risingwave_common::array::DataChunk;
-use risingwave_common::buffer::Bitmap;
+use risingwave_common::bitmap::Bitmap;
 use risingwave_common::util::hash_util::Crc32FastBuilder;
 use risingwave_pb::batch_plan::exchange_info::HashInfo;
 use risingwave_pb::batch_plan::*;

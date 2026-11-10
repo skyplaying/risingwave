@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod cache_refill_metrics;
+pub use cache_refill_metrics::*;
 mod hummock_state_store_metrics;
 use futures::Future;
 pub use hummock_state_store_metrics::*;
@@ -32,12 +34,12 @@ pub use local_metrics::*;
 mod hitmap;
 pub use hitmap::*;
 pub use risingwave_object_store::object::object_metrics::{
-    ObjectStoreMetrics, GLOBAL_OBJECT_STORE_METRICS,
+    GLOBAL_OBJECT_STORE_METRICS, ObjectStoreMetrics,
 };
 
 // include only when hummock trace enabled
 #[cfg(all(not(madsim), feature = "hm-trace"))]
-mod traced_store;
+pub(crate) mod traced_store;
 
 pub trait HummockTraceFutureExt: Sized + Future {
     type TraceOutput;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use num_traits::Zero;
 use risingwave_common::types::{Date, Interval, Timestamp, Timestamptz};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 #[inline(always)]
 fn interval_to_micro_second(t: Interval) -> Result<i64> {
@@ -38,17 +38,15 @@ pub fn tumble_start_date(timestamp: Date, window_size: Interval) -> Result<Times
 
 #[function("tumble_start(timestamp, interval) -> timestamp")]
 pub fn tumble_start_date_time(timestamp: Timestamp, window_size: Interval) -> Result<Timestamp> {
-    let timestamp_micro_second = timestamp.0.timestamp_micros();
+    let timestamp_micro_second = timestamp.0.and_utc().timestamp_micros();
     let window_start_micro_second = get_window_start(timestamp_micro_second, window_size)?;
-    Ok(Timestamp::from_timestamp_uncheck(
-        window_start_micro_second / 1_000_000,
-        (window_start_micro_second % 1_000_000 * 1000) as u32,
-    ))
+    Timestamp::with_micros(window_start_micro_second).map_err(|_| ExprError::NumericOutOfRange)
 }
 
 #[function("tumble_start(timestamptz, interval) -> timestamptz")]
 pub fn tumble_start_timestamptz(tz: Timestamptz, window_size: Interval) -> Result<Timestamptz> {
-    get_window_start(tz.timestamp_micros(), window_size).map(Timestamptz::from_micros)
+    get_window_start(tz.timestamp_micros(), window_size)
+        .and_then(|us| Timestamptz::from_micros(us).ok_or(ExprError::NumericOutOfRange))
 }
 
 /// The common part of PostgreSQL function `timestamp_bin` and `timestamptz_bin`.
@@ -72,14 +70,11 @@ pub fn tumble_start_offset_date_time(
     window_size: Interval,
     offset: Interval,
 ) -> Result<Timestamp> {
-    let timestamp_micro_second = time.0.timestamp_micros();
+    let timestamp_micro_second = time.0.and_utc().timestamp_micros();
     let window_start_micro_second =
         get_window_start_with_offset(timestamp_micro_second, window_size, offset)?;
 
-    Ok(Timestamp::from_timestamp_uncheck(
-        window_start_micro_second / 1_000_000,
-        (window_start_micro_second % 1_000_000 * 1000) as u32,
-    ))
+    Timestamp::with_micros(window_start_micro_second).map_err(|_| ExprError::NumericOutOfRange)
 }
 
 #[inline(always)]
@@ -115,14 +110,14 @@ pub fn tumble_start_offset_timestamptz(
     offset: Interval,
 ) -> Result<Timestamptz> {
     get_window_start_with_offset(tz.timestamp_micros(), window_size, offset)
-        .map(Timestamptz::from_micros)
+        .and_then(|us| Timestamptz::from_micros(us).ok_or(ExprError::NumericOutOfRange))
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{Datelike, Timelike};
     use risingwave_common::types::test_utils::IntervalTestExt;
-    use risingwave_common::types::{Date, Interval};
+    use risingwave_common::types::{Date, Interval, Timestamp};
 
     use super::tumble_start_offset_date_time;
     use crate::scalar::tumble::{
@@ -140,6 +135,14 @@ mod tests {
         assert_eq!(w.hour(), 22);
         assert_eq!(w.minute(), 0);
         assert_eq!(w.second(), 0);
+    }
+
+    #[test]
+    fn test_tumble_start_negative_fractional() {
+        // A pre-1970 sub-second window start used to wrap `as u32` and panic.
+        let dt = "1969-12-31 23:59:58.450".parse::<Timestamp>().unwrap();
+        let w = tumble_start_date_time(dt, Interval::from_millis(100)).unwrap();
+        assert_eq!(w, "1969-12-31 23:59:58.400".parse::<Timestamp>().unwrap());
     }
 
     #[test]

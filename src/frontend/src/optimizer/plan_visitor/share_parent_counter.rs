@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,27 +14,31 @@
 
 use std::collections::HashMap;
 
-use super::{DefaultBehavior, DefaultValue};
-use crate::optimizer::plan_node::generic::GenericPlanRef;
-use crate::optimizer::plan_node::{LogicalShare, PlanNodeId, PlanTreeNodeUnary};
+use super::{DefaultBehavior, DefaultValue, LogicalPlanVisitor};
+use crate::optimizer::ShareId;
+use crate::optimizer::plan_node::{LogicalShare, PlanTreeNodeUnary, ShareNode};
 use crate::optimizer::plan_visitor::PlanVisitor;
 
 #[derive(Debug, Clone, Default)]
 pub struct ShareParentCounter {
-    /// Plan node id to parent number mapping.
-    parent_counter: HashMap<PlanNodeId, usize>,
+    /// Share identity to parent number mapping.
+    parent_counter: HashMap<ShareId, usize>,
 }
 
 impl ShareParentCounter {
     pub fn get_parent_num(&self, share: &LogicalShare) -> usize {
+        self.get_parent_num_by_id(share.share_id())
+    }
+
+    pub fn get_parent_num_by_id(&self, share_id: ShareId) -> usize {
         *self
             .parent_counter
-            .get(&share.id())
+            .get(&share_id)
             .expect("share must exist")
     }
 }
 
-impl PlanVisitor for ShareParentCounter {
+impl LogicalPlanVisitor for ShareParentCounter {
     type Result = ();
 
     type DefaultBehavior = impl DefaultBehavior<Self::Result>;
@@ -46,7 +50,7 @@ impl PlanVisitor for ShareParentCounter {
     fn visit_logical_share(&mut self, share: &LogicalShare) {
         let v = self
             .parent_counter
-            .entry(share.id())
+            .entry(share.share_id())
             .and_modify(|counter| *counter += 1)
             .or_insert(1);
         if *v == 1 {

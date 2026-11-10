@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
+
 use expr_node::Type;
 use risingwave_pb::expr::expr_node;
 
@@ -20,21 +22,91 @@ use crate::expr::FunctionCall;
 
 #[derive(Default)]
 pub(crate) struct ImpureAnalyzer {
-    pub(crate) impure: bool,
+    impure: Option<Cow<'static, str>>,
+}
+
+impl ImpureAnalyzer {
+    /// Returns `true` if the expression is impure.
+    ///
+    /// Only call this method after visiting the expression.
+    pub fn is_impure(&self) -> bool {
+        self.impure.is_some()
+    }
+
+    /// Returns the description of the impure expression if it is impure, for error reporting.
+    /// `None` if the expression is pure.
+    ///
+    /// Only call this method after visiting the expression.
+    pub fn impure_expr_desc(&self) -> Option<&str> {
+        self.impure.as_deref()
+    }
 }
 
 impl ExprVisitor for ImpureAnalyzer {
-    fn visit_user_defined_function(&mut self, _func_call: &super::UserDefinedFunction) {
-        self.impure = true;
+    fn visit_user_defined_function(&mut self, func_call: &super::UserDefinedFunction) {
+        if func_call.catalog.is_immutable {
+            func_call.args.iter().for_each(|expr| self.visit_expr(expr));
+        } else {
+            let name = &func_call.catalog.name;
+            self.impure = Some(format!("user-defined function `{name}`").into());
+        }
+    }
+
+    fn visit_table_function(&mut self, func_call: &super::TableFunction) {
+        use crate::expr::table_function::TableFunctionType as Type;
+        let func_type = func_call.function_type;
+        match func_type {
+            Type::Unspecified => unreachable!(),
+
+            // deterministic
+            Type::GenerateSeries
+            | Type::Unnest
+            | Type::RegexpMatches
+            | Type::Range
+            | Type::GenerateSubscripts
+            | Type::PgExpandarray
+            | Type::JsonbArrayElements
+            | Type::JsonbArrayElementsText
+            | Type::JsonbEach
+            | Type::JsonbEachText
+            | Type::JsonbObjectKeys
+            | Type::JsonbPathQuery
+            | Type::JsonbPopulateRecordset
+            | Type::JsonbToRecordset => {
+                func_call.args.iter().for_each(|expr| self.visit_expr(expr));
+            }
+
+            // indeterministic
+            Type::FileScan
+            | Type::PostgresQuery
+            | Type::MysqlQuery
+            | Type::MssqlQuery
+            | Type::InternalBackfillProgress
+            | Type::InternalSourceBackfillProgress
+            | Type::InternalGetChannelDeltaStats
+            | Type::PgGetKeywords => {
+                self.impure = Some(func_type.as_str_name().into());
+            }
+            Type::UserDefined => {
+                let name = &func_call.user_defined.as_ref().unwrap().name;
+                self.impure = Some(format!("user-defined table function `{name}`").into());
+            }
+        }
     }
 
     fn visit_now(&mut self, _: &super::Now) {
-        self.impure = true;
+        self.impure = Some("NOW or PROCTIME".into());
+    }
+
+    fn visit_secret_ref(&mut self, secret_ref: &super::SecretRef) {
+        self.impure = Some(format!("secret reference `{}`", secret_ref.secret_name).into());
     }
 
     fn visit_function_call(&mut self, func_call: &super::FunctionCall) {
-        match func_call.func_type() {
+        let func_type = func_call.func_type();
+        match func_type {
             Type::Unspecified => unreachable!(),
+            #[expect(deprecated)]
             Type::Add
             | Type::Subtract
             | Type::Multiply
@@ -64,6 +136,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::SecToTimestamptz
             | Type::AtTimeZone
             | Type::DateTrunc
+            | Type::DateBin
             | Type::MakeDate
             | Type::MakeTime
             | Type::MakeTimestamp
@@ -104,6 +177,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::CharLength
             | Type::Repeat
             | Type::ConcatOp
+            | Type::ByteaConcatOp
             | Type::Concat
             | Type::ConcatVariadic
             | Type::BoolOut
@@ -135,14 +209,19 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::Cot
             | Type::Asin
             | Type::Acos
+            | Type::Acosd
             | Type::Atan
             | Type::Atan2
+            | Type::Atand
+            | Type::Atan2d
             | Type::Sqrt
             | Type::Cbrt
             | Type::Sign
             | Type::Scale
             | Type::MinScale
             | Type::TrimScale
+            | Type::Gamma
+            | Type::Lgamma
             | Type::Left
             | Type::Right
             | Type::Degrees
@@ -167,6 +246,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::ArraySum
             | Type::ArraySort
             | Type::ArrayAppend
+            | Type::ArrayReverse
             | Type::ArrayPrepend
             | Type::FormatType
             | Type::ArrayDistinct
@@ -180,6 +260,8 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::ArrayPosition
             | Type::ArrayContains
             | Type::ArrayContained
+            | Type::ArrayOverlaps
+            | Type::ArrayFlatten
             | Type::HexToInt256
             | Type::JsonbConcat
             | Type::JsonbAccess
@@ -203,14 +285,21 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::JsonbBuildArrayVariadic
             | Type::JsonbBuildObject
             | Type::JsonbPopulateRecord
+            | Type::JsonbToArray
             | Type::JsonbToRecord
             | Type::JsonbBuildObjectVariadic
             | Type::JsonbPathExists
             | Type::JsonbPathMatch
             | Type::JsonbPathQueryArray
             | Type::JsonbPathQueryFirst
+            | Type::JsonbSet
+            | Type::JsonbPopulateMap
             | Type::IsJson
             | Type::ToJsonb
+            | Type::ToVariant
+            | Type::VariantGet
+            | Type::TryVariantGet
+            | Type::VariantTypeof
             | Type::Sind
             | Type::Cosd
             | Type::Cotd
@@ -224,11 +313,20 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::Acosh
             | Type::Decode
             | Type::Encode
+            | Type::GetBit
+            | Type::GetByte
+            | Type::SetBit
+            | Type::SetByte
+            | Type::BitCount
             | Type::Sha1
             | Type::Sha224
             | Type::Sha256
             | Type::Sha384
             | Type::Sha512
+            | Type::Crc32
+            | Type::Crc32c
+            | Type::Hmac
+            | Type::SecureCompare
             | Type::Decrypt
             | Type::Encrypt
             | Type::Tand
@@ -247,7 +345,36 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::InetNtoa
             | Type::InetAton
             | Type::QuoteLiteral
-            | Type::QuoteNullable =>
+            | Type::QuoteNullable
+            | Type::MapFromEntries
+            | Type::MapAccess
+            | Type::MapKeys
+            | Type::MapValues
+            | Type::MapEntries
+            | Type::MapFromKeyValues
+            | Type::MapCat
+            | Type::MapContains
+            | Type::MapDelete
+            | Type::MapFilter
+            | Type::MapInsert
+            | Type::MapLength
+            | Type::L2Distance
+            | Type::CosineDistance
+            | Type::L1Distance
+            | Type::InnerProduct
+            | Type::VecConcat
+            | Type::L2Norm
+            | Type::L2Normalize
+            | Type::Subvector
+            // TODO: `rw_vnode` is more like STABLE instead of IMMUTABLE, because even its result is
+            // deterministic, it needs to read the total vnode count from the context, which means that
+            // it cannot be evaluated during constant folding. We have to treat it pure here so it can be used
+            // internally without materialization.
+            | Type::Vnode
+            | Type::VnodeUser
+            | Type::RwEpochToTs
+            | Type::CheckNotNull
+            | Type::CompositeCast =>
             // expression output is deterministic(same result for the same input)
             {
                 func_call
@@ -256,7 +383,8 @@ impl ExprVisitor for ImpureAnalyzer {
                     .for_each(|expr| self.visit_expr(expr));
             }
             // expression output is not deterministic
-            Type::Vnode
+            Type::TestFeature
+            | Type::License
             | Type::Proctime
             | Type::PgSleep
             | Type::PgSleepFor
@@ -269,28 +397,88 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::PgIndexesSize
             | Type::PgRelationSize
             | Type::PgGetSerialSequence
+            | Type::PgIndexColumnHasProperty
             | Type::HasTablePrivilege
             | Type::HasAnyColumnPrivilege
             | Type::HasSchemaPrivilege
-            | Type::MakeTimestamptz => self.impure = true,
+            | Type::MakeTimestamptz
+            | Type::PgIsInRecovery
+            | Type::RwRecoveryStatus
+            | Type::RwClusterId
+            | Type::RwFragmentVnodes
+            | Type::RwActorVnodes
+            | Type::PgTableIsVisible
+            | Type::HasFunctionPrivilege
+            | Type::OpenaiEmbedding
+            | Type::HasDatabasePrivilege
+            | Type::Random
+            | Type::ClockTimestamp
+            | Type::GenRandomUuid => self.impure = Some(func_type.as_str_name().into()),
         }
     }
 }
 
+/// Returns whether every function in the expression always produces the same result for the same
+/// inputs, so that the expression can be re-evaluated or moved by the optimizer.
+///
+/// - Built-in scalar and table functions are pure when they are deterministic, as classified by
+///   [`ImpureAnalyzer`]. `NOW`, `PROCTIME` and secret references are impure.
+/// - User-defined scalar functions are pure when they are declared `IMMUTABLE`. The planner
+///   trusts the declaration; it cannot verify the implementation. User-defined table functions
+///   are always impure.
+///
+/// A pure expression may still have its evaluated results materialized on retract streams: a UDF
+/// keeps materialization unless it sets `unsafe_skip_materializing_exprs`. Whether an expression
+/// needs materialization is decided by [`needs_materialization`].
 pub fn is_pure(expr: &ExprImpl) -> bool {
     !is_impure(expr)
 }
 
+/// The inverse of [`is_pure`].
 pub fn is_impure(expr: &ExprImpl) -> bool {
     let mut a = ImpureAnalyzer::default();
     a.visit_expr(expr);
-    a.impure
+    a.is_impure()
 }
 
 pub fn is_impure_func_call(func_call: &FunctionCall) -> bool {
     let mut a = ImpureAnalyzer::default();
     a.visit_function_call(func_call);
-    a.impure
+    a.is_impure()
+}
+
+/// Returns the description of the impure expression if it is impure, for error reporting.
+/// `None` if the expression is pure.
+pub fn impure_expr_desc(expr: &ExprImpl) -> Option<String> {
+    let mut a = ImpureAnalyzer::default();
+    a.visit_expr(expr);
+    a.impure_expr_desc().map(|s| s.to_owned())
+}
+
+/// Finds UDFs that keep their evaluated results materialized on retract streams, that is, UDFs
+/// without `unsafe_skip_materializing_exprs`.
+#[derive(Default)]
+struct MaterializationAnalyzer {
+    needs_materialization: bool,
+}
+
+impl ExprVisitor for MaterializationAnalyzer {
+    fn visit_user_defined_function(&mut self, func_call: &super::UserDefinedFunction) {
+        self.needs_materialization |= !func_call.catalog.unsafe_skip_materializing_exprs;
+        func_call.args.iter().for_each(|expr| self.visit_expr(expr));
+    }
+}
+
+/// Returns whether a streaming project on a retract stream must materialize the evaluated results
+/// of the expression: when the expression is impure, or when it calls a UDF without
+/// `unsafe_skip_materializing_exprs`.
+pub fn needs_materialization(expr: &ExprImpl) -> bool {
+    if is_impure(expr) {
+        return true;
+    }
+    let mut a = MaterializationAnalyzer::default();
+    a.visit_expr(expr);
+    a.needs_materialization
 }
 
 #[cfg(test)]
@@ -298,7 +486,7 @@ mod tests {
     use risingwave_common::types::DataType;
     use risingwave_pb::expr::expr_node::Type;
 
-    use crate::expr::{is_impure, is_pure, ExprImpl, FunctionCall, InputRef};
+    use crate::expr::{ExprImpl, FunctionCall, InputRef, is_impure, is_pure};
 
     fn expect_pure(expr: &ExprImpl) {
         assert!(is_pure(expr));

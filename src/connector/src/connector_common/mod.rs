@@ -12,12 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod mqtt_common;
+//! Common parameters and utilities for both source and sink.
+
+mod mqtt_common;
 pub use mqtt_common::{MqttCommon, QualityOfService as MqttQualityOfService};
 
-pub mod common;
+mod pubsub_common;
+pub(crate) use pubsub_common::resolve_pubsub_project_id;
+
+mod common;
 pub use common::{
-    AwsAuthProps, AwsPrivateLinkItem, KafkaCommon, KafkaPrivateLinkCommon, KinesisCommon,
-    NatsCommon, PulsarCommon, PulsarOauthCommon, RdKafkaPropertiesCommon,
-    PRIVATE_LINK_BROKER_REWRITE_MAP_KEY, PRIVATE_LINK_TARGETS_KEY,
+    AwsAuthProps, AwsPrivateLinkItem, DISABLE_DEFAULT_CREDENTIAL, KafkaCommon,
+    KafkaConnectionProps, KafkaPrivateLinkCommon, KinesisCommon, MongodbCommon, NatsCommon,
+    NatsConnectionProps, PRIVATE_LINK_BROKER_REWRITE_MAP_KEY, PRIVATE_LINK_TARGETS_KEY,
+    PulsarCommon, PulsarOauthCommon, RdKafkaPropertiesCommon, SHARED_NATS_CLIENT,
+    TcpKeepaliveConfig,
 };
+mod connection;
+pub use connection::{
+    ConfluentSchemaRegistryConnection, Connection, ElasticsearchConnection, IcebergConnection,
+    KafkaConnection, SCHEMA_REGISTRY_CONNECTION_TYPE, read_kafka_log_level, validate_connection,
+};
+pub use iceberg::compaction::{IcebergCommittedSnapshot, IcebergSinkCompactionUpdate};
+#[cfg(any(test, feature = "test"))]
+pub use iceberg::mock_catalog;
+
+mod iceberg;
+#[cfg(not(madsim))]
+mod maybe_tls_connector;
+pub mod postgres;
+pub mod sql_server;
+pub use iceberg::{
+    IcebergCatalogKind, IcebergCatalogRuntime, IcebergCommon, IcebergTableIdentifier,
+    ResolvedIcebergCatalogConfig, iceberg_java_catalog_props_from_options,
+};
+pub use postgres::{
+    PgConnectionConfig, PostgresExternalTable, SslMode, create_pg_client,
+    create_pg_client_from_properties, discover_pgvector_dimensions,
+    pg_connection_config_from_properties,
+};
+#[cfg(test)]
+mod common_test;

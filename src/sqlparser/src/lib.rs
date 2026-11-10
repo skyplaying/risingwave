@@ -30,22 +30,17 @@
 //! println!("AST: {:?}", ast);
 //! ```
 
-#![cfg_attr(not(feature = "std"), no_std)]
-#![feature(lint_reasons)]
-#![feature(let_chains)]
 #![expect(clippy::doc_markdown)]
 #![expect(clippy::upper_case_acronyms)]
 #![feature(register_tool)]
 #![register_tool(rw)]
-#![allow(rw::format_error)] // external crate
-
-#[cfg(not(feature = "std"))]
-extern crate alloc;
+#![expect(rw::format_error)] // external crate
 
 pub mod ast;
 pub mod keywords;
 pub mod parser;
 pub mod parser_v2;
+pub mod quote_ident;
 pub mod tokenizer;
 
 #[doc(hidden)]

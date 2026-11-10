@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,8 @@
 use itertools::Itertools;
 use risingwave_pb::plan_common::JoinType;
 
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::optimizer::plan_node::{LogicalApply, LogicalFilter, LogicalTopN};
-use crate::optimizer::PlanRef;
 use crate::utils::Condition;
 
 /// Transpose `LogicalApply` and `LogicalTopN`.
@@ -42,14 +41,15 @@ use crate::utils::Condition;
 ///  Domain        Input
 /// ```
 pub struct ApplyTopNTransposeRule {}
-impl Rule for ApplyTopNTransposeRule {
+impl Rule<Logical> for ApplyTopNTransposeRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let apply: &LogicalApply = plan.as_logical_apply()?;
         let (left, right, on, join_type, correlated_id, correlated_indices, max_one_row) =
             apply.clone().decompose();
         assert_eq!(join_type, JoinType::Inner);
         let topn: &LogicalTopN = right.as_logical_top_n()?;
-        let (topn_input, limit, offset, with_ties, mut order, group_key) = topn.clone().decompose();
+        let (topn_input, limit, offset, with_ties, mut order, mut group_key) =
+            topn.clone().decompose();
 
         let apply_left_len = left.schema().len();
 
@@ -73,6 +73,7 @@ impl Rule for ApplyTopNTransposeRule {
                 .column_orders
                 .iter_mut()
                 .for_each(|ord| ord.column_index += apply_left_len);
+            group_key.iter_mut().for_each(|idx| *idx += apply_left_len);
             let new_group_key = (0..apply_left_len).chain(group_key).collect_vec();
             LogicalTopN::new(new_apply, limit, offset, with_ties, order, new_group_key)
         };

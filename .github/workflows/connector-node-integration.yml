@@ -1,5 +1,9 @@
 name: Connector Node Integration Tests
 
+permissions:
+  contents: read
+  pull-requests: read
+
 on:
   push:
     branches: [ main ]
@@ -10,28 +14,62 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: risingwave-large # this runner comes with more disk space, necessary for workflows that build RW
     strategy:
       matrix:
-        java: [ '11', '17' ]
+        java: [ '21' ]
     name: Java ${{ matrix.java }}
+    env:
+      # External test dependency only; do not bundle Oracle into RisingWave images.
+      ORACLE_TEST_IMAGE: container-registry.oracle.com/database/free:23.9.0.0
     steps:
-      - uses: actions/checkout@v3
-      - uses: dorny/paths-filter@v2
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
+          # Empty for other events; without it, `merge_group` would diff against `main`.
+          base: ${{ github.event.merge_group.base_ref }}
           filters: |
             java:
               - 'java/**'
+              - '.github/workflows/connector-node-integration.yml'
             proto:
               - 'proto/**'
       - name: Set up JDK ${{ matrix.java }}
         if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v5
         with:
           java-version: ${{ matrix.java }}
           distribution: 'adopt'
-          cache: 'maven'
+      - name: Get the Debezium submodule commit
+        if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
+        id: debezium
+        run: echo "commit=$(git rev-parse HEAD:java/debezium)" >> "$GITHUB_OUTPUT"
+      - name: Cache the local Maven repository
+        if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: v1-cache-maven-${{ runner.os }}-${{ hashFiles('.github/workflows/connector-node-integration.yml') }}-${{ hashFiles('java/build-debezium.sh') }}-${{ hashFiles('java/pom.xml') }}-${{ steps.debezium.outputs.commit }}
+          restore-keys: |
+            v1-cache-maven-${{ runner.os }}-
+            v1-cache-maven-
+      - name: Setup Rust toolchain
+        if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
+        run: rustup show
+      - name: Install build dependencies
+        if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make build-essential cmake protobuf-compiler \
+            libssl-dev libsasl2-dev libcurl4-openssl-dev pkg-config \
+            lld libopenblas-dev liblapack-dev
+      - name: Pre-pull Oracle source test image
+        if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
+        timeout-minutes: 10
+        run: docker pull "$ORACLE_TEST_IMAGE"
       - name: run integration tests
         if: steps.filter.outputs.java == 'true' || steps.filter.outputs.proto == 'true'
         run: |
@@ -39,11 +77,9 @@ jobs:
 
           RISINGWAVE_ROOT=${PWD}
 
-          echo "--- build connector node"
+          echo "--- build connector node with Rust native library"
           cd ${RISINGWAVE_ROOT}/java
-          # run unit test
-          # WARN: `testOnNext_writeValidation` is skipped because it relies on Rust code to decode message,
-          #       while we don't build Rust code (`-Dno-build-rust`) here to save time
-          mvn --batch-mode --update-snapshots clean package -Dno-build-rust \
-            '-Dtest=!com.risingwave.connector.sink.SinkStreamObserverTest#testOnNext_writeValidation' \
-            -Dsurefire.failIfNoSpecifiedTests=false
+          ./build-debezium.sh
+          # Build with Rust to support OpendalSchemaHistory in MySQL CDC integration tests
+          mvn --batch-mode --update-snapshots clean package -Dapi.version=1.44 \
+            -Doracle.test.image="$ORACLE_TEST_IMAGE"

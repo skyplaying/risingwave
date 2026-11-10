@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,10 @@ use itertools::Itertools;
 use risingwave_common::config::ObjectStoreConfig;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_object_store::object::{
-    InMemObjectStore, MonitoredObjectStore, ObjectError, ObjectStoreImpl, ObjectStoreRef,
+    InMemObjectStore, MonitoredObjectStore, MonitoredStreamingReader, ObjectError, ObjectStoreImpl,
+    ObjectStoreRef,
 };
+use tokio::sync::RwLock;
 
 use crate::meta_snapshot::{MetaSnapshot, Metadata};
 use crate::{
@@ -41,8 +43,11 @@ pub trait MetaSnapshotStorage: 'static + Sync + Send {
     /// Gets a snapshot by id.
     async fn get<S: Metadata>(&self, id: MetaSnapshotId) -> BackupResult<MetaSnapshot<S>>;
 
+    /// Gets encoded snapshot bytes stream by id.
+    async fn get_bytes_stream(&self, id: MetaSnapshotId) -> BackupResult<MonitoredStreamingReader>;
+
     /// Gets local snapshot manifest.
-    fn manifest(&self) -> Arc<MetaSnapshotManifest>;
+    async fn manifest(&self) -> Arc<MetaSnapshotManifest>;
 
     /// Refreshes local snapshot manifest.
     async fn refresh_manifest(&self) -> BackupResult<()>;
@@ -55,14 +60,14 @@ pub trait MetaSnapshotStorage: 'static + Sync + Send {
 pub struct ObjectStoreMetaSnapshotStorage {
     path: String,
     store: ObjectStoreRef,
-    manifest: Arc<parking_lot::RwLock<Arc<MetaSnapshotManifest>>>,
+    manifest: Arc<RwLock<Arc<MetaSnapshotManifest>>>,
 }
 
 // TODO #6482: purge stale snapshots that is not in manifest.
 impl ObjectStoreMetaSnapshotStorage {
     pub async fn new(path: &str, store: ObjectStoreRef) -> BackupResult<Self> {
         let instance = Self {
-            path: path.to_string(),
+            path: path.to_owned(),
             store,
             manifest: Default::default(),
         };
@@ -70,13 +75,18 @@ impl ObjectStoreMetaSnapshotStorage {
         Ok(instance)
     }
 
-    async fn update_manifest(&self, new_manifest: MetaSnapshotManifest) -> BackupResult<()> {
+    async fn update_manifest(
+        &self,
+        update: impl FnOnce(MetaSnapshotManifest) -> MetaSnapshotManifest,
+    ) -> BackupResult<()> {
+        let mut guard = self.manifest.write().await;
+        let new_manifest = update((**guard).clone());
         let bytes =
             serde_json::to_vec(&new_manifest).map_err(|e| BackupError::Encoding(e.into()))?;
         self.store
             .upload(&self.get_manifest_path(), bytes.into())
             .await?;
-        *self.manifest.write() = Arc::new(new_manifest);
+        *guard = Arc::new(new_manifest);
         Ok(())
     }
 
@@ -104,7 +114,7 @@ impl ObjectStoreMetaSnapshotStorage {
         format!("{}/{}.snapshot", self.path, id)
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn get_snapshot_id_from_path(path: &str) -> MetaSnapshotId {
         let split = path.split(&['/', '.']).collect_vec();
         debug_assert!(split.len() > 2);
@@ -123,36 +133,40 @@ impl MetaSnapshotStorage for ObjectStoreMetaSnapshotStorage {
         remarks: Option<String>,
     ) -> BackupResult<()> {
         let path = self.get_snapshot_path(snapshot.id);
-        self.store.upload(&path, snapshot.encode()?.into()).await?;
-
-        // update manifest last
-        let mut new_manifest = (**self.manifest.read()).clone();
-        new_manifest.manifest_id += 1;
-        new_manifest
-            .snapshot_metadata
-            .push(MetaSnapshotMetadata::new(
+        let uploader = self.store.streaming_upload(&path).await?;
+        snapshot.encode_to_uploader(uploader).await?;
+        self.update_manifest(|mut manifest: MetaSnapshotManifest| {
+            manifest.manifest_id += 1;
+            manifest.snapshot_metadata.push(MetaSnapshotMetadata::new(
                 snapshot.id,
                 snapshot.metadata.hummock_version_ref(),
                 snapshot.format_version,
                 remarks,
+                snapshot.metadata.table_change_log_object_ids().into_iter(),
             ));
-        self.update_manifest(new_manifest).await?;
+            manifest
+        })
+        .await?;
         Ok(())
     }
 
     async fn get<S: Metadata>(&self, id: MetaSnapshotId) -> BackupResult<MetaSnapshot<S>> {
-        let path = self.get_snapshot_path(id);
-        let data = self.store.read(&path, ..).await?;
-        MetaSnapshot::decode(&data)
+        let reader = self.get_bytes_stream(id).await?;
+        MetaSnapshot::decode_from_stream(reader).await
     }
 
-    fn manifest(&self) -> Arc<MetaSnapshotManifest> {
-        self.manifest.read().clone()
+    async fn get_bytes_stream(&self, id: MetaSnapshotId) -> BackupResult<MonitoredStreamingReader> {
+        let path = self.get_snapshot_path(id);
+        Ok(self.store.streaming_read(&path, ..).await?)
+    }
+
+    async fn manifest(&self) -> Arc<MetaSnapshotManifest> {
+        self.manifest.read().await.clone()
     }
 
     async fn refresh_manifest(&self) -> BackupResult<()> {
         if let Some(manifest) = self.get_manifest().await? {
-            let mut guard = self.manifest.write();
+            let mut guard = self.manifest.write().await;
             if manifest.manifest_id > guard.manifest_id {
                 *guard = Arc::new(manifest);
             }
@@ -161,15 +175,15 @@ impl MetaSnapshotStorage for ObjectStoreMetaSnapshotStorage {
     }
 
     async fn delete(&self, ids: &[MetaSnapshotId]) -> BackupResult<()> {
-        // update manifest first
         let to_delete: HashSet<MetaSnapshotId> = HashSet::from_iter(ids.iter().cloned());
-        let mut new_manifest = (**self.manifest.read()).clone();
-        new_manifest.manifest_id += 1;
-        new_manifest
-            .snapshot_metadata
-            .retain(|m| !to_delete.contains(&m.id));
-        self.update_manifest(new_manifest).await?;
-
+        self.update_manifest(|mut manifest: MetaSnapshotManifest| {
+            manifest.manifest_id += 1;
+            manifest
+                .snapshot_metadata
+                .retain(|m| !to_delete.contains(&m.id));
+            manifest
+        })
+        .await?;
         let paths = ids
             .iter()
             .map(|id| self.get_snapshot_path(*id))
@@ -190,11 +204,74 @@ pub async fn unused() -> ObjectStoreMetaSnapshotStorage {
     ObjectStoreMetaSnapshotStorage::new(
         "",
         Arc::new(ObjectStoreImpl::InMem(MonitoredObjectStore::new(
-            InMemObjectStore::new(),
+            InMemObjectStore::for_test(),
             Arc::new(ObjectStoreMetrics::unused()),
             Arc::new(ObjectStoreConfig::default()),
         ))),
     )
     .await
     .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_hummock_sdk::HummockVersionId;
+    use risingwave_meta_model::hummock_sequence;
+
+    use super::{MetaSnapshotStorage, unused};
+    use crate::meta_snapshot::MetaSnapshot;
+    use crate::meta_snapshot_v2::{MetadataV2, decode_hummock_sequences_from_stream};
+
+    #[tokio::test]
+    async fn test_create_v2_snapshot_with_streaming_upload() {
+        let storage = unused().await;
+        let mut metadata = MetadataV2::default();
+        metadata.hummock_version.id = HummockVersionId::new(321);
+        let snapshot = MetaSnapshot {
+            format_version: 2,
+            id: 123,
+            metadata,
+        };
+
+        storage.create(&snapshot, None).await.unwrap();
+        let decoded: MetaSnapshot<MetadataV2> = storage.get(snapshot.id).await.unwrap();
+
+        assert_eq!(snapshot.format_version, decoded.format_version);
+        assert_eq!(snapshot.id, decoded.id);
+        assert_eq!(
+            snapshot.metadata.hummock_version.id,
+            decoded.metadata.hummock_version.id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decode_hummock_sequences_with_streaming_read() {
+        let storage = unused().await;
+        let snapshot = MetaSnapshot {
+            format_version: 2,
+            id: 456,
+            metadata: MetadataV2 {
+                hummock_sequences: vec![
+                    hummock_sequence::Model {
+                        name: "meta_backup".to_owned(),
+                        seq: 42,
+                    },
+                    hummock_sequence::Model {
+                        name: "sstable_object".to_owned(),
+                        seq: 100,
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+
+        storage.create(&snapshot, None).await.unwrap();
+        let decoded = decode_hummock_sequences_from_stream(
+            storage.get_bytes_stream(snapshot.id).await.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decoded, snapshot.metadata.hummock_sequences);
+    }
 }

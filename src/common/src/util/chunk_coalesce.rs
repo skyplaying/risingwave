@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,10 @@ impl DataChunkBuilder {
             array_builders: vec![],
             buffered_count: 0,
         }
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
     }
 
     /// Lazily create the array builders if absent
@@ -228,6 +232,10 @@ impl DataChunkBuilder {
         self.buffered_count
     }
 
+    pub fn can_append_update(&self) -> bool {
+        self.buffered_count + 2 <= self.batch_size
+    }
+
     pub fn num_columns(&self) -> usize {
         self.data_types.len()
     }
@@ -343,14 +351,14 @@ mod tests {
         assert_eq!(Some(1), returned_input.as_ref().map(|c| c.offset));
         assert_eq!(Some(3), output.as_ref().map(DataChunk::cardinality));
         assert_eq!(Some(3), output.as_ref().map(DataChunk::capacity));
-        assert!(output.unwrap().is_compacted());
+        assert!(output.unwrap().is_vis_compacted());
 
         // Append last input
         let (returned_input, output) = builder.append_chunk_inner(returned_input.unwrap());
         assert!(returned_input.is_none());
         assert_eq!(Some(3), output.as_ref().map(DataChunk::cardinality));
         assert_eq!(Some(3), output.as_ref().map(DataChunk::capacity));
-        assert!(output.unwrap().is_compacted());
+        assert!(output.unwrap().is_vis_compacted());
     }
 
     #[test]
@@ -381,7 +389,7 @@ mod tests {
         assert_eq!(Some(3), returned_input.as_ref().map(|c| c.offset));
         assert_eq!(Some(3), output.as_ref().map(DataChunk::cardinality));
         assert_eq!(Some(3), output.as_ref().map(DataChunk::capacity));
-        assert!(output.unwrap().is_compacted());
+        assert!(output.unwrap().is_vis_compacted());
         assert_eq!(0, builder.buffered_count());
 
         // Append last input
@@ -423,7 +431,7 @@ mod tests {
         for output in &[output_1, output_2] {
             assert_eq!(3, output.cardinality());
             assert_eq!(3, output.capacity());
-            assert!(output.is_compacted());
+            assert!(output.is_vis_compacted());
         }
     }
 
@@ -448,7 +456,7 @@ mod tests {
         let output = builder.consume_all().expect("Failed to consume all!");
         assert_eq!(2, output.cardinality());
         assert_eq!(2, output.capacity());
-        assert!(output.is_compacted());
+        assert!(output.is_vis_compacted());
     }
 
     #[test]
@@ -459,13 +467,13 @@ mod tests {
 
         let mut left_array_builder = DataType::Int32.create_array_builder(5);
         for v in [1, 2, 3, 4, 5] {
-            left_array_builder.append(&Some(ScalarImpl::Int32(v)));
+            left_array_builder.append(Some(ScalarImpl::Int32(v)));
         }
         let left_arrays = [left_array_builder.finish()];
 
         let mut right_array_builder = DataType::Int64.create_array_builder(5);
         for v in [5, 4, 3, 2, 1] {
-            right_array_builder.append(&Some(ScalarImpl::Int64(v)));
+            right_array_builder.append(Some(ScalarImpl::Int64(v)));
         }
         let right_arrays = [right_array_builder.finish()];
 

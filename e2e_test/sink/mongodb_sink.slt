@@ -1,0 +1,194 @@
+control substitution on
+
+system ok retry 30 backoff 1s
+test "$(mongosh --eval 'db.runCommand({ ping: 1 }).ok')" = "1"
+
+system ok
+mongosh --eval '
+db.getSiblingDB("demo").dropDatabase();
+db.getSiblingDB("shard_2024_01").dropDatabase();
+'
+
+statement ok
+set sink_decouple = false;
+
+statement ok
+create table t1(
+    a smallint,
+    b int,
+    c bigint,
+    d rw_int256,
+    e real,
+    f double precision,
+    g varchar,
+    h bytea,
+    i date,
+    j time,
+    k timestamp,
+    l timestamptz,
+    m interval,
+    n STRUCT <b STRUCT<c INTEGER>, d INTEGER>,
+    o varchar[],
+    p jsonb
+) append only;
+
+statement ok
+create sink t1_sink from t1
+with (
+    ${RISEDEV_MONGODB_WITH_OPTIONS_COMMON},
+    type = 'append-only',
+    collection.name = 'demo.t1',
+    mongodb.bulk_write.max_entries = '1024'
+);
+
+statement ok
+insert into t1 values(1, 2, 3, 4, 5.0, 6.0, '7', decode('De00BeEf', 'hex'), date '2022-04-08', time '18:20:49',
+                      '2022-03-13 01:00:00'::timestamp, '2022-03-13 01:00:00Z'::timestamptz, interval '4 hour',
+                      ROW(ROW(8), 9), ARRAY['a', 'b', 'c'], '{"a": [{"b": 1}], "c": true}'::jsonb);
+
+statement ok
+create table t2(
+    _id bigint primary key,
+    collection_name varchar,
+    value varchar
+);
+
+statement ok
+create sink t2_sink from t2
+with (
+    ${RISEDEV_MONGODB_WITH_OPTIONS_COMMON},
+    type = 'upsert',
+    collection.name = 'demo.t2',
+    mongodb.bulk_write.max_entries = '1024',
+    collection.name.field = 'collection_name',
+    collection.name.field.drop = 'true',
+    primary_key='_id'
+);
+
+statement ok
+insert into t2 values(1, 'shard_2024_01.tenant_1', 'data');
+
+statement ok
+insert into t2 values(2, '', 'data');
+
+statement ok
+create table t3(
+    a int,
+    b int,
+    value text,
+    primary key (a,b)
+);
+
+statement ok
+create sink t3_sink from t3
+with (
+    ${RISEDEV_MONGODB_WITH_OPTIONS_COMMON},
+    type = 'upsert',
+    collection.name = 'demo.t3',
+    mongodb.bulk_write.max_entries = '1024',
+    primary_key='a,b'
+);
+
+statement ok
+delete from t3 where a = 1 and b = 2;
+
+statement ok
+insert into t3 values(1, 2, 'abc');
+
+
+statement ok
+create table t4(
+    v1 int,
+    v2 int,
+    v3 int,
+    v4 int,
+);
+
+statement ok
+create sink t4_sink from t4
+with (
+    ${RISEDEV_MONGODB_WITH_OPTIONS_COMMON},
+    type = 'upsert',
+    collection.name = 'demo.t4',
+    mongodb.bulk_write.max_entries = '1024',
+    primary_key='v1'
+);
+
+statement ok
+insert into t4 values(1, 1, 1, 1),(2, 2, 2, 2);
+
+statement ok
+drop sink t4_sink;
+
+statement ok
+drop table t4;
+
+statement ok
+create table t5(
+    v1 int,
+    v2 int,
+);
+
+statement ok
+create sink t5_sink from t5
+with (
+    ${RISEDEV_MONGODB_WITH_OPTIONS_COMMON},
+    type = 'upsert',
+    collection.name = 'demo.t4',
+    mongodb.bulk_write.max_entries = '1024',
+    primary_key='v1'
+);
+
+statement ok
+insert into t5 values(1, 10),(2, 20);
+
+statement ok
+FLUSH;
+
+statement ok
+update t5 set v2 = 200 where v1 = 2;
+
+statement ok
+FLUSH;
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("demo").t1.countDocuments({})')" = "1"
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("demo").t2.countDocuments({})')" = "1"
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("shard_2024_01").tenant_1.countDocuments({})')" = "1"
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("demo").t3.countDocuments({})')" = "1"
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("demo").t4.countDocuments({ _id: 1, v1: 1, v2: 10, v3: 1, v4: 1 })')" = "1"
+
+system ok retry 10 backoff 1s
+test "$(mongosh --eval 'db.getSiblingDB("demo").t4.countDocuments({ _id: 2, v1: 2, v2: 200, v3: 2, v4: 2 })')" = "1"
+
+statement ok
+DROP SINK t1_sink;
+
+statement ok
+DROP TABLE t1;
+
+statement ok
+DROP SINK t2_sink;
+
+statement ok
+DROP TABLE t2;
+
+statement ok
+DROP SINK t3_sink;
+
+statement ok
+DROP TABLE t3;
+
+statement ok
+DROP SINK t5_sink;
+
+statement ok
+DROP TABLE t5;

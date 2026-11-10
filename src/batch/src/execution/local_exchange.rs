@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,18 +26,25 @@ pub struct LocalExchangeSource {
 
     /// Id of task which contains the `ExchangeExecutor` of this source.
     task_id: TaskId,
+
+    take_data_span: await_tree::Span,
 }
 
 impl LocalExchangeSource {
     pub fn create(
         output_id: TaskOutputId,
-        context: impl BatchTaskContext,
+        context: &dyn BatchTaskContext,
         task_id: TaskId,
     ) -> Result<Self> {
         let task_output = context.get_task_output(output_id)?;
+        let take_data_span = await_tree::span!(
+            "local_exchange_take_data (task_output {:?})",
+            task_output.id()
+        );
         Ok(Self {
             task_output,
             task_id,
+            take_data_span,
         })
     }
 }
@@ -52,9 +59,14 @@ impl Debug for LocalExchangeSource {
 
 impl ExchangeSource for LocalExchangeSource {
     async fn take_data(&mut self) -> Result<Option<DataChunk>> {
-        let ret = self.task_output.direct_take_data().await?;
+        use await_tree::InstrumentAwait;
+        let ret = self
+            .task_output
+            .direct_take_data()
+            .instrument_await(self.take_data_span.clone())
+            .await?;
         if let Some(data) = ret {
-            let data = data.compact();
+            let data = data.compact_vis();
             trace!(
                 "Receiver task: {:?}, source task output: {:?}, data: {:?}",
                 self.task_id,
@@ -75,22 +87,21 @@ impl ExchangeSource for LocalExchangeSource {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use risingwave_common::config::RpcClientConfig;
     use risingwave_pb::batch_plan::{TaskId, TaskOutputId};
     use risingwave_pb::data::DataChunk;
-    use risingwave_pb::task_service::exchange_service_server::{
-        ExchangeService, ExchangeServiceServer,
+    use risingwave_pb::task_service::batch_exchange_service_server::{
+        BatchExchangeService, BatchExchangeServiceServer,
     };
-    use risingwave_pb::task_service::{
-        GetDataRequest, GetDataResponse, GetStreamRequest, GetStreamResponse,
-    };
+    use risingwave_pb::task_service::{GetDataRequest, GetDataResponse};
     use risingwave_rpc_client::ComputeClient;
     use tokio::time::sleep;
     use tokio_stream::wrappers::ReceiverStream;
-    use tonic::{Request, Response, Status, Streaming};
+    use tonic::{Request, Response, Status};
 
     use crate::exchange_source::ExchangeSource;
     use crate::execution::grpc_exchange::GrpcExchangeSource;
@@ -100,9 +111,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeService for FakeExchangeService {
+    impl BatchExchangeService for FakeExchangeService {
         type GetDataStream = ReceiverStream<Result<GetDataResponse, Status>>;
-        type GetStreamStream = ReceiverStream<std::result::Result<GetStreamResponse, Status>>;
 
         async fn get_data(
             &self,
@@ -119,13 +129,6 @@ mod tests {
             }
             Ok(Response::new(ReceiverStream::new(rx)))
         }
-
-        async fn get_stream(
-            &self,
-            _request: Request<Streaming<GetStreamRequest>>,
-        ) -> Result<Response<Self::GetStreamStream>, Status> {
-            unimplemented!()
-        }
     }
 
     #[tokio::test]
@@ -136,7 +139,7 @@ mod tests {
 
         // Start a server.
         let (shutdown_send, shutdown_recv) = tokio::sync::oneshot::channel();
-        let exchange_svc = ExchangeServiceServer::new(FakeExchangeService {
+        let exchange_svc = BatchExchangeServiceServer::new(FakeExchangeService {
             rpc_called: rpc_called.clone(),
         });
         let cp_server_run = server_run.clone();
@@ -154,7 +157,9 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(server_run.load(Ordering::SeqCst));
 
-        let client = ComputeClient::new(addr.into()).await.unwrap();
+        let client = ComputeClient::new(addr.into(), &RpcClientConfig::default())
+            .await
+            .unwrap();
         let task_output_id = TaskOutputId {
             task_id: Some(TaskId::default()),
             ..Default::default()

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,17 +13,20 @@
 // limitations under the License.
 
 use pretty_xmlish::XmlNode;
-use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::InsertNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::plan_common::{DefaultColumns, IndexAndExpr};
 
 use super::batch::prelude::*;
-use super::utils::{childless_record, Distill};
-use super::{generic, ExprRewritable, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch};
+use super::utils::{Distill, childless_record};
+use super::{
+    BatchPlanRef as PlanRef, ExprRewritable, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch,
+    generic,
+};
 use crate::error::Result;
 use crate::expr::Expr;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::{utils, PlanBase, ToLocalBatch};
+use crate::optimizer::plan_node::{PlanBase, ToLocalBatch, utils};
 use crate::optimizer::plan_visitor::DistributedDmlVisitor;
 use crate::optimizer::property::{Distribution, Order, RequiredDist};
 
@@ -52,7 +55,7 @@ impl Distill for BatchInsert {
     }
 }
 
-impl PlanTreeNodeUnary for BatchInsert {
+impl PlanTreeNodeUnary<Batch> for BatchInsert {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -64,7 +67,7 @@ impl PlanTreeNodeUnary for BatchInsert {
     }
 }
 
-impl_plan_tree_node_for_unary! { BatchInsert }
+impl_plan_tree_node_for_unary! { Batch, BatchInsert }
 
 impl ToDistributedBatch for BatchInsert {
     fn to_distributed(&self) -> Result<PlanRef> {
@@ -73,7 +76,7 @@ impl ToDistributedBatch for BatchInsert {
             let new_input = RequiredDist::PhysicalDist(Distribution::HashShard(
                 (0..self.input().schema().len()).collect(),
             ))
-            .enforce_if_not_satisfies(self.input().to_distributed()?, &Order::any())?;
+            .batch_enforce_if_not_satisfies(self.input().to_distributed()?, &Order::any())?;
             let new_insert: PlanRef = self.clone_with_input(new_input).into();
             if self.core.returning {
                 Ok(new_insert)
@@ -82,7 +85,7 @@ impl ToDistributedBatch for BatchInsert {
             }
         } else {
             let new_input = RequiredDist::single()
-                .enforce_if_not_satisfies(self.input().to_distributed()?, &Order::any())?;
+                .batch_enforce_if_not_satisfies(self.input().to_distributed()?, &Order::any())?;
             Ok(self.clone_with_input(new_input).into())
         }
     }
@@ -90,6 +93,7 @@ impl ToDistributedBatch for BatchInsert {
 
 impl ToBatchPb for BatchInsert {
     fn to_batch_prost_body(&self) -> NodeBody {
+        let wait_for_persistence = self.base.ctx().batch_plan_dml_wait_persistence();
         let column_indices = self.core.column_indices.iter().map(|&i| i as u32).collect();
 
         let default_columns = &self.core.default_columns;
@@ -104,7 +108,7 @@ impl ToBatchPb for BatchInsert {
                 .collect(),
         };
         NodeBody::Insert(InsertNode {
-            table_id: self.core.table_id.table_id(),
+            table_id: self.core.table_id,
             table_version_id: self.core.table_version_id,
             column_indices,
             default_columns: if has_default_columns {
@@ -115,6 +119,7 @@ impl ToBatchPb for BatchInsert {
             row_id_index: self.core.row_id_index.map(|index| index as _),
             returning: self.core.returning,
             session_id: self.base.ctx().session_ctx().session_id().0 as u32,
+            wait_for_persistence,
         })
     }
 }
@@ -122,11 +127,11 @@ impl ToBatchPb for BatchInsert {
 impl ToLocalBatch for BatchInsert {
     fn to_local(&self) -> Result<PlanRef> {
         let new_input = RequiredDist::single()
-            .enforce_if_not_satisfies(self.input().to_local()?, &Order::any())?;
+            .batch_enforce_if_not_satisfies(self.input().to_local()?, &Order::any())?;
         Ok(self.clone_with_input(new_input).into())
     }
 }
 
-impl ExprRewritable for BatchInsert {}
+impl ExprRewritable<Batch> for BatchInsert {}
 
 impl ExprVisitable for BatchInsert {}

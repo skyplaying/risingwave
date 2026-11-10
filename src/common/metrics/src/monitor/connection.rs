@@ -22,26 +22,28 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use cfg_or_panic::cfg_or_panic;
 use futures::FutureExt;
 use http::Uri;
-use hyper::client::connect::dns::{GaiAddrs, GaiFuture, GaiResolver, Name};
-use hyper::client::connect::Connection;
-use hyper::client::HttpConnector;
-use hyper::service::Service;
+use hyper_util::client::legacy::connect::dns::{GaiAddrs, GaiFuture, GaiResolver, Name};
+use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
+use hyper_util::rt::TokioIo;
 use itertools::Itertools;
 use pin_project_lite::pin_project;
 use prometheus::{
-    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, Registry,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry,
+    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
 };
 use thiserror_ext::AsReport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, info, warn};
+use tower_service::Service;
+use tracing::{trace, warn};
 
 use crate::monitor::GLOBAL_METRICS_REGISTRY;
-use crate::{register_guarded_int_counter_vec_with_registry, LabelGuardedIntCounterVec};
+use crate::{LabelGuardedIntCounterVec, register_guarded_int_counter_vec_with_registry};
 
+#[auto_impl::auto_impl(&mut)]
 pub trait MonitorAsyncReadWrite {
     fn on_read(&mut self, _size: usize) {}
     fn on_eof(&mut self) {}
@@ -73,6 +75,14 @@ impl<C, M> MonitoredConnection<C, M> {
     fn project_into(this: Pin<&mut Self>) -> (Pin<&mut C>, &mut M) {
         let this = this.project();
         (this.inner, this.monitor)
+    }
+
+    /// Delegate async read/write traits between tokio and hyper.
+    fn hyper_tokio_delegate(
+        self: Pin<&mut Self>,
+    ) -> TokioIo<MonitoredConnection<TokioIo<Pin<&mut C>>, &mut M>> {
+        let (inner, monitor) = MonitoredConnection::project_into(self);
+        TokioIo::new(MonitoredConnection::new(TokioIo::new(inner), monitor))
     }
 }
 
@@ -109,6 +119,16 @@ impl<C: AsyncRead, M: MonitorAsyncReadWrite> AsyncRead for MonitoredConnection<C
             Poll::Pending => {}
         }
         ret
+    }
+}
+
+impl<C: hyper::rt::Read, M: MonitorAsyncReadWrite> hyper::rt::Read for MonitoredConnection<C, M> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        hyper::rt::Read::poll_read(std::pin::pin!(self.hyper_tokio_delegate()), cx, buf)
     }
 }
 
@@ -186,8 +206,41 @@ impl<C: AsyncWrite, M: MonitorAsyncReadWrite> AsyncWrite for MonitoredConnection
     }
 }
 
+impl<C: hyper::rt::Write, M: MonitorAsyncReadWrite> hyper::rt::Write for MonitoredConnection<C, M> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        hyper::rt::Write::poll_write(std::pin::pin!(self.hyper_tokio_delegate()), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        hyper::rt::Write::poll_flush(std::pin::pin!(self.hyper_tokio_delegate()), cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        hyper::rt::Write::poll_shutdown(std::pin::pin!(self.hyper_tokio_delegate()), cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        hyper::rt::Write::poll_write_vectored(std::pin::pin!(self.hyper_tokio_delegate()), cx, bufs)
+    }
+}
+
 impl<C: Connection, M> Connection for MonitoredConnection<C, M> {
-    fn connected(&self) -> hyper::client::connect::Connected {
+    fn connected(&self) -> Connected {
         self.inner.connected()
     }
 }
@@ -223,7 +276,7 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let ret = self.inner.poll_ready(cx);
         if let Poll::Ready(Err(_)) = &ret {
-            self.monitor.on_err("<poll_ready>".to_string());
+            self.monitor.on_err("<poll_ready>".to_owned());
         }
         ret
     }
@@ -263,7 +316,7 @@ where
                     let remote_addr = conn.connect_info().remote_addr();
                     let endpoint = remote_addr
                         .map(|remote_addr| format!("{}", remote_addr.ip()))
-                        .unwrap_or("unknown".to_string());
+                        .unwrap_or("unknown".to_owned());
                     MonitoredConnection::new(conn, monitor.new_connection_monitor(endpoint))
                 })
             })
@@ -287,7 +340,7 @@ pub struct ConnectionMetrics {
     write_rate: IntCounterVec,
     writer_count: IntGaugeVec,
 
-    io_err_rate: LabelGuardedIntCounterVec<4>,
+    io_err_rate: LabelGuardedIntCounterVec,
 }
 
 pub static GLOBAL_CONNECTION_METRICS: LazyLock<ConnectionMetrics> =
@@ -378,12 +431,23 @@ pub struct TcpConfig {
     pub keepalive_duration: Option<Duration>,
 }
 
+impl Default for TcpConfig {
+    fn default() -> Self {
+        Self {
+            // Without it, Nagle's algorithm holds the DATA frame of a small gRPC request until the
+            // peer's delayed ACK, adding about 40ms to the request.
+            tcp_nodelay: true,
+            keepalive_duration: None,
+        }
+    }
+}
+
 pub fn monitor_connector<C>(
     connector: C,
     connection_type: impl Into<String>,
 ) -> MonitoredConnection<C, MonitorNewConnectionImpl> {
     let connection_type = connection_type.into();
-    info!(
+    trace!(
         "monitoring connector {} with type {}",
         type_name::<C>(),
         connection_type
@@ -433,7 +497,7 @@ impl Future for MonitoredGaiFuture {
         Pin::new(&mut self.inner).poll(cx).map(|res| match res {
             Ok(addrs) => {
                 let addrs: MonitoredGaiAddrs = addrs.into();
-                debug!("resolve {} => {:?}", self.name, addrs.inner);
+                trace!("resolve {} => {:?}", self.name, addrs.inner);
                 Ok(addrs)
             }
             Err(err) => Err(err),
@@ -477,23 +541,40 @@ impl Service<Name> for MonitoredGaiResolver {
     }
 }
 
+#[cfg_or_panic(not(madsim))]
+fn monitored_http_connector(
+    connection_type: impl Into<String>,
+    config: TcpConfig,
+) -> MonitoredConnection<HttpConnector<MonitoredGaiResolver>, MonitorNewConnectionImpl> {
+    let resolver = MonitoredGaiResolver::default();
+    let mut http = HttpConnector::new_with_resolver(resolver);
+
+    http.enforce_http(false);
+    http.set_nodelay(config.tcp_nodelay);
+    http.set_keepalive(config.keepalive_duration);
+
+    monitor_connector(http, connection_type)
+}
+
+/// Attach general configurations to the endpoint.
+#[cfg_or_panic(not(madsim))]
+fn configure_endpoint(endpoint: Endpoint) -> Endpoint {
+    // This is to mitigate https://github.com/risingwavelabs/risingwave/issues/18039.
+    // TODO: remove this after https://github.com/hyperium/hyper/issues/3724 gets resolved.
+    endpoint.http2_max_header_list_size(16 * 1024 * 1024)
+}
+
 #[easy_ext::ext(EndpointExt)]
 impl Endpoint {
     pub async fn monitored_connect(
-        self,
+        mut self,
         connection_type: impl Into<String>,
         config: TcpConfig,
     ) -> Result<Channel, tonic::transport::Error> {
         #[cfg(not(madsim))]
         {
-            let resolver = MonitoredGaiResolver::default();
-            let mut http = HttpConnector::new_with_resolver(resolver);
-
-            http.enforce_http(false);
-            http.set_nodelay(config.tcp_nodelay);
-            http.set_keepalive(config.keepalive_duration);
-
-            let connector = monitor_connector(http, connection_type);
+            self = configure_endpoint(self);
+            let connector = monitored_http_connector(connection_type, config);
             self.connect_with_connector(connector).await
         }
         #[cfg(madsim)]
@@ -504,16 +585,12 @@ impl Endpoint {
 
     #[cfg(not(madsim))]
     pub fn monitored_connect_lazy(
-        self,
+        mut self,
         connection_type: impl Into<String>,
         config: TcpConfig,
     ) -> Channel {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(config.tcp_nodelay);
-        http.set_keepalive(config.keepalive_duration);
-
-        let connector = monitor_connector(http, connection_type);
+        self = configure_endpoint(self);
+        let connector = monitored_http_connector(connection_type, config);
         self.connect_with_connector_lazy(connector)
     }
 }
@@ -534,34 +611,33 @@ impl<L> tonic::transport::server::Router<L> {
         signal: impl Future<Output = ()>,
     ) -> impl Future<Output = ()>
     where
-        L: tower_layer::Layer<tonic::transport::server::Routes>,
-        L::Service: Service<
-                http::request::Request<hyper::Body>,
-                Response = http::response::Response<ResBody>,
-            > + Clone
+        L: tower_layer::Layer<tonic::service::Routes>,
+        L::Service: Service<http::Request<tonic::body::Body>, Response = http::Response<ResBody>>
+            + Clone
             + Send
             + 'static,
-        <<L as tower_layer::Layer<tonic::transport::server::Routes>>::Service as Service<
-            http::request::Request<hyper::Body>,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as Service<
+            http::Request<tonic::body::Body>,
         >>::Future: Send + 'static,
-        <<L as tower_layer::Layer<tonic::transport::server::Routes>>::Service as Service<
-            http::request::Request<hyper::Body>,
+        <<L as tower_layer::Layer<tonic::service::Routes>>::Service as Service<
+            http::Request<tonic::body::Body>,
         >>::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
         ResBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,
         ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let connection_type = connection_type.into();
-        let incoming = tonic::transport::server::TcpIncoming::new(
-            listen_addr,
-            config.tcp_nodelay,
-            config.keepalive_duration,
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to bind `{connection_type}` to `{listen_addr}`: {}",
-                err.as_report()
-            )
-        });
+        let incoming = tonic::transport::server::TcpIncoming::bind(listen_addr)
+            .map(|incoming| {
+                incoming
+                    .with_nodelay(Some(config.tcp_nodelay))
+                    .with_keepalive(config.keepalive_duration)
+            })
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to bind `{connection_type}` to `{listen_addr}`: {}",
+                    err.as_report()
+                )
+            });
         let incoming =
             MonitoredConnection::new(incoming, MonitorNewConnectionImpl { connection_type });
 
@@ -585,28 +661,6 @@ impl<L> tonic::transport::server::Router<L> {
     ) {
         self.serve_with_shutdown(listen_addr, signal).await.unwrap()
     }
-}
-
-#[cfg(not(madsim))]
-pub fn monitored_tcp_incoming(
-    listen_addr: std::net::SocketAddr,
-    connection_type: impl Into<String>,
-    config: TcpConfig,
-) -> Result<
-    MonitoredConnection<tonic::transport::server::TcpIncoming, MonitorNewConnectionImpl>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let incoming = tonic::transport::server::TcpIncoming::new(
-        listen_addr,
-        config.tcp_nodelay,
-        config.keepalive_duration,
-    )?;
-    Ok(MonitoredConnection::new(
-        incoming,
-        MonitorNewConnectionImpl {
-            connection_type: connection_type.into(),
-        },
-    ))
 }
 
 #[derive(Clone)]
@@ -743,9 +797,10 @@ impl MonitorAsyncReadWrite for MonitorAsyncReadWriteImpl {
         self.reader_count_guard.dec();
     }
 
+    #[allow(rw::temporary_guarded_metric)]
     fn on_read_err(&mut self, err: &Error) {
-        // No need to store the value returned from `with_guarded_label_values`
-        // because it is reporting a single error.
+        // This is intentionally an ephemeral event counter. Collection exports
+        // the dropped label once before removing it.
         GLOBAL_CONNECTION_METRICS
             .io_err_rate
             .with_guarded_label_values(&[
@@ -774,9 +829,10 @@ impl MonitorAsyncReadWrite for MonitorAsyncReadWriteImpl {
         self.writer_count_guard.dec();
     }
 
+    #[allow(rw::temporary_guarded_metric)]
     fn on_write_err(&mut self, err: &Error) {
-        // No need to store the value returned from `with_guarded_label_values`
-        // because it is reporting a single error.
+        // This is intentionally an ephemeral event counter. Collection exports
+        // the dropped label once before removing it.
         GLOBAL_CONNECTION_METRICS
             .io_err_rate
             .with_guarded_label_values(&[

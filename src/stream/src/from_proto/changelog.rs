@@ -1,0 +1,68 @@
+// Copyright 2024 RisingWave Labs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use risingwave_pb::stream_plan::ChangeLogNode;
+use risingwave_pb::stream_plan::change_log_node::Mode;
+use risingwave_storage::StateStore;
+
+use super::ExecutorBuilder;
+use crate::error::StreamResult;
+use crate::executor::{ChangeLogExecutor, ChangeLogMode, Executor};
+use crate::task::ExecutorParams;
+
+pub struct ChangeLogExecutorBuilder;
+
+impl_stream_node_body!(Changelog(ChangeLogNode) => ChangeLogExecutorBuilder);
+
+impl ExecutorBuilder for ChangeLogExecutorBuilder {
+    type Node = ChangeLogNode;
+
+    async fn new_boxed_executor(
+        params: ExecutorParams,
+        node: &Self::Node,
+        _store: impl StateStore,
+    ) -> StreamResult<Executor> {
+        let [input]: [_; 1] = params.input.try_into().unwrap();
+
+        let vnodes = params.vnode_bitmap;
+        let vnode_count = params.actor_context.vnode_count;
+        let distribution_keys = node
+            .distribution_keys
+            .iter()
+            .map(|k| *k as usize)
+            .collect::<Vec<_>>();
+        let mode = match &node.mode {
+            None => ChangeLogMode::Normal,
+            Some(Mode::Keyed(keyed)) => ChangeLogMode::Keyed {
+                additional_key_columns: keyed
+                    .additional_key_columns
+                    .iter()
+                    .map(|&index| index as usize)
+                    .collect(),
+            },
+        };
+        let stream_keys = node.stream_keys.iter().map(|&k| k as usize).collect();
+        let exec = ChangeLogExecutor::new(
+            params.actor_context,
+            input,
+            node.need_op,
+            vnode_count,
+            vnodes,
+            mode,
+            distribution_keys,
+            stream_keys,
+        );
+        Ok((params.info, exec).into())
+    }
+}

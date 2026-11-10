@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,13 @@ use std::collections::binary_heap::PeekMut;
 use std::collections::{BinaryHeap, LinkedList};
 use std::ops::{Deref, DerefMut};
 
-use futures::FutureExt;
 use risingwave_hummock_sdk::key::FullKey;
 
-use super::Forward;
+use crate::hummock::HummockResult;
 use crate::hummock::iterator::{
     DirectionEnum, HummockIterator, HummockIteratorDirection, ValueMeta,
 };
-use crate::hummock::shared_buffer::shared_buffer_batch::{
-    SharedBufferBatchIterator, SharedBufferVersionedEntryRef,
-};
 use crate::hummock::value::HummockValue;
-use crate::hummock::HummockResult;
 use crate::monitor::StoreLocalStatistic;
 
 pub struct Node<I: HummockIterator> {
@@ -70,10 +65,16 @@ pub struct MergeIterator<I: HummockIterator> {
 
     /// The heap for merge sort.
     heap: BinaryHeap<Node<I>>,
+
+    /// Statistics collected from iterators discarded after an error.
+    retired_stats: Option<Box<StoreLocalStatistic>>,
 }
 
 impl<I: HummockIterator> MergeIterator<I> {
     fn collect_local_statistic_impl(&self, stats: &mut StoreLocalStatistic) {
+        if let Some(retired_stats) = &self.retired_stats {
+            stats.add(retired_stats);
+        }
         for node in &self.heap {
             node.iter.collect_local_statistic(stats);
         }
@@ -96,18 +97,8 @@ impl<I: HummockIterator> MergeIterator<I> {
         Self {
             unused_iters: iterators.into_iter().map(|iter| Node { iter }).collect(),
             heap: BinaryHeap::new(),
+            retired_stats: None,
         }
-    }
-}
-
-impl MergeIterator<SharedBufferBatchIterator<Forward>> {
-    /// Used in `merge_imms_in_memory` to merge immutable memtables.
-    pub(crate) fn current_key_entry(&self) -> SharedBufferVersionedEntryRef<'_> {
-        self.heap
-            .peek()
-            .expect("no inner iter for imm merge")
-            .iter
-            .current_key_entry()
     }
 }
 
@@ -172,7 +163,7 @@ impl<'a, T: Ord> PeekMutGuard<'a, T> {
     }
 }
 
-impl<'a, T: Ord> Deref for PeekMutGuard<'a, T> {
+impl<T: Ord> Deref for PeekMutGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -180,13 +171,13 @@ impl<'a, T: Ord> Deref for PeekMutGuard<'a, T> {
     }
 }
 
-impl<'a, T: Ord> DerefMut for PeekMutGuard<'a, T> {
+impl<T: Ord> DerefMut for PeekMutGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.peek.as_mut().expect("should not be None")
     }
 }
 
-impl<'a, T: Ord> Drop for PeekMutGuard<'a, T> {
+impl<T: Ord> Drop for PeekMutGuard<'_, T> {
     /// When the guard is dropped, if `pop` or `used` is not called before it is dropped, we will
     /// call `PeekMut::pop` on the `PeekMut` and recycle the node to the unused list.
     fn drop(&mut self) {
@@ -197,31 +188,6 @@ impl<'a, T: Ord> Drop for PeekMutGuard<'a, T> {
             let top = PeekMut::pop(peek);
             self.unused.push_back(top);
         }
-    }
-}
-
-impl MergeIterator<SharedBufferBatchIterator<Forward>> {
-    pub(crate) fn advance_peek_to_next_key(&mut self) {
-        let mut node =
-            PeekMutGuard::peek_mut(&mut self.heap, &mut self.unused_iters).expect("no inner iter");
-
-        node.iter.advance_to_next_key();
-
-        if !node.iter.is_valid() {
-            // Put back to `unused_iters`
-            let node = node.pop();
-            self.unused_iters.push_back(node);
-        } else {
-            // This will update the heap top.
-            node.used();
-        }
-    }
-
-    pub(crate) fn rewind_no_await(&mut self) {
-        self.rewind()
-            .now_or_never()
-            .expect("should not pending")
-            .expect("should not err")
     }
 }
 
@@ -243,9 +209,16 @@ where
             Ok(_) => {}
             Err(e) => {
                 // If the iterator returns error, we should clear the heap, so that this
-                // iterator becomes invalid.
-                node.pop();
-                self.heap.clear();
+                // iterator becomes invalid. Collect their work before dropping them, but do not
+                // retain the failed/current heap iterators for a later seek or rewind.
+                let node = node.pop();
+                let retired_stats = self
+                    .retired_stats
+                    .get_or_insert_with(|| Box::new(StoreLocalStatistic::default()));
+                node.iter.collect_local_statistic(retired_stats);
+                for node in self.heap.drain() {
+                    node.iter.collect_local_statistic(retired_stats);
+                }
                 return Err(e);
             }
         }
@@ -271,7 +244,7 @@ where
     }
 
     fn is_valid(&self) -> bool {
-        self.heap.peek().map_or(false, |n| n.iter.is_valid())
+        self.heap.peek().is_some_and(|n| n.iter.is_valid())
     }
 
     async fn rewind(&mut self) -> HummockResult<()> {

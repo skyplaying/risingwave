@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,20 +13,17 @@
 // limitations under the License.
 
 use std::future::Future;
-use std::num::NonZeroU32;
 
-use futures::{pin_mut, Stream};
+use futures::{Stream, pin_mut};
 use futures_async_stream::try_stream;
-use governor::clock::MonotonicClock;
-use governor::{Quota, RateLimiter};
-use itertools::Itertools;
 use risingwave_common::array::StreamChunk;
-use risingwave_common::catalog::ColumnDesc;
+use risingwave_common::catalog::{ColumnDesc, Field};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{Scalar, ScalarImpl, Timestamptz};
 use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
+use risingwave_common_rate_limit::RateLimiter;
 use risingwave_connector::source::cdc::external::{
-    CdcOffset, ExternalTableReader, SchemaTableName,
+    CdcOffset, ExternalTableReader, ExternalTableReaderImpl, SchemaTableName,
 };
 use risingwave_pb::plan_common::additional_column::ColumnType;
 
@@ -45,6 +42,13 @@ pub trait UpstreamTableRead {
     fn current_cdc_offset(
         &self,
     ) -> impl Future<Output = StreamExecutorResult<Option<CdcOffset>>> + Send + '_;
+
+    async fn disconnect(self) -> StreamExecutorResult<()>;
+
+    fn snapshot_read_table_split(
+        &self,
+        args: SplitSnapshotReadArgs,
+    ) -> impl Stream<Item = StreamExecutorResult<Option<StreamChunk>>> + Send + '_;
 }
 
 #[derive(Debug, Clone)]
@@ -77,20 +81,50 @@ impl SnapshotReadArgs {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SplitSnapshotReadArgs {
+    pub left_bound_inclusive: OwnedRow,
+    pub right_bound_exclusive: OwnedRow,
+    pub split_columns: Vec<Field>,
+    pub rate_limit_rps: Option<u32>,
+    pub additional_columns: Vec<ColumnDesc>,
+    pub schema_table_name: SchemaTableName,
+    pub database_name: String,
+}
+
+impl SplitSnapshotReadArgs {
+    pub fn new(
+        left_bound_inclusive: OwnedRow,
+        right_bound_exclusive: OwnedRow,
+        split_columns: Vec<Field>,
+        rate_limit_rps: Option<u32>,
+        additional_columns: Vec<ColumnDesc>,
+        schema_table_name: SchemaTableName,
+        database_name: String,
+    ) -> Self {
+        Self {
+            left_bound_inclusive,
+            right_bound_exclusive,
+            split_columns,
+            rate_limit_rps,
+            additional_columns,
+            schema_table_name,
+            database_name,
+        }
+    }
+}
+
 /// A wrapper of upstream table for snapshot read
 /// because we need to customize the snapshot read for managed upstream table (e.g. mv, index)
 /// and external upstream table.
 pub struct UpstreamTableReader<T> {
-    inner: T,
+    table: T,
+    pub(crate) reader: ExternalTableReaderImpl,
 }
 
 impl<T> UpstreamTableReader<T> {
-    pub fn inner(&self) -> &T {
-        &self.inner
-    }
-
-    pub fn new(table: T) -> Self {
-        Self { inner: table }
+    pub fn new(table: T, reader: ExternalTableReaderImpl) -> Self {
+        Self { table, reader }
     }
 }
 
@@ -141,15 +175,7 @@ fn with_additional_columns(
 impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
     #[try_stream(ok = Option<StreamChunk>, error = StreamExecutorError)]
     async fn snapshot_read_full_table(&self, args: SnapshotReadArgs, batch_size: u32) {
-        let primary_keys = self
-            .inner
-            .pk_indices()
-            .iter()
-            .map(|idx| {
-                let f = &self.inner.schema().fields[*idx];
-                f.name.clone()
-            })
-            .collect_vec();
+        let primary_keys = self.table.pk_names();
 
         // prepare rate limiter
         if args.rate_limit_rps == Some(0) {
@@ -159,13 +185,12 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
             future.await;
             unreachable!();
         }
-        let limiter = args.rate_limit_rps.map(|limit| {
-            tracing::info!(rate_limit = limit, "rate limit applied");
-            RateLimiter::direct_with_clock(
-                Quota::per_second(NonZeroU32::new(limit).unwrap()),
-                &MonotonicClock,
-            )
-        });
+
+        let rate_limiter = RateLimiter::new(
+            args.rate_limit_rps
+                .inspect(|limit| tracing::info!(rate_limit = limit, "rate limit applied"))
+                .into(),
+        );
 
         let mut read_args = args;
         let schema_table_name = read_args.schema_table_name.clone();
@@ -179,8 +204,8 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
             );
 
             let mut read_count: usize = 0;
-            let row_stream = self.inner.table_reader().snapshot_read(
-                self.inner.schema_table_name(),
+            let row_stream = self.reader.snapshot_read(
+                self.table.schema_table_name(),
                 read_args.current_pos.clone(),
                 primary_keys.clone(),
                 batch_size,
@@ -188,7 +213,7 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
 
             pin_mut!(row_stream);
             let mut builder = DataChunkBuilder::new(
-                self.inner.schema().data_types(),
+                self.table.schema().data_types(),
                 limited_chunk_size(read_args.rate_limit_rps),
             );
             let chunk_stream = iter_chunks(row_stream, &mut builder);
@@ -201,7 +226,26 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
                 read_count += chunk.cardinality();
                 current_pk_pos = get_new_pos(&chunk, &read_args.pk_indices);
 
-                if read_args.rate_limit_rps.is_none() || chunk_size == 0 {
+                if let Some(rate_limit_rps) = read_args.rate_limit_rps
+                    && chunk_size != 0
+                {
+                    // Apply rate limit, see `risingwave_stream::executor::source::apply_rate_limit` for more.
+                    // May be should be refactored to a common function later.
+                    let limit = rate_limit_rps as usize;
+
+                    // Because we produce chunks with limited-sized data chunk builder and all rows
+                    // are `Insert`s, the chunk size should never exceed the limit.
+                    assert!(chunk_size <= limit);
+
+                    // `InsufficientCapacity` should never happen because we have check the cardinality
+                    rate_limiter.wait(chunk_size as _).await;
+                    yield Some(with_additional_columns(
+                        chunk,
+                        &read_args.additional_columns,
+                        schema_table_name.clone(),
+                        database_name.clone(),
+                    ));
+                } else {
                     // no limit, or empty chunk
                     yield Some(with_additional_columns(
                         chunk,
@@ -210,27 +254,6 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
                         database_name.clone(),
                     ));
                     continue;
-                } else {
-                    // Apply rate limit, see `risingwave_stream::executor::source::apply_rate_limit` for more.
-                    // May be should be refactored to a common function later.
-                    let limiter = limiter.as_ref().unwrap();
-                    let limit = read_args.rate_limit_rps.unwrap() as usize;
-
-                    // Because we produce chunks with limited-sized data chunk builder and all rows
-                    // are `Insert`s, the chunk size should never exceed the limit.
-                    assert!(chunk_size <= limit);
-
-                    // `InsufficientCapacity` should never happen because we have check the cardinality
-                    limiter
-                        .until_n_ready(NonZeroU32::new(chunk_size as u32).unwrap())
-                        .await
-                        .unwrap();
-                    yield Some(with_additional_columns(
-                        chunk,
-                        &read_args.additional_columns,
-                        schema_table_name.clone(),
-                        database_name.clone(),
-                    ));
                 }
             }
 
@@ -246,10 +269,88 @@ impl UpstreamTableRead for UpstreamTableReader<ExternalStorageTable> {
         }
     }
 
+    #[try_stream(ok = Option<StreamChunk>, error = StreamExecutorError)]
+    async fn snapshot_read_table_split(&self, args: SplitSnapshotReadArgs) {
+        // prepare rate limiter
+        if args.rate_limit_rps == Some(0) {
+            // If limit is 0, we should not read any data from the upstream table.
+            // Keep waiting util the stream is rebuilt.
+            let future = futures::future::pending::<()>();
+            future.await;
+            unreachable!();
+        }
+
+        let rate_limiter = RateLimiter::new(
+            args.rate_limit_rps
+                .inspect(|limit| tracing::info!(rate_limit = limit, "rate limit applied"))
+                .into(),
+        );
+
+        let read_args = args;
+        let schema_table_name = read_args.schema_table_name.clone();
+        let database_name = read_args.database_name.clone();
+        // tracing::debug!(?args, "snapshot_read",);
+
+        let row_stream = self.reader.split_snapshot_read(
+            self.table.schema_table_name(),
+            read_args.left_bound_inclusive.clone(),
+            read_args.right_bound_exclusive.clone(),
+            read_args.split_columns.clone(),
+        );
+
+        pin_mut!(row_stream);
+        let mut builder = DataChunkBuilder::new(
+            self.table.schema().data_types(),
+            limited_chunk_size(read_args.rate_limit_rps),
+        );
+        let chunk_stream = iter_chunks(row_stream, &mut builder);
+
+        #[for_await]
+        for chunk in chunk_stream {
+            let chunk = chunk?;
+            let chunk_size = chunk.capacity();
+
+            if let Some(rate_limit_rps) = read_args.rate_limit_rps
+                && chunk_size != 0
+            {
+                // Apply rate limit, see `risingwave_stream::executor::source::apply_rate_limit` for more.
+                // May be should be refactored to a common function later.
+                let limit = rate_limit_rps as usize;
+
+                // Because we produce chunks with limited-sized data chunk builder and all rows
+                // are `Insert`s, the chunk size should never exceed the limit.
+                assert!(chunk_size <= limit);
+
+                // `InsufficientCapacity` should never happen because we have check the cardinality
+                rate_limiter.wait(chunk_size as _).await;
+                yield Some(with_additional_columns(
+                    chunk,
+                    &read_args.additional_columns,
+                    schema_table_name.clone(),
+                    database_name.clone(),
+                ));
+            } else {
+                // no limit, or empty chunk
+                yield Some(with_additional_columns(
+                    chunk,
+                    &read_args.additional_columns,
+                    schema_table_name.clone(),
+                    database_name.clone(),
+                ));
+            }
+        }
+        yield None;
+    }
+
     async fn current_cdc_offset(&self) -> StreamExecutorResult<Option<CdcOffset>> {
-        let binlog = self.inner.table_reader().current_cdc_offset();
+        let binlog = self.reader.current_cdc_offset();
         let binlog = binlog.await?;
         Ok(Some(binlog))
+    }
+
+    async fn disconnect(self) -> StreamExecutorResult<()> {
+        self.reader.disconnect().await?;
+        Ok(())
     }
 }
 
@@ -264,8 +365,9 @@ mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::{DataType, ScalarImpl};
     use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
+    use risingwave_connector::source::cdc::external::mysql::MysqlExternalTableReader;
     use risingwave_connector::source::cdc::external::{
-        ExternalTableConfig, ExternalTableReader, MySqlExternalTableReader, SchemaTableName,
+        ExternalTableConfig, ExternalTableReader, SchemaTableName,
     };
 
     use crate::executor::backfill::utils::{get_new_pos, iter_chunks};
@@ -273,7 +375,7 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn test_mysql_table_reader() {
-        let columns = vec![
+        let columns = [
             ColumnDesc::named("o_orderkey", ColumnId::new(1), DataType::Int64),
             ColumnDesc::named("o_custkey", ColumnId::new(2), DataType::Int64),
             ColumnDesc::named("o_orderstatus", ColumnId::new(3), DataType::Varchar),
@@ -292,7 +394,7 @@ mod tests {
         let config =
             serde_json::from_value::<ExternalTableConfig>(serde_json::to_value(props).unwrap())
                 .unwrap();
-        let reader = MySqlExternalTableReader::new(config, rw_schema.clone())
+        let reader = MysqlExternalTableReader::new(config, rw_schema.clone(), vec![0])
             .await
             .unwrap();
 
@@ -301,11 +403,11 @@ mod tests {
         loop {
             let row_stream = reader.snapshot_read(
                 SchemaTableName {
-                    schema_name: "mydb".to_string(),
-                    table_name: "orders_rw".to_string(),
+                    schema_name: "mydb".to_owned(),
+                    table_name: "orders_rw".to_owned(),
                 },
                 start_pk.clone(),
-                vec!["o_orderkey".to_string()],
+                vec!["o_orderkey".to_owned()],
                 1000,
             );
             let mut builder = DataChunkBuilder::new(rw_schema.clone().data_types(), 256);

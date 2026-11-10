@@ -13,62 +13,63 @@
 // limitations under the License.
 
 mod schema;
-use std::sync::LazyLock;
 
-use apache_avro::schema::{DecimalSchema, RecordSchema};
+use apache_avro::Schema;
+use apache_avro::schema::{DecimalSchema, NamesRef, UnionSchema};
 use apache_avro::types::{Value, ValueKind};
-use apache_avro::{Decimal as AvroDecimal, Schema};
 use chrono::Datelike;
 use itertools::Itertools;
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 use risingwave_common::array::{ListValue, StructValue};
-use risingwave_common::bail;
-use risingwave_common::log::LogSuppresser;
 use risingwave_common::types::{
-    DataType, Date, Interval, JsonbVal, ScalarImpl, Time, Timestamp, Timestamptz,
+    DataType, Date, DatumCow, Interval, JsonbVal, MapValue, ScalarImpl, Time, Timestamp,
+    Timestamptz, ToOwnedDatum,
 };
-use risingwave_common::util::iter_util::ZipEqFast;
 
-pub use self::schema::{avro_schema_to_column_descs, MapHandling, ResolvedAvroSchema};
-use super::utils::extract_decimal;
-use super::{bail_uncategorized, uncategorized, Access, AccessError, AccessResult};
+pub use self::schema::{MapHandling, ResolvedAvroSchema, avro_schema_to_fields};
+use super::utils::scaled_bigint_to_rust_decimal;
+use super::{Access, AccessError, AccessResult, bail_uncategorized, uncategorized};
+use crate::decoder::avro::schema::avro_schema_to_struct_field_name;
 
 #[derive(Clone)]
-/// Options for parsing an `AvroValue` into Datum, with an optional avro schema.
+/// Options for parsing an `AvroValue` into Datum, with a root avro schema.
 pub struct AvroParseOptions<'a> {
-    /// Currently, this schema is only used for decimal.
-    ///
-    /// FIXME: In theory we should use resolved schema.
-    /// e.g., it's possible that a field is a reference to a decimal or a record containing a decimal field.
-    pub schema: Option<&'a Schema>,
+    /// The avro schema at root level
+    root_schema: &'a Schema,
+    /// The immutable "global" context during recursive parsing
+    inner: AvroParseOptionsInner<'a>,
+}
+
+#[derive(Clone)]
+/// Options for parsing an `AvroValue` into Datum, with names resolved from root schema.
+struct AvroParseOptionsInner<'a> {
+    /// Mapping from type names to actual schema
+    refs: NamesRef<'a>,
     /// Strict Mode
     /// If strict mode is disabled, an int64 can be parsed from an `AvroInt` (int32) value.
-    pub relax_numeric: bool,
+    relax_numeric: bool,
 }
 
 impl<'a> AvroParseOptions<'a> {
-    pub fn create(schema: &'a Schema) -> Self {
+    pub fn create(root_schema: &'a Schema) -> Self {
+        let resolved = apache_avro::schema::ResolvedSchema::try_from(root_schema)
+            .expect("avro schema is self contained");
         Self {
-            schema: Some(schema),
-            relax_numeric: true,
+            root_schema,
+            inner: AvroParseOptionsInner {
+                refs: resolved.get_names().clone(),
+                relax_numeric: true,
+            },
         }
     }
 }
 
-impl<'a> AvroParseOptions<'a> {
-    fn extract_inner_schema(&self, key: Option<&'a str>) -> Option<&'a Schema> {
-        self.schema
-            .map(|schema| avro_extract_field_schema(schema, key))
-            .transpose()
-            .map_err(|_err| {
-                static LOG_SUPPERSSER: LazyLock<LogSuppresser> =
-                    LazyLock::new(LogSuppresser::default);
-                if let Ok(suppressed_count) = LOG_SUPPERSSER.check() {
-                    tracing::error!(suppressed_count, "extract sub-schema");
-                }
-            })
-            .ok()
-            .flatten()
+impl<'a> AvroParseOptionsInner<'a> {
+    fn lookup_ref(&self, schema: &'a Schema) -> &'a Schema {
+        match schema {
+            Schema::Ref { name } => self.refs[name],
+            _ => schema,
+        }
     }
 
     /// Parse an avro value into expected type.
@@ -80,15 +81,16 @@ impl<'a> AvroParseOptions<'a> {
     ///
     /// Cases: (FIXME: Is this precise?)
     /// - If both `type_expected` and schema are provided, it will check both strictly.
-    /// - If only `type_expected` is provided, it will try to match the value type and the
-    ///    `type_expected`, converting the value if possible.
+    /// - If only `type_expected` is provided, it will try to match the value type
+    ///   and the `type_expected`, converting the value if possible.
     /// - If only value is provided (without schema and `type_expected`),
-    ///     the `DataType` will be inferred.
-    pub fn convert_to_datum<'b>(
+    ///   the `DataType` will be inferred.
+    fn convert_to_datum<'b>(
         &self,
+        unresolved_schema: &'a Schema,
         value: &'b Value,
-        type_expected: &'b DataType,
-    ) -> AccessResult
+        type_expected: &DataType,
+    ) -> AccessResult<DatumCow<'b>>
     where
         'b: 'a,
     {
@@ -98,15 +100,60 @@ impl<'a> AvroParseOptions<'a> {
             value: String::new(),
         };
 
+        macro_rules! borrowed {
+            ($v:expr) => {
+                return Ok(DatumCow::Borrowed(Some($v.into())))
+            };
+        }
+
         let v: ScalarImpl = match (type_expected, value) {
-            (_, Value::Null) => return Ok(None),
-            (_, Value::Union(_, v)) => {
-                let schema = self.extract_inner_schema(None);
-                return Self {
-                    schema,
-                    relax_numeric: self.relax_numeric,
+            (_, Value::Null) => return Ok(DatumCow::NULL),
+            // ---- Union (with >=2 non null variants), and nullable Union ([null, record]) -----
+            (DataType::Struct(struct_type_info), Value::Union(variant, v)) => {
+                let Schema::Union(u) = self.lookup_ref(unresolved_schema) else {
+                    // XXX: Is this branch actually unreachable? (if self.schema is correctly used)
+                    return Err(create_error());
+                };
+
+                if let Some(inner) = get_nullable_union_inner(u) {
+                    // nullable Union ([null, record])
+                    return self.convert_to_datum(inner, v, type_expected);
                 }
-                .convert_to_datum(v, type_expected);
+                let variant_schema = &u.variants()[*variant as usize];
+
+                if matches!(variant_schema, &Schema::Null) {
+                    return Ok(DatumCow::NULL);
+                }
+
+                // Here we compare the field name, instead of using the variant idx to find the field idx.
+                // The latter approach might also work, but might be more error-prone.
+                // We will need to get the index of the "null" variant, and then re-map the variant index to the field index.
+                // XXX: probably we can unwrap here (if self.schema is correctly used)
+                let expected_field_name = avro_schema_to_struct_field_name(variant_schema)?;
+
+                let mut fields = Vec::with_capacity(struct_type_info.len());
+                for (field_name, field_type) in struct_type_info.iter() {
+                    if field_name == expected_field_name {
+                        let datum = self
+                            .convert_to_datum(variant_schema, v, field_type)?
+                            .to_owned_datum();
+
+                        fields.push(datum)
+                    } else {
+                        fields.push(None)
+                    }
+                }
+                StructValue::new(fields).into()
+            }
+            // nullable Union ([null, T])
+            (_, Value::Union(_, v)) => {
+                let Schema::Union(u) = self.lookup_ref(unresolved_schema) else {
+                    return Err(create_error());
+                };
+                let Some(schema) = get_nullable_union_inner(u) else {
+                    return Err(create_error());
+                };
+                return self.convert_to_datum(schema, v, type_expected);
             }
             // ---- Boolean -----
             (DataType::Boolean, Value::Boolean(b)) => (*b).into(),
@@ -128,13 +175,13 @@ impl<'a> AvroParseOptions<'a> {
             (DataType::Float64, Value::Float(i)) => (*i as f64).into(),
             // ---- Decimal -----
             (DataType::Decimal, Value::Decimal(avro_decimal)) => {
-                let (precision, scale) = match self.schema {
-                    Some(Schema::Decimal(DecimalSchema {
+                let (_precision, scale) = match self.lookup_ref(unresolved_schema) {
+                    Schema::Decimal(DecimalSchema {
                         precision, scale, ..
-                    })) => (*precision, *scale),
+                    }) => (*precision, *scale),
                     _ => Err(create_error())?,
                 };
-                let decimal = avro_decimal_to_rust_decimal(avro_decimal.clone(), precision, scale)
+                let decimal = scaled_bigint_to_rust_decimal(avro_decimal.clone().into(), scale)
                     .map_err(|_| create_error())?;
                 ScalarImpl::Decimal(risingwave_common::types::Decimal::Normalized(decimal))
             }
@@ -165,10 +212,7 @@ impl<'a> AvroParseOptions<'a> {
                     ),
                 };
 
-                let negative = value.sign() == Sign::Minus;
-                let (lo, mid, hi) = extract_decimal(value.to_bytes_be().1)?;
-                let decimal =
-                    rust_decimal::Decimal::from_parts(lo, mid, hi, negative, scale as u32);
+                let decimal = scaled_bigint_to_rust_decimal(value, scale as _)?;
                 ScalarImpl::Decimal(risingwave_common::types::Decimal::Normalized(decimal))
             }
             // ---- Time -----
@@ -179,12 +223,14 @@ impl<'a> AvroParseOptions<'a> {
                 .map_err(|_| create_error())?
                 .into(),
             // ---- Date -----
-            (DataType::Date, Value::Date(days)) => Date::with_days(days + unix_epoch_days())
-                .map_err(|_| create_error())?
-                .into(),
+            (DataType::Date, Value::Date(days)) => {
+                Date::with_days_since_ce(days + unix_epoch_days())
+                    .map_err(|_| create_error())?
+                    .into()
+            }
             // ---- Varchar -----
-            (DataType::Varchar, Value::Enum(_, symbol)) => symbol.clone().into_boxed_str().into(),
-            (DataType::Varchar, Value::String(s)) => s.clone().into_boxed_str().into(),
+            (DataType::Varchar, Value::Enum(_, symbol)) => borrowed!(symbol.as_str()),
+            (DataType::Varchar, Value::String(s)) => borrowed!(s.as_str()),
             // ---- Timestamp -----
             (DataType::Timestamp, Value::LocalTimestampMillis(ms)) => Timestamp::with_millis(*ms)
                 .map_err(|_| create_error())?
@@ -199,9 +245,11 @@ impl<'a> AvroParseOptions<'a> {
                     uncategorized!("timestamptz with milliseconds {ms} * 1000 is out of range")
                 })?
                 .into(),
-            (DataType::Timestamptz, Value::TimestampMicros(us)) => {
-                Timestamptz::from_micros(*us).into()
-            }
+            (DataType::Timestamptz, Value::TimestampMicros(us)) => Timestamptz::from_micros(*us)
+                .ok_or_else(|| {
+                    uncategorized!("timestamptz with microseconds {us} is out of range")
+                })?
+                .into(),
 
             // ---- Interval -----
             (DataType::Interval, Value::Duration(duration)) => {
@@ -211,43 +259,43 @@ impl<'a> AvroParseOptions<'a> {
                 ScalarImpl::Interval(Interval::from_month_day_usec(months, days, usecs))
             }
             // ---- Struct -----
-            (DataType::Struct(struct_type_info), Value::Record(descs)) => StructValue::new(
+            (DataType::Struct(struct_type_info), Value::Record(descs)) => StructValue::new({
+                let Schema::Record(record_schema) = self.lookup_ref(unresolved_schema) else {
+                    return Err(create_error());
+                };
                 struct_type_info
-                    .names()
-                    .zip_eq_fast(struct_type_info.types())
+                    .iter()
                     .map(|(field_name, field_type)| {
-                        let maybe_value = descs.iter().find(|(k, _v)| k == field_name);
-                        if let Some((_, value)) = maybe_value {
-                            let schema = self.extract_inner_schema(Some(field_name));
-                            Ok(Self {
-                                schema,
-                                relax_numeric: self.relax_numeric,
-                            }
-                            .convert_to_datum(value, field_type)?)
+                        if let Some(idx) = record_schema.lookup.get(field_name) {
+                            let value = &descs[*idx].1;
+                            let schema = &record_schema.fields[*idx].schema;
+                            Ok(self
+                                .convert_to_datum(schema, value, field_type)?
+                                .to_owned_datum())
                         } else {
                             Ok(None)
                         }
                     })
-                    .collect::<Result<_, AccessError>>()?,
-            )
+                    .collect::<Result<_, AccessError>>()?
+            })
             .into(),
             // ---- List -----
-            (DataType::List(item_type), Value::Array(array)) => ListValue::new({
-                let schema = self.extract_inner_schema(None);
-                let mut builder = item_type.create_array_builder(array.len());
+            (DataType::List(list_type), Value::Array(array)) => ListValue::new({
+                let Schema::Array(array_schema) = self.lookup_ref(unresolved_schema) else {
+                    return Err(create_error());
+                };
+                let schema = &array_schema.items;
+                let elem_type = list_type.elem();
+                let mut builder = elem_type.create_array_builder(array.len());
                 for v in array {
-                    let value = Self {
-                        schema,
-                        relax_numeric: self.relax_numeric,
-                    }
-                    .convert_to_datum(v, item_type)?;
+                    let value = self.convert_to_datum(schema, v, elem_type)?;
                     builder.append(value);
                 }
                 builder.finish()
             })
             .into(),
             // ---- Bytea -----
-            (DataType::Bytea, Value::Bytes(value)) => value.clone().into_boxed_slice().into(),
+            (DataType::Bytea, Value::Bytes(value)) => borrowed!(value.as_slice()),
             // ---- Jsonb -----
             (DataType::Jsonb, v @ Value::Map(_)) => {
                 let mut builder = jsonbb::Builder::default();
@@ -259,49 +307,117 @@ impl<'a> AvroParseOptions<'a> {
             (DataType::Varchar, Value::Uuid(uuid)) => {
                 uuid.as_hyphenated().to_string().into_boxed_str().into()
             }
+            (DataType::Map(map_type), Value::Map(map)) => {
+                let Schema::Map(map_schema) = self.lookup_ref(unresolved_schema) else {
+                    return Err(create_error());
+                };
+                let schema = &map_schema.types;
+                let mut builder = map_type
+                    .clone()
+                    .into_struct()
+                    .create_array_builder(map.len());
+                // Since the map is HashMap, we can ensure
+                // key is non-null and unique, keys and values have the same length.
+
+                // NOTE: HashMap's iter order is non-deterministic, but MapValue's
+                // order matters. We sort by key here to have deterministic order
+                // in tests. We might consider removing this, or make all MapValue sorted
+                // in the future.
+                for (k, v) in map.iter().sorted_by_key(|(k, _v)| *k) {
+                    let value_datum = self
+                        .convert_to_datum(schema, v, map_type.value())?
+                        .to_owned_datum();
+                    builder.append(
+                        StructValue::new(vec![Some(k.as_str().into()), value_datum])
+                            .to_owned_datum(),
+                    );
+                }
+                let list = ListValue::new(builder.finish());
+                MapValue::from_entries(list).into()
+            }
 
             (_expected, _got) => Err(create_error())?,
         };
-        Ok(Some(v))
+        Ok(DatumCow::Owned(Some(v)))
     }
 }
 
-pub struct AvroAccess<'a, 'b> {
+pub struct AvroAccess<'a> {
     value: &'a Value,
-    options: AvroParseOptions<'b>,
+    options: AvroParseOptions<'a>,
 }
 
-impl<'a, 'b> AvroAccess<'a, 'b> {
-    pub fn new(value: &'a Value, options: AvroParseOptions<'b>) -> Self {
-        Self { value, options }
+impl<'a> AvroAccess<'a> {
+    pub fn new(root_value: &'a Value, options: AvroParseOptions<'a>) -> Self {
+        Self {
+            value: root_value,
+            options,
+        }
     }
 }
 
-impl<'a, 'b> Access for AvroAccess<'a, 'b>
-where
-    'a: 'b,
-{
-    fn access(&self, path: &[&str], type_expected: &DataType) -> AccessResult {
+impl Access for AvroAccess<'_> {
+    fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
         let mut value = self.value;
-        let mut options: AvroParseOptions<'_> = self.options.clone();
+        let mut unresolved_schema = self.options.root_schema;
 
+        debug_assert!(
+            path.len() == 1
+                || (path.len() == 2 && matches!(path[0], "before" | "after" | "source")),
+            "unexpected path access: {:?}",
+            path
+        );
         let mut i = 0;
         while i < path.len() {
             let key = path[i];
             let create_error = || AccessError::Undefined {
-                name: key.to_string(),
+                name: key.to_owned(),
                 path: path.iter().take(i).join("."),
             };
             match value {
                 Value::Union(_, v) => {
+                    // The debezium "before" field is a nullable union.
+                    // "fields": [
+                    // {
+                    //     "name": "before",
+                    //     "type": [
+                    //         "null",
+                    //         {
+                    //             "type": "record",
+                    //             "name": "Value",
+                    //             "fields": [...],
+                    //         }
+                    //     ],
+                    //     "default": null
+                    // },
+                    // {
+                    //     "name": "after",
+                    //     "type": [
+                    //         "null",
+                    //         "Value"
+                    //     ],
+                    //     "default": null
+                    // },
+                    // ...]
                     value = v;
-                    options.schema = options.extract_inner_schema(None);
+                    let Schema::Union(u) = self.options.inner.lookup_ref(unresolved_schema) else {
+                        return Err(create_error());
+                    };
+                    let Some(schema) = get_nullable_union_inner(u) else {
+                        return Err(create_error());
+                    };
+                    unresolved_schema = schema;
                     continue;
                 }
                 Value::Record(fields) => {
-                    if let Some((_, v)) = fields.iter().find(|(k, _)| k == key) {
-                        value = v;
-                        options.schema = options.extract_inner_schema(Some(key));
+                    let Schema::Record(record_schema) =
+                        self.options.inner.lookup_ref(unresolved_schema)
+                    else {
+                        return Err(create_error());
+                    };
+                    if let Some(idx) = record_schema.lookup.get(key) {
+                        value = &fields[*idx].1;
+                        unresolved_schema = &record_schema.fields[*idx].schema;
                         i += 1;
                         continue;
                     }
@@ -311,65 +427,24 @@ where
             Err(create_error())?;
         }
 
-        options.convert_to_datum(value, type_expected)
+        self.options
+            .inner
+            .convert_to_datum(unresolved_schema, value, type_expected)
     }
 }
 
-pub(crate) fn avro_decimal_to_rust_decimal(
-    avro_decimal: AvroDecimal,
-    _precision: usize,
-    scale: usize,
-) -> AccessResult<rust_decimal::Decimal> {
-    let negative = !avro_decimal.is_positive();
-    let bytes = avro_decimal.to_vec_unsigned();
-
-    let (lo, mid, hi) = extract_decimal(bytes)?;
-    Ok(rust_decimal::Decimal::from_parts(
-        lo,
-        mid,
-        hi,
-        negative,
-        scale as u32,
-    ))
-}
-
-pub fn avro_schema_skip_union(schema: &Schema) -> anyhow::Result<&Schema> {
-    match schema {
-        Schema::Union(union_schema) => {
-            let inner_schema = union_schema
-                .variants()
-                .iter()
-                .find(|s| !matches!(s, &&Schema::Null))
-                .ok_or_else(|| {
-                    anyhow::format_err!("illegal avro record schema {:?}", union_schema)
-                })?;
-            Ok(inner_schema)
-        }
-        other => Ok(other),
-    }
-}
-
-// extract inner filed/item schema of record/array/union
-pub fn avro_extract_field_schema<'a>(
-    schema: &'a Schema,
-    name: Option<&'a str>,
-) -> anyhow::Result<&'a Schema> {
-    match schema {
-        Schema::Record(RecordSchema { fields, lookup, .. }) => {
-            let name =
-                name.ok_or_else(|| anyhow::format_err!("no name provided for a field in record"))?;
-            let index = lookup.get(name).ok_or_else(|| {
-                anyhow::format_err!("no field named '{}' in record: {:?}", name, schema)
-            })?;
-            let field = fields
-                .get(*index)
-                .ok_or_else(|| anyhow::format_err!("illegal avro record schema {:?}", schema))?;
-            Ok(&field.schema)
-        }
-        Schema::Array(schema) => Ok(schema),
-        Schema::Union(_) => avro_schema_skip_union(schema),
-        Schema::Map(schema) => Ok(schema),
-        _ => bail!("avro schema does not have inner item, schema: {:?}", schema),
+/// If the union schema is `[null, T]` or `[T, null]`, returns `Some(T)`; otherwise returns `None`.
+pub fn get_nullable_union_inner(union_schema: &UnionSchema) -> Option<&'_ Schema> {
+    let variants = union_schema.variants();
+    // Note: `[null, null] is invalid`, we don't need to worry about that.
+    if variants.len() == 2 && variants.contains(&Schema::Null) {
+        let inner_schema = variants
+            .iter()
+            .find(|s| !matches!(s, &&Schema::Null))
+            .unwrap();
+        Some(inner_schema)
+    } else {
+        None
     }
 }
 
@@ -449,12 +524,15 @@ pub(crate) fn avro_to_jsonb(avro: &Value, builder: &mut jsonbb::Builder) -> Acce
         | Value::Fixed(_, _)
         | Value::Date(_)
         | Value::Decimal(_)
+        | Value::BigDecimal(_)
         | Value::TimeMillis(_)
         | Value::TimeMicros(_)
         | Value::TimestampMillis(_)
         | Value::TimestampMicros(_)
+        | Value::TimestampNanos(_)
         | Value::LocalTimestampMillis(_)
         | Value::LocalTimestampMicros(_)
+        | Value::LocalTimestampNanos(_)
         | Value::Duration(_)
         | Value::Uuid(_)
         | Value::Union(_, _)) => {
@@ -471,30 +549,368 @@ pub(crate) fn avro_to_jsonb(avro: &Value, builder: &mut jsonbb::Builder) -> Acce
 mod tests {
     use std::str::FromStr;
 
-    use apache_avro::Decimal as AvroDecimal;
+    use apache_avro::{Decimal as AvroDecimal, from_avro_datum};
+    use expect_test::expect;
     use risingwave_common::types::{Datum, Decimal};
 
     use super::*;
+
+    /// Test the behavior of the Rust Avro lib for handling union with logical type.
+    #[test]
+    fn test_avro_lib_union() {
+        // duplicate types
+        let s = Schema::parse_str(r#"["null", "null"]"#);
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions cannot contain duplicate types,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        let s = Schema::parse_str(r#"["int", "int"]"#);
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions cannot contain duplicate types,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        // multiple map/array are considered as the same type, regardless of the element type!
+        let s = Schema::parse_str(
+            r#"[
+"null",
+{
+    "type": "map",
+    "values" : "long",
+    "default": {}
+},
+{
+    "type": "map",
+    "values" : "int",
+    "default": {}
+}
+]
+"#,
+        );
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions cannot contain duplicate types,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        let s = Schema::parse_str(
+            r#"[
+"null",
+{
+    "type": "array",
+    "items" : "long",
+    "default": {}
+},
+{
+    "type": "array",
+    "items" : "int",
+    "default": {}
+}
+]
+"#,
+        );
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions cannot contain duplicate types,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        // multiple named types
+        let s = Schema::parse_str(
+            r#"[
+"null",
+{"type":"fixed","name":"a","size":16},
+{"type":"fixed","name":"b","size":32}
+]
+"#,
+        );
+        expect![[r#"
+            Ok(
+                Union(
+                    UnionSchema {
+                        schemas: [
+                            Null,
+                            Fixed(
+                                FixedSchema {
+                                    name: Name {
+                                        name: "a",
+                                        namespace: None,
+                                    },
+                                    aliases: None,
+                                    doc: None,
+                                    size: 16,
+                                    default: None,
+                                    attributes: {},
+                                },
+                            ),
+                            Fixed(
+                                FixedSchema {
+                                    name: Name {
+                                        name: "b",
+                                        namespace: None,
+                                    },
+                                    aliases: None,
+                                    doc: None,
+                                    size: 32,
+                                    default: None,
+                                    attributes: {},
+                                },
+                            ),
+                        ],
+                        variant_index: {
+                            Null: 0,
+                        },
+                    },
+                ),
+            )
+        "#]]
+        .assert_debug_eq(&s);
+
+        // union in union
+        let s = Schema::parse_str(r#"["int", ["null", "int"]]"#);
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions may not directly contain a union,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+
+        // logical type
+        let s = Schema::parse_str(r#"["null", {"type":"string","logicalType":"uuid"}]"#).unwrap();
+        expect![[r#"
+            Union(
+                UnionSchema {
+                    schemas: [
+                        Null,
+                        Uuid,
+                    ],
+                    variant_index: {
+                        Null: 0,
+                        Uuid: 1,
+                    },
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        // Note: Java Avro lib rejects this (logical type unions with its physical type)
+        let s = Schema::parse_str(r#"["string", {"type":"string","logicalType":"uuid"}]"#).unwrap();
+        expect![[r#"
+            Union(
+                UnionSchema {
+                    schemas: [
+                        String,
+                        Uuid,
+                    ],
+                    variant_index: {
+                        String: 0,
+                        Uuid: 1,
+                    },
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        // Note: Java Avro lib rejects this (logical type unions with its physical type)
+        let s = Schema::parse_str(r#"["int", {"type":"int", "logicalType": "date"}]"#).unwrap();
+        expect![[r#"
+            Union(
+                UnionSchema {
+                    schemas: [
+                        Int,
+                        Date,
+                    ],
+                    variant_index: {
+                        Int: 0,
+                        Date: 1,
+                    },
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+        // Note: Java Avro lib allows this (2 decimal with different "name")
+        let s = Schema::parse_str(
+            r#"[
+{"type":"fixed","name":"Decimal128","size":16,"logicalType":"decimal","precision":38,"scale":2},
+{"type":"fixed","name":"Decimal256","size":32,"logicalType":"decimal","precision":50,"scale":2}
+]"#,
+        );
+        expect![[r#"
+            Err(
+                Error {
+                    details: Unions cannot contain duplicate types,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&s);
+    }
+
+    #[test]
+    fn test_avro_lib_union_record_bug() {
+        // multiple named types (record)
+        let s = Schema::parse_str(
+            r#"
+    {
+      "type": "record",
+      "name": "Root",
+      "fields": [
+        {
+          "name": "unionTypeComplex",
+          "type": [
+            "null",
+            {"type": "record", "name": "Email","fields": [{"name":"inner","type":"string"}]},
+            {"type": "record", "name": "Fax","fields": [{"name":"inner","type":"int"}]},
+            {"type": "record", "name": "Sms","fields": [{"name":"inner","type":"int"}]}
+          ]
+        }
+      ]
+    }
+        "#,
+        )
+        .unwrap();
+
+        let bytes = hex::decode("060c").unwrap();
+        // Correct should be variant 3 (Sms)
+        let correct_value = from_avro_datum(&s, &mut bytes.as_slice(), None);
+        expect![[r#"
+                Ok(
+                    Record(
+                        [
+                            (
+                                "unionTypeComplex",
+                                Union(
+                                    3,
+                                    Record(
+                                        [
+                                            (
+                                                "inner",
+                                                Int(
+                                                    6,
+                                                ),
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ),
+                        ],
+                    ),
+                )
+            "#]]
+        .assert_debug_eq(&correct_value);
+        // Bug: We got variant 2 (Fax) here, if we pass the reader schema.
+        let wrong_value = from_avro_datum(&s, &mut bytes.as_slice(), Some(&s));
+        expect![[r#"
+                Ok(
+                    Record(
+                        [
+                            (
+                                "unionTypeComplex",
+                                Union(
+                                    2,
+                                    Record(
+                                        [
+                                            (
+                                                "inner",
+                                                Int(
+                                                    6,
+                                                ),
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ),
+                        ],
+                    ),
+                )
+            "#]]
+        .assert_debug_eq(&wrong_value);
+
+        // The bug below can explain what happened.
+        // The two records below are actually incompatible: https://avro.apache.org/docs/1.11.1/specification/_print/#schema-resolution
+        // > both schemas are records with the _same (unqualified) name_
+        // In from_avro_datum, it first reads the value with the writer schema, and then
+        // it just uses the reader schema to interpret the value.
+        // The value doesn't have record "name" information. So it wrongly passed the conversion.
+        // The correct way is that we need to use both the writer and reader schema in the second step to interpret the value.
+
+        let s = Schema::parse_str(
+            r#"
+    {
+      "type": "record",
+      "name": "Root",
+      "fields": [
+        {
+          "name": "a",
+          "type": "int"
+        }
+      ]
+    }
+        "#,
+        )
+        .unwrap();
+        let s2 = Schema::parse_str(
+            r#"
+{
+  "type": "record",
+  "name": "Root222",
+  "fields": [
+    {
+      "name": "a",
+      "type": "int"
+    }
+  ]
+}
+    "#,
+        )
+        .unwrap();
+
+        let bytes = hex::decode("0c").unwrap();
+        let value = from_avro_datum(&s, &mut bytes.as_slice(), Some(&s2));
+        expect![[r#"
+            Ok(
+                Record(
+                    [
+                        (
+                            "a",
+                            Int(
+                                6,
+                            ),
+                        ),
+                    ],
+                ),
+            )
+        "#]]
+        .assert_debug_eq(&value);
+    }
 
     #[test]
     fn test_convert_decimal() {
         // 280
         let v = vec![1, 24];
         let avro_decimal = AvroDecimal::from(v);
-        let rust_decimal = avro_decimal_to_rust_decimal(avro_decimal, 28, 0).unwrap();
+        let rust_decimal = scaled_bigint_to_rust_decimal(avro_decimal.into(), 0).unwrap();
         assert_eq!(rust_decimal, rust_decimal::Decimal::from(280));
 
         // 28.1
         let v = vec![1, 25];
         let avro_decimal = AvroDecimal::from(v);
-        let rust_decimal = avro_decimal_to_rust_decimal(avro_decimal, 28, 1).unwrap();
+        let rust_decimal = scaled_bigint_to_rust_decimal(avro_decimal.into(), 1).unwrap();
         assert_eq!(rust_decimal, rust_decimal::Decimal::try_from(28.1).unwrap());
 
         // 1.1234567891
         let value = BigInt::from(11234567891_i64);
-        let negative = value.sign() == Sign::Minus;
-        let (lo, mid, hi) = extract_decimal(value.to_bytes_be().1).unwrap();
-        let decimal = rust_decimal::Decimal::from_parts(lo, mid, hi, negative, 10);
+        let decimal = scaled_bigint_to_rust_decimal(value, 10).unwrap();
         assert_eq!(
             decimal,
             rust_decimal::Decimal::try_from(1.1234567891).unwrap()
@@ -503,7 +919,7 @@ mod tests {
         // 1.123456789123456789123456789
         let v = vec![3, 161, 77, 58, 146, 180, 49, 220, 100, 4, 95, 21];
         let avro_decimal = AvroDecimal::from(v);
-        let rust_decimal = avro_decimal_to_rust_decimal(avro_decimal, 28, 27).unwrap();
+        let rust_decimal = scaled_bigint_to_rust_decimal(avro_decimal.into(), 27).unwrap();
         assert_eq!(
             rust_decimal,
             rust_decimal::Decimal::from_str("1.123456789123456789123456789").unwrap()
@@ -524,9 +940,10 @@ mod tests {
         value_schema: &Schema,
         shape: &DataType,
     ) -> anyhow::Result<Datum> {
-        AvroParseOptions::create(value_schema)
-            .convert_to_datum(&value, shape)
-            .map_err(Into::into)
+        Ok(AvroParseOptions::create(value_schema)
+            .inner
+            .convert_to_datum(value_schema, &value, shape)?
+            .to_owned_datum())
     }
 
     #[test]
@@ -566,10 +983,7 @@ mod tests {
         .unwrap();
         let bytes = vec![0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f];
         let value = Value::Decimal(AvroDecimal::from(bytes));
-        let options = AvroParseOptions::create(&schema);
-        let resp = options
-            .convert_to_datum(&value, &DataType::Decimal)
-            .unwrap();
+        let resp = from_avro_value(value, &schema, &DataType::Decimal).unwrap();
         assert_eq!(
             resp,
             Some(ScalarImpl::Decimal(Decimal::Normalized(
@@ -601,14 +1015,11 @@ mod tests {
         )
         .unwrap();
         let value = Value::Record(vec![
-            ("scale".to_string(), Value::Int(0)),
-            ("value".to_string(), Value::Bytes(vec![0x01, 0x02, 0x03])),
+            ("scale".to_owned(), Value::Int(0)),
+            ("value".to_owned(), Value::Bytes(vec![0x01, 0x02, 0x03])),
         ]);
 
-        let options = AvroParseOptions::create(&schema);
-        let resp = options
-            .convert_to_datum(&value, &DataType::Decimal)
-            .unwrap();
+        let resp = from_avro_value(value, &schema, &DataType::Decimal).unwrap();
         assert_eq!(resp, Some(ScalarImpl::Decimal(Decimal::from(66051))));
     }
 }

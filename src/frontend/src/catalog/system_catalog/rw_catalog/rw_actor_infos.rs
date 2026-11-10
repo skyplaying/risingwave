@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use itertools::Itertools;
+use risingwave_common::id::{ActorId, FragmentId};
 use risingwave_common::types::{Fields, JsonbVal};
 use risingwave_frontend_macro::system_catalog;
 use serde_json::json;
@@ -23,30 +24,30 @@ use crate::error::Result;
 #[derive(Fields)]
 struct RwActorInfo {
     #[primary_key]
-    actor_id: i32,
-    fragment_id: i32,
+    actor_id: ActorId,
+    fragment_id: FragmentId,
     node: JsonbVal,
     dispatcher: JsonbVal,
 }
 
 #[system_catalog(table, "rw_catalog.rw_actor_infos")]
 async fn read_rw_actors(reader: &SysCatalogReaderImpl) -> Result<Vec<RwActorInfo>> {
-    let table_ids = reader
+    let job_ids = reader
         .meta_client
-        .list_table_fragment_states()
+        .list_streaming_job_states()
         .await?
         .into_iter()
         .map(|fragment| fragment.table_id)
         .collect_vec();
-    let table_fragments = reader.meta_client.list_table_fragments(&table_ids).await?;
+    let table_fragments = reader.meta_client.list_table_fragments(&job_ids).await?;
     Ok(table_fragments
-        .into_iter()
-        .flat_map(|(_, fragment_info)| {
+        .into_values()
+        .flat_map(|fragment_info| {
             fragment_info.fragments.into_iter().flat_map(|fragment| {
                 let fragment_id = fragment.id;
                 fragment.actors.into_iter().map(move |actor| RwActorInfo {
-                    actor_id: actor.id as _,
-                    fragment_id: fragment_id as _,
+                    actor_id: actor.id,
+                    fragment_id,
                     node: json!(actor.node).into(),
                     dispatcher: json!(actor.dispatcher).into(),
                 })

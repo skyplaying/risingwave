@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,34 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::id::JobId;
 use risingwave_common::types::Fields;
 use risingwave_frontend_macro::system_catalog;
 
-use crate::catalog::system_catalog::{extract_parallelism_from_table_state, SysCatalogReaderImpl};
+use crate::catalog::system_catalog::{SysCatalogReaderImpl, extract_parallelism_from_table_state};
 use crate::error::Result;
 
 #[derive(Fields)]
 struct RwTableFragment {
     #[primary_key]
-    table_id: i32,
+    table_id: JobId,
     status: String,
     parallelism: String,
+    max_parallelism: i32,
 }
 
 #[system_catalog(table, "rw_catalog.rw_table_fragments")]
 async fn read_rw_table_fragments_info(
     reader: &SysCatalogReaderImpl,
 ) -> Result<Vec<RwTableFragment>> {
-    let states = reader.meta_client.list_table_fragment_states().await?;
+    let states = reader.meta_client.list_streaming_job_states().await?;
 
     Ok(states
         .into_iter()
         .map(|state| {
             let parallelism = extract_parallelism_from_table_state(&state);
             RwTableFragment {
-                table_id: state.table_id as i32,
+                table_id: state.table_id,
                 status: state.state().as_str_name().into(),
-                parallelism: parallelism.to_uppercase(),
+                parallelism,
+                max_parallelism: state.max_parallelism as i32,
             }
         })
         .collect())

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,42 +14,37 @@
 
 use pretty_xmlish::XmlNode;
 use risingwave_common::bail;
-use risingwave_common::catalog::{Field, Schema};
-use risingwave_common::types::DataType;
+use risingwave_common::catalog::Schema;
 
-use super::generic::GenericPlanRef;
-use super::utils::{childless_record, Distill};
+use super::generic::{self, GenericPlanRef, Mode};
+use super::utils::{Distill, childless_record};
 use super::{
-    ColPrunable, ColumnPruningContext, ExprRewritable, Logical, LogicalFilter, PlanBase, PlanRef,
-    PredicatePushdown, RewriteStreamContext, StreamNow, ToBatch, ToStream, ToStreamContext,
+    ColPrunable, ColumnPruningContext, ExprRewritable, Logical, LogicalFilter,
+    LogicalPlanRef as PlanRef, LogicalValues, PlanBase, PredicatePushdown, RewriteStreamContext,
+    StreamNow, ToBatch, ToStream, ToStreamContext,
 };
 use crate::error::Result;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::utils::column_names_pretty;
-use crate::optimizer::property::FunctionalDependencySet;
 use crate::utils::ColIndexMapping;
-use crate::OptimizerContextRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalNow {
     pub base: PlanBase<Logical>,
+    core: generic::Now,
 }
 
 impl LogicalNow {
-    pub fn new(ctx: OptimizerContextRef) -> Self {
-        let schema = Schema::new(vec![Field {
-            data_type: DataType::Timestamptz,
-            name: String::from("now"),
-            sub_fields: vec![],
-            type_name: String::default(),
-        }]);
-        let base = PlanBase::new_logical(
-            ctx,
-            schema,
-            Some(vec![]),
-            FunctionalDependencySet::default(),
-        );
-        Self { base }
+    pub fn new(core: generic::Now) -> Self {
+        let base = PlanBase::new_logical_with_core(&core);
+        Self { base, core }
+    }
+
+    pub fn max_one_row(&self) -> bool {
+        match self.core.mode {
+            Mode::UpdateCurrent => true,
+            Mode::GenerateSeries { .. } => false,
+        }
     }
 }
 
@@ -65,9 +60,9 @@ impl Distill for LogicalNow {
     }
 }
 
-impl_plan_tree_node_for_leaf! { LogicalNow }
+impl_plan_tree_node_for_leaf! { Logical, LogicalNow }
 
-impl ExprRewritable for LogicalNow {}
+impl ExprRewritable<Logical> for LogicalNow {}
 
 impl ExprVisitable for LogicalNow {}
 
@@ -76,7 +71,7 @@ impl PredicatePushdown for LogicalNow {
         &self,
         predicate: crate::utils::Condition,
         _ctx: &mut super::PredicatePushdownContext,
-    ) -> crate::PlanRef {
+    ) -> PlanRef {
         LogicalFilter::create(self.clone().into(), predicate)
     }
 }
@@ -90,20 +85,28 @@ impl ToStream for LogicalNow {
     }
 
     /// `to_stream` is equivalent to `to_stream_with_dist_required(RequiredDist::Any)`
-    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<PlanRef> {
-        Ok(StreamNow::new(self.clone(), self.ctx()).into())
+    fn to_stream(
+        &self,
+        _ctx: &mut ToStreamContext,
+    ) -> Result<crate::optimizer::plan_node::StreamPlanRef> {
+        Ok(StreamNow::new(self.core.clone()).into())
     }
 }
 
 impl ToBatch for LogicalNow {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         bail!("`LogicalNow` can only be converted to stream")
     }
 }
 
 /// The trait for column pruning, only logical plan node will use it, though all plan node impl it.
 impl ColPrunable for LogicalNow {
-    fn prune_col(&self, _required_cols: &[usize], _ctx: &mut ColumnPruningContext) -> PlanRef {
-        self.clone().into()
+    fn prune_col(&self, required_cols: &[usize], _: &mut ColumnPruningContext) -> PlanRef {
+        if required_cols.is_empty() {
+            LogicalValues::new(vec![], Schema::empty().clone(), self.ctx()).into()
+        } else {
+            assert_eq!(required_cols, &[0], "we only output one column");
+            self.clone().into()
+        }
     }
 }

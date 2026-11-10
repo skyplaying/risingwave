@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_hummock_sdk::version::HummockVersion;
 use risingwave_hummock_sdk::HummockEpoch;
+use risingwave_hummock_sdk::version::HummockVersion;
 
 use crate::CtlContext;
 
@@ -22,8 +22,8 @@ pub async fn disable_commit_epoch(context: &CtlContext) -> anyhow::Result<()> {
     let version = meta_client.disable_commit_epoch().await?;
     println!(
         "Disabled.\
-        Current version: id {}, max_committed_epoch {}",
-        version.id, version.max_committed_epoch
+        Current version: id {}",
+        version.id,
     );
     Ok(())
 }

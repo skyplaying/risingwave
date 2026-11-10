@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,24 +17,69 @@ use std::sync::LazyLock;
 
 use base64::Engine;
 use itertools::Itertools;
-use num_bigint::{BigInt, Sign};
-use risingwave_common::array::{ListValue, StructValue};
+use num_bigint::BigInt;
+use risingwave_common::array::{Finite32, ListValue, StructValue};
 use risingwave_common::cast::{i64_to_timestamp, i64_to_timestamptz, str_to_bytea};
-use risingwave_common::log::LogSuppresser;
+use risingwave_common::log::LogSuppressor;
 use risingwave_common::types::{
-    DataType, Date, Decimal, Int256, Interval, JsonbVal, ScalarImpl, Time, Timestamp, Timestamptz,
+    DEBEZIUM_UNAVAILABLE_VALUE, DataType, Date, Decimal, Int256, Interval, JsonbVal, ScalarImpl,
+    Time, Timestamp, Timestamptz, ToOwnedDatum, VectorVal, debezium_unavailable_vector,
 };
-use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_connector_codec::decoder::utils::extract_decimal;
+use risingwave_connector_codec::decoder::utils::scaled_bigint_to_rust_decimal;
+use simd_json::base::ValueAsObject;
 use simd_json::prelude::{
-    TypedValue, ValueAsContainer, ValueAsScalar, ValueObjectAccess, ValueTryAsScalar,
+    TypedValue, ValueAsArray, ValueAsScalar, ValueObjectAccess, ValueTryAsScalar,
 };
 use simd_json::{BorrowedValue, ValueType};
 use thiserror_ext::AsReport;
 
 use super::{Access, AccessError, AccessResult};
-use crate::parser::common::json_object_get_case_insensitive;
-use crate::schema::{bail_invalid_option_error, InvalidOptionError};
+use crate::parser::DatumCow;
+use crate::schema::{InvalidOptionError, bail_invalid_option_error};
+
+/// Try to parse a Debezium `PostGIS` spatial object.
+///
+/// Debezium represents `PostGIS` `geometry` and `geography` values as an object:
+/// `{"srid": <int>, "wkb": <base64_string>}`.
+/// For our current Postgres CDC ingestion, the `wkb` field is expected to be EWKB bytes (base64-encoded),
+/// and `srid` is redundant. We decode `wkb` into raw bytes and store it as `bytea`.
+///
+/// Note: Debezium provides an SMT to convert between `WKB` and `EWKB`, which may be useful for future
+/// unification across connectors (e.g., MySQL): see `GeometryFormatTransformer`.
+///
+/// Return semantics:
+/// - `Ok(Some(bytes))`: The input matches the Debezium spatial shape (`srid` is numeric AND `wkb` is string),
+///   and we successfully decoded `wkb` into bytes.
+/// - `Ok(None)`: The input does NOT look like a Debezium spatial object. This allows the caller to keep the
+///   match arm focused on dispatching, and avoids misclassifying other JSON objects that might map to `bytea`
+///   in the future.
+/// - `Err(...)`: The input looks like a Debezium spatial object, but decoding/parsing failed (e.g. invalid
+///   base64). This indicates a real data/format error and should not be silently ignored.
+fn try_parse_debezium_postgis_spatial_as_bytea(
+    value: &BorrowedValue<'_>,
+    create_error: impl Fn() -> AccessError,
+) -> AccessResult<Option<Box<[u8]>>> {
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => return Ok(None),
+    };
+
+    // Strictly identify the spatial object by checking both fields and their types.
+    // There may be other objects that map to bytea in the future.
+    let srid = obj.get("srid").and_then(|v| v.as_i64());
+    let wkb = obj.get("wkb").and_then(|v| v.as_str());
+
+    let (Some(_srid), Some(wkb)) = (srid, wkb) else {
+        return Ok(None);
+    };
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(wkb)
+        .map_err(|_| create_error())?
+        .into_boxed_slice();
+
+    Ok(Some(bytes))
+}
 
 #[derive(Clone, Debug)]
 pub enum ByteaHandling {
@@ -46,6 +91,14 @@ pub enum ByteaHandling {
 pub enum TimeHandling {
     Milli,
     Micro,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BigintUnsignedHandlingMode {
+    /// Convert unsigned bigint to signed bigint (default)
+    Long,
+    /// Use base64-encoded decimal for unsigned bigint (Debezium precise mode)
+    Precise,
 }
 
 #[derive(Clone, Debug)]
@@ -69,20 +122,24 @@ pub enum TimestamptzHandling {
 impl TimestamptzHandling {
     pub const OPTION_KEY: &'static str = "timestamptz.handling.mode";
 
-    pub fn from_options(
-        options: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Option<Self>, InvalidOptionError> {
-        let mode = match options.get(Self::OPTION_KEY).map(std::ops::Deref::deref) {
-            Some("utc_string") => Self::UtcString,
-            Some("utc_without_suffix") => Self::UtcWithoutSuffix,
-            Some("micro") => Self::Micro,
-            Some("milli") => Self::Milli,
-            Some("guess_number_unit") => Self::GuessNumberUnit,
-            Some(v) => bail_invalid_option_error!("unrecognized {} value {}", Self::OPTION_KEY, v),
-            None => return Ok(None),
+    pub fn from_options(value: &str) -> Result<Self, InvalidOptionError> {
+        let mode = match value {
+            "utc_string" => Self::UtcString,
+            "utc_without_suffix" => Self::UtcWithoutSuffix,
+            "micro" => Self::Micro,
+            "milli" => Self::Milli,
+            "guess_number_unit" => Self::GuessNumberUnit,
+            v => bail_invalid_option_error!("unrecognized {} value {}", Self::OPTION_KEY, v),
         };
-        Ok(Some(mode))
+        Ok(mode)
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum TimestampHandling {
+    Milli,
+    Micro,
+    GuessNumberUnit,
 }
 
 #[derive(Clone, Debug)]
@@ -134,13 +191,16 @@ pub enum StructHandling {
 pub struct JsonParseOptions {
     pub bytea_handling: ByteaHandling,
     pub time_handling: TimeHandling,
+    pub timestamp_handling: TimestampHandling,
     pub timestamptz_handling: TimestamptzHandling,
     pub json_value_handling: JsonValueHandling,
     pub numeric_handling: NumericHandling,
     pub boolean_handling: BooleanHandling,
     pub varchar_handling: VarcharHandling,
     pub struct_handling: StructHandling,
+    pub bigint_unsigned_handling: BigintUnsignedHandlingMode,
     pub ignoring_keycase: bool,
+    pub handle_toast_columns: bool,
 }
 
 impl Default for JsonParseOptions {
@@ -153,6 +213,7 @@ impl JsonParseOptions {
     pub const CANAL: JsonParseOptions = JsonParseOptions {
         bytea_handling: ByteaHandling::Standard,
         time_handling: TimeHandling::Micro,
+        timestamp_handling: TimestampHandling::GuessNumberUnit, // backward-compatible
         timestamptz_handling: TimestamptzHandling::GuessNumberUnit, // backward-compatible
         json_value_handling: JsonValueHandling::AsValue,
         numeric_handling: NumericHandling::Relax {
@@ -164,11 +225,14 @@ impl JsonParseOptions {
         },
         varchar_handling: VarcharHandling::Strict,
         struct_handling: StructHandling::Strict,
+        bigint_unsigned_handling: BigintUnsignedHandlingMode::Long, // default to long mode
         ignoring_keycase: true,
+        handle_toast_columns: false,
     };
     pub const DEFAULT: JsonParseOptions = JsonParseOptions {
         bytea_handling: ByteaHandling::Standard,
         time_handling: TimeHandling::Micro,
+        timestamp_handling: TimestampHandling::GuessNumberUnit, // backward-compatible
         timestamptz_handling: TimestamptzHandling::GuessNumberUnit, // backward-compatible
         json_value_handling: JsonValueHandling::AsValue,
         numeric_handling: NumericHandling::Relax {
@@ -177,13 +241,22 @@ impl JsonParseOptions {
         boolean_handling: BooleanHandling::Strict,
         varchar_handling: VarcharHandling::OnlyPrimaryTypes,
         struct_handling: StructHandling::AllowJsonString,
+        bigint_unsigned_handling: BigintUnsignedHandlingMode::Long, // default to long mode
         ignoring_keycase: true,
+        handle_toast_columns: false,
     };
 
-    pub fn new_for_debezium(timestamptz_handling: TimestamptzHandling) -> Self {
+    pub fn new_for_debezium(
+        timestamptz_handling: TimestamptzHandling,
+        timestamp_handling: TimestampHandling,
+        time_handling: TimeHandling,
+        bigint_unsigned_handling: BigintUnsignedHandlingMode,
+        handle_toast_columns: bool,
+    ) -> Self {
         Self {
             bytea_handling: ByteaHandling::Base64,
-            time_handling: TimeHandling::Micro,
+            time_handling,
+            timestamp_handling,
             timestamptz_handling,
             json_value_handling: JsonValueHandling::AsString,
             numeric_handling: NumericHandling::Relax {
@@ -195,21 +268,26 @@ impl JsonParseOptions {
             },
             varchar_handling: VarcharHandling::Strict,
             struct_handling: StructHandling::Strict,
+            bigint_unsigned_handling,
             ignoring_keycase: true,
+            handle_toast_columns,
         }
     }
 
-    pub fn parse(&self, value: &BorrowedValue<'_>, type_expected: &DataType) -> AccessResult {
+    pub fn parse<'a>(
+        &self,
+        value: &'a BorrowedValue<'a>,
+        type_expected: &DataType,
+    ) -> AccessResult<DatumCow<'a>> {
         let create_error = || AccessError::TypeError {
             expected: format!("{:?}", type_expected),
             got: value.value_type().to_string(),
             value: value.to_string(),
         };
-
         let v: ScalarImpl = match (type_expected, value.value_type()) {
-            (_, ValueType::Null) => return Ok(None),
+            (_, ValueType::Null) => return Ok(DatumCow::NULL),
             // ---- Boolean -----
-            (DataType::Boolean , ValueType::Bool) => value.as_bool().unwrap().into(),
+            (DataType::Boolean, ValueType::Bool) => value.as_bool().unwrap().into(),
 
             (
                 DataType::Boolean,
@@ -360,33 +438,52 @@ impl JsonParseOptions {
                     .map_err(|_| create_error())?
                     .into()
             }
-            (DataType::Float64 , ValueType::F64) => {
+            (DataType::Float64, ValueType::F64) => {
                 value.try_as_f64().map_err(|_| create_error())?.into()
             }
             // ---- Decimal -----
-            (DataType::Decimal , ValueType::I128 | ValueType::U128) => {
+            (DataType::Decimal, ValueType::I128 | ValueType::U128) => {
                 Decimal::from_str(&value.try_as_i128().map_err(|_| create_error())?.to_string())
                     .map_err(|_| create_error())?
                     .into()
             }
             (DataType::Decimal, ValueType::I64 | ValueType::U64) => {
-                Decimal::from(value.try_as_i64().map_err(|_| create_error())?).into()
+                let i64_val = value.try_as_i64().map_err(|_| create_error())?;
+                Decimal::from(i64_val).into()
+            }
+            (DataType::Decimal, ValueType::String) => {
+                let str_val = value.as_str().unwrap();
+                // the following values are special string generated by Debezium and should be handled separately
+                match str_val {
+                    "NAN" => return Ok(DatumCow::Owned(Some(ScalarImpl::Decimal(Decimal::NaN)))),
+                    "POSITIVE_INFINITY" => {
+                        return Ok(DatumCow::Owned(Some(ScalarImpl::Decimal(
+                            Decimal::PositiveInf,
+                        ))));
+                    }
+                    "NEGATIVE_INFINITY" => {
+                        return Ok(DatumCow::Owned(Some(ScalarImpl::Decimal(
+                            Decimal::NegativeInf,
+                        ))));
+                    }
+                    _ => {}
+                }
+
+                Decimal::from_str(str_val)
+                    .or_else(|_err| {
+                        try_base64_decode_decimal(
+                            str_val,
+                            self.bigint_unsigned_handling,
+                            create_error,
+                        )
+                    })?
+                    .into()
             }
 
             (DataType::Decimal, ValueType::F64) => {
                 Decimal::try_from(value.try_as_f64().map_err(|_| create_error())?)
                     .map_err(|_| create_error())?
                     .into()
-            }
-            (DataType::Decimal, ValueType::String) => {
-                let str = value.as_str().unwrap();
-                // the following values are special string generated by Debezium and should be handled separately
-                match str {
-                    "NAN" => ScalarImpl::Decimal(Decimal::NaN),
-                    "POSITIVE_INFINITY" => ScalarImpl::Decimal(Decimal::PositiveInf),
-                    "NEGATIVE_INFINITY" => ScalarImpl::Decimal(Decimal::NegativeInf),
-                    _ => ScalarImpl::Decimal(Decimal::from_str(str).map_err(|_err| create_error())?),
-                }
             }
             (DataType::Decimal, ValueType::Object) => {
                 // ref https://github.com/risingwavelabs/risingwave/issues/10628
@@ -402,11 +499,8 @@ impl JsonParseOptions {
                     .as_str()
                     .unwrap()
                     .as_bytes();
-                let decimal = BigInt::from_signed_bytes_be(value);
-                let negative = decimal.sign() == Sign::Minus;
-                let (lo, mid, hi) = extract_decimal(decimal.to_bytes_be().1)?;
-                let decimal =
-                    rust_decimal::Decimal::from_parts(lo, mid, hi, negative, scale as u32);
+                let unscaled = BigInt::from_signed_bytes_be(value);
+                let decimal = scaled_bigint_to_rust_decimal(unscaled, scale as _)?;
                 ScalarImpl::Decimal(Decimal::Normalized(decimal))
             }
             // ---- Date -----
@@ -423,7 +517,9 @@ impl JsonParseOptions {
                 .map_err(|_| create_error())?
                 .into(),
             // ---- Varchar -----
-            (DataType::Varchar , ValueType::String) => value.as_str().unwrap().into(),
+            (DataType::Varchar, ValueType::String) => {
+                return Ok(DatumCow::Borrowed(Some(value.as_str().unwrap().into())));
+            }
             (
                 DataType::Varchar,
                 ValueType::Bool
@@ -477,8 +573,22 @@ impl JsonParseOptions {
             (
                 DataType::Timestamp,
                 ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128,
-            ) => i64_to_timestamp(value.as_i64().unwrap())
-                .map_err(|_| create_error())?
+            ) => value
+                .as_i64()
+                .map(|num| match self.timestamp_handling {
+                    // Only when user configures debezium.time.precision.mode = 'connect',
+                    // the Milli branch will be executed
+                    TimestampHandling::Milli => {
+                        Timestamp::with_millis(num).map_err(|_| create_error())
+                    }
+                    TimestampHandling::Micro => {
+                        Timestamp::with_micros(num).map_err(|_| create_error())
+                    }
+                    TimestampHandling::GuessNumberUnit => {
+                        i64_to_timestamp(num).map_err(|_| create_error())
+                    }
+                })
+                .ok_or_else(create_error)??
                 .into(),
             // ---- Timestamptz -----
             (DataType::Timestamptz, ValueType::String) => match self.timestamptz_handling {
@@ -486,7 +596,9 @@ impl JsonParseOptions {
                     .as_str()
                     .unwrap()
                     .parse::<Timestamp>()
-                    .map(|naive_utc| Timestamptz::from_micros(naive_utc.0.timestamp_micros()))
+                    .map(|naive_utc| {
+                        Timestamptz::from_micros_uncheck(naive_utc.0.and_utc().timestamp_micros())
+                    })
                     .map_err(|_| create_error())?
                     .into(),
                 // Unless explicitly requested `utc_without_utc`, we parse string with `YYYY-MM-DDTHH:MM:SSZ`.
@@ -496,14 +608,15 @@ impl JsonParseOptions {
                     .parse::<Timestamptz>()
                     .map_err(|_| create_error())?
                     .into(),
-            }
+            },
             (
                 DataType::Timestamptz,
                 ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128,
-            ) => value.as_i64()
+            ) => value
+                .as_i64()
                 .and_then(|num| match self.timestamptz_handling {
                     TimestamptzHandling::GuessNumberUnit => i64_to_timestamptz(num).ok(),
-                    TimestamptzHandling::Micro => Some(Timestamptz::from_micros(num)),
+                    TimestamptzHandling::Micro => Timestamptz::from_micros(num),
                     TimestamptzHandling::Milli => Timestamptz::from_millis(num),
                     // When explicitly requested string format, number without units are rejected.
                     TimestamptzHandling::UtcString | TimestamptzHandling::UtcWithoutSuffix => None,
@@ -511,34 +624,38 @@ impl JsonParseOptions {
                 .ok_or_else(create_error)?
                 .into(),
             // ---- Interval -----
-            (DataType::Interval, ValueType::String) => {
-                value.as_str().unwrap().parse::<Interval>().map_err(|_| create_error())?.into()
-            }
+            (DataType::Interval, ValueType::String) => value
+                .as_str()
+                .unwrap()
+                .parse::<Interval>()
+                .map_err(|_| create_error())?
+                .into(),
             // ---- Struct -----
-            (DataType::Struct(struct_type_info), ValueType::Object) => StructValue::new(
-                struct_type_info
-                    .names()
-                    .zip_eq_fast(struct_type_info.types())
-                    .map(|(field_name, field_type)| {
-                        let field_value = json_object_get_case_insensitive(value, field_name)
+            (DataType::Struct(struct_type_info), ValueType::Object) => {
+                // Collecting into a Result<Vec<_>> doesn't reserve the capacity in advance, so we `Vec::with_capacity` instead.
+                // https://github.com/rust-lang/rust/issues/48994
+                let mut fields = Vec::with_capacity(struct_type_info.len());
+                for (field_name, field_type) in struct_type_info.iter() {
+                    let field_value = json_object_get_case_insensitive(value, field_name)
                             .unwrap_or_else(|| {
                                 let error = AccessError::Undefined {
                                     name: field_name.to_owned(),
                                     path: struct_type_info.to_string(), // TODO: this is not good, we should maintain a path stack
                                 };
                                 // TODO: is it possible to unify the logging with the one in `do_action`?
-                                static LOG_SUPPERSSER: LazyLock<LogSuppresser> =  LazyLock::new(LogSuppresser::default);
-                                if let Ok(suppressed_count) = LOG_SUPPERSSER.check() {
+                                static LOG_SUPPRESSOR: LazyLock<LogSuppressor> =  LazyLock::new(LogSuppressor::default);
+                                if let Ok(suppressed_count) = LOG_SUPPRESSOR.check() {
                                     tracing::warn!(error = %error.as_report(), suppressed_count, "undefined nested field, padding with `NULL`");
                                 }
                                 &BorrowedValue::Static(simd_json::StaticNode::Null)
                             });
+                    fields.push(
                         self.parse(field_value, field_type)
-                    })
-                    .collect::<Result<_, _>>()?,
-            )
-            .into(),
-
+                            .map(|d| d.to_owned_datum())?,
+                    );
+                }
+                StructValue::new(fields).into()
+            }
 
             // String containing json object, e.g. "{\"a\": 1, \"b\": 2}"
             // Try to parse it as json object.
@@ -549,11 +666,14 @@ impl JsonParseOptions {
                 let mut value = value.as_str().unwrap().as_bytes().to_vec();
                 let value =
                     simd_json::to_borrowed_value(&mut value[..]).map_err(|_| create_error())?;
-                return self.parse(&value, type_expected);
+                return self
+                    .parse(&value, type_expected)
+                    .map(|d| d.to_owned_datum().into());
             }
 
             // ---- List -----
-            (DataType::List(item_type), ValueType::Array) => ListValue::new({
+            (DataType::List(list_type), ValueType::Array) => ListValue::new({
+                let item_type = list_type.elem();
                 let array = value.as_array().unwrap();
                 let mut builder = item_type.create_array_builder(array.len());
                 for v in array {
@@ -563,25 +683,111 @@ impl JsonParseOptions {
                 builder.finish()
             })
             .into(),
+            // ---- Vector -----
+            (DataType::Vector(size), ValueType::Array) => {
+                let array = value.as_array().unwrap();
+                if array.len() != *size {
+                    Err(create_error())?
+                }
+                let mut elems = Vec::with_capacity(array.len());
+                for v in array {
+                    let value = match v.value_type() {
+                        ValueType::I64 | ValueType::I128 => {
+                            let i128_value = v.try_as_i128().map_err(|_| create_error())?;
+                            i128_value
+                                .to_string()
+                                .parse::<f32>()
+                                .map_err(|_| create_error())?
+                        }
+                        ValueType::U64 | ValueType::U128 => {
+                            let u128_value = v.try_as_u128().map_err(|_| create_error())?;
+                            u128_value
+                                .to_string()
+                                .parse::<f32>()
+                                .map_err(|_| create_error())?
+                        }
+                        ValueType::F64 => {
+                            let f64_value = v.try_as_f64().map_err(|_| create_error())?;
+                            if !f64_value.is_finite() {
+                                Err(create_error())?
+                            }
+                            f64_value
+                                .to_string()
+                                .parse::<f32>()
+                                .map_err(|_| create_error())?
+                        }
+                        _ => Err(create_error())?,
+                    };
+                    let finite = Finite32::try_from(value).map_err(|_| create_error())?;
+                    elems.push(finite);
+                }
+                VectorVal::from(elems).into()
+            }
+            // Vector emitted as a string. Reached via the Java `PgVectorToStringConverter`,
+            // which downgrades the pgvector column from `DoubleVector` (ARRAY) to STRING so
+            // that the Debezium unchanged-TOAST placeholder can flow through without tripping
+            // Connect's schema validation. The value is either the pgvector text form
+            // `"[a,b,...]"` or the placeholder; the latter is mapped to a sentinel `VectorVal`
+            // that the materialize executor recognises and replaces with the old row value.
+            (DataType::Vector(size), ValueType::String) => {
+                let s = value.as_str().unwrap();
+                if self.handle_toast_columns
+                    && s.len() == DEBEZIUM_UNAVAILABLE_VALUE.len()
+                    && s == DEBEZIUM_UNAVAILABLE_VALUE
+                {
+                    // Build the sentinel at the declared dimension so it passes
+                    // `check_datum_type` in the chunk builder; the materialize
+                    // executor recognises it by checking that every element
+                    // equals `DEBEZIUM_UNAVAILABLE_VECTOR_ELEM`.
+                    debezium_unavailable_vector(*size).into()
+                } else {
+                    VectorVal::from_text(s, *size)
+                        .map_err(|_| create_error())?
+                        .into()
+                }
+            }
 
             // ---- Bytea -----
-            (DataType::Bytea, ValueType::String) => match self.bytea_handling {
-                ByteaHandling::Standard => str_to_bytea(value.as_str().unwrap())
-                    .map_err(|_| create_error())?
-                    .into(),
-                ByteaHandling::Base64 => base64::engine::general_purpose::STANDARD
-                    .decode(value.as_str().unwrap())
-                    .map_err(|_| create_error())?
-                    .into_boxed_slice()
-                    .into(),
-            },
+            (DataType::Bytea, ValueType::String) => {
+                let value_str = value.as_str().unwrap();
+
+                match self.bytea_handling {
+                    ByteaHandling::Standard => {
+                        let mut buf = Vec::new();
+                        str_to_bytea(value_str, &mut buf).map_err(|_| create_error())?;
+                        buf.into()
+                    }
+                    ByteaHandling::Base64 => base64::engine::general_purpose::STANDARD
+                        .decode(value_str)
+                        .map_err(|_| create_error())?
+                        .into_boxed_slice()
+                        .into(),
+                }
+            }
+            // Handle Debezium PostGIS geometry and geography types:
+            // {"srid": <int>, "wkb": <base64_string>}. We extract the wkb field and
+            // decode it as EWKB bytes.
+            (DataType::Bytea, ValueType::Object) => {
+                match try_parse_debezium_postgis_spatial_as_bytea(value, create_error)? {
+                    Some(bytes) => bytes.into(),
+                    None => Err(create_error())?,
+                }
+            }
             // ---- Jsonb -----
             (DataType::Jsonb, ValueType::String)
                 if matches!(self.json_value_handling, JsonValueHandling::AsString) =>
             {
-                JsonbVal::from_str(value.as_str().unwrap())
-                    .map_err(|_| create_error())?
-                    .into()
+                // Check if this value is the Debezium unavailable value (TOAST handling for postgres-cdc).
+                // Debezium will base64 encode the bytea type placeholder.
+                // When a placeholder is encountered, it is converted into a jsonb format placeholder to match the original type.
+                match self.handle_toast_columns {
+                    true => JsonbVal::from_debezium_unavailable_value(value.as_str().unwrap())
+                        .map_err(|_| create_error())?
+                        .into(),
+                    false => JsonbVal::from_str(value.as_str().unwrap())
+                        .map_err(|_| create_error())?
+                        .into(),
+                }
             }
             (DataType::Jsonb, _)
                 if matches!(self.json_value_handling, JsonValueHandling::AsValue) =>
@@ -596,39 +802,66 @@ impl JsonParseOptions {
                 ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128,
             ) => Int256::from(value.try_as_i64().map_err(|_| create_error())?).into(),
 
-            (DataType::Int256, ValueType::String) => {
-                Int256::from_str(value.as_str().unwrap())
-                    .map_err(|_| create_error())?
-                    .into()
-            }
+            (DataType::Int256, ValueType::String) => Int256::from_str(value.as_str().unwrap())
+                .map_err(|_| create_error())?
+                .into(),
 
             (_expected, _got) => Err(create_error())?,
         };
-        Ok(Some(v))
+        Ok(DatumCow::Owned(Some(v)))
     }
 }
 
-pub struct JsonAccess<'a, 'b> {
-    value: BorrowedValue<'b>,
+/// Try to decode a base64-encoded decimal string for unsigned bigint handling in Precise mode.
+///
+/// This is used when processing CDC data from upstream systems with unsigned bigint (e.g., MySQL CDC).
+/// When users configure `debezium.bigint.unsigned.handling.mode='precise'`, Debezium converts
+/// unsigned bigint to base64-encoded decimal.
+///
+/// Reference: <https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-bigint-unsigned-handling-mode>.
+fn try_base64_decode_decimal(
+    str_val: &str,
+    bigint_unsigned_handling: BigintUnsignedHandlingMode,
+    create_error: impl Fn() -> AccessError,
+) -> Result<Decimal, AccessError> {
+    match bigint_unsigned_handling {
+        BigintUnsignedHandlingMode::Precise => {
+            // A better approach would be to get bytes + org.apache.kafka.connect.data.Decimal from schema
+            // instead of string, as described in <https://github.com/risingwavelabs/risingwave/issues/16852>.
+            // However, Rust doesn't have a library to parse Kafka Connect metadata, so we'll refactor this
+            // after implementing that functionality.
+            let value = base64::engine::general_purpose::STANDARD
+                .decode(str_val)
+                .map_err(|_| create_error())?;
+            let unscaled = num_bigint::BigInt::from_signed_bytes_be(&value);
+            Decimal::from_str(&unscaled.to_string()).map_err(|_| create_error())
+        }
+        BigintUnsignedHandlingMode::Long => {
+            // In Long mode, don't attempt base64 decoding
+            Err(create_error())
+        }
+    }
+}
+
+pub struct JsonAccess<'a> {
+    value: BorrowedValue<'a>,
     options: &'a JsonParseOptions,
 }
 
-impl<'a, 'b> JsonAccess<'a, 'b> {
-    pub fn new_with_options(value: BorrowedValue<'b>, options: &'a JsonParseOptions) -> Self {
+impl<'a> JsonAccess<'a> {
+    pub fn new_with_options(value: BorrowedValue<'a>, options: &'a JsonParseOptions) -> Self {
         Self { value, options }
     }
 
-    pub fn new(value: BorrowedValue<'b>) -> Self {
+    pub fn new(value: BorrowedValue<'a>) -> Self {
         Self::new_with_options(value, &JsonParseOptions::DEFAULT)
     }
 }
 
-impl<'a, 'b> Access for JsonAccess<'a, 'b>
-where
-    'a: 'b,
-{
-    fn access(&self, path: &[&str], type_expected: &DataType) -> AccessResult {
+impl Access for JsonAccess<'_> {
+    fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
         let mut value = &self.value;
+
         for (idx, &key) in path.iter().enumerate() {
             if let Some(sub_value) = if self.options.ignoring_keycase {
                 json_object_get_case_insensitive(value, key)
@@ -638,7 +871,7 @@ where
                 value = sub_value;
             } else {
                 Err(AccessError::Undefined {
-                    name: key.to_string(),
+                    name: key.to_owned(),
                     path: path.iter().take(idx).join("."),
                 })?;
             }
@@ -646,4 +879,24 @@ where
 
         self.options.parse(value, type_expected)
     }
+}
+
+/// Get a value from a json object by key, case insensitive.
+///
+/// Returns `None` if the given json value is not an object, or the key is not found.
+fn json_object_get_case_insensitive<'b>(
+    v: &'b simd_json::BorrowedValue<'b>,
+    key: &str,
+) -> Option<&'b simd_json::BorrowedValue<'b>> {
+    let obj = v.as_object()?;
+    let value = obj.get(key);
+    if value.is_some() {
+        return value; // fast path
+    }
+    for (k, v) in obj {
+        if k.eq_ignore_ascii_case(key) {
+            return Some(v);
+        }
+    }
+    None
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
 
 pub use column_mapping::*;
 
-pub mod cache;
+pub mod change_buffer;
 mod column_mapping;
 pub mod compact_chunk;
 pub mod log_store_impl;
 pub mod metrics;
 pub mod rate_limit;
+pub mod state_cache;
 pub mod table;

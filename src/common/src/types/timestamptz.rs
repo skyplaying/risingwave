@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,19 +13,20 @@
 // limitations under the License.
 
 use std::error::Error;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::str::FromStr;
 
-use bytes::{Bytes, BytesMut};
+use anyhow::Context;
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::BytesMut;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use chrono_tz::Tz;
-use postgres_types::{accepts, to_sql_checked, FromSql, IsNull, ToSql, Type};
+use postgres_types::{FromSql, IsNull, ToSql, Type, accepts, to_sql_checked};
 use risingwave_common_estimate_size::ZeroHeapSize;
 use serde::{Deserialize, Serialize};
 
-use super::to_binary::ToBinary;
-use super::to_text::ToText;
 use super::DataType;
+use super::to_text::ToText;
 use crate::array::ArrayResult;
 
 /// Timestamp with timezone.
@@ -65,18 +66,6 @@ impl<'a> FromSql<'a> for Timestamptz {
     }
 }
 
-impl ToBinary for Timestamptz {
-    fn to_binary_with_type(&self, _ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        let instant = self.to_datetime_utc();
-        let mut out = BytesMut::new();
-        // postgres_types::Type::ANY is only used as a placeholder.
-        instant
-            .to_sql(&postgres_types::Type::ANY, &mut out)
-            .unwrap();
-        Ok(Some(out.freeze()))
-    }
-}
-
 impl ToText for Timestamptz {
     fn write<W: std::fmt::Write>(&self, f: &mut W) -> std::fmt::Result {
         // Just a meaningful representation as placeholder. The real implementation depends
@@ -95,22 +84,46 @@ impl ToText for Timestamptz {
 }
 
 impl Timestamptz {
-    pub const MIN: Self = Self(i64::MIN);
-
     /// Creates a `Timestamptz` from seconds. Returns `None` if the given timestamp is out of range.
     pub fn from_secs(timestamp_secs: i64) -> Option<Self> {
-        timestamp_secs.checked_mul(1_000_000).map(Self)
+        timestamp_secs
+            .checked_mul(1_000_000)
+            .and_then(Self::from_micros)
     }
 
     /// Creates a `Timestamptz` from milliseconds. Returns `None` if the given timestamp is out of
     /// range.
     pub fn from_millis(timestamp_millis: i64) -> Option<Self> {
-        timestamp_millis.checked_mul(1000).map(Self)
+        timestamp_millis
+            .checked_mul(1000)
+            .and_then(Self::from_micros)
     }
 
-    /// Creates a `Timestamptz` from microseconds.
-    pub fn from_micros(timestamp_micros: i64) -> Self {
+    /// Creates a `Timestamptz` from microseconds. Returns `None` if the value does not convert to
+    /// [`chrono::DateTime`], which formatting and time zone operations require.
+    pub fn from_micros(timestamp_micros: i64) -> Option<Self> {
+        // Exactly the values `DateTime::from_timestamp_micros` accepts, as a cheap range check.
+        const MIN_MICROS: i64 = DateTime::<Utc>::MIN_UTC.timestamp_micros();
+        const MAX_MICROS: i64 = DateTime::<Utc>::MAX_UTC.timestamp_micros();
+        (MIN_MICROS..=MAX_MICROS)
+            .contains(&timestamp_micros)
+            .then_some(Self(timestamp_micros))
+    }
+
+    /// Creates a `Timestamptz` from microseconds without checking representability.
+    ///
+    /// For values provably in range (e.g. derived from a [`chrono::DateTime`]), or for decode
+    /// paths that must stay infallible and knowingly tolerate legacy out-of-range values.
+    pub fn from_micros_uncheck(timestamp_micros: i64) -> Self {
         Self(timestamp_micros)
+    }
+
+    /// Creates a `Timestamptz` from nanoseconds, flooring to microseconds.
+    ///
+    /// An `i64` nanosecond count spans only ±292 years around the epoch, well within the
+    /// representable range, so this cannot fail.
+    pub fn from_nanos(timestamp_nanos: i64) -> Self {
+        Self(timestamp_nanos.div_euclid(1_000))
     }
 
     /// Returns the number of non-leap-microseconds since January 1, 1970 UTC.
@@ -121,6 +134,11 @@ impl Timestamptz {
     /// Returns the number of non-leap-milliseconds since January 1, 1970 UTC.
     pub fn timestamp_millis(&self) -> i64 {
         self.0.div_euclid(1_000)
+    }
+
+    /// Returns the number of non-leap-nanosseconds since January 1, 1970 UTC.
+    pub fn timestamp_nanos(&self) -> Option<i64> {
+        self.0.checked_mul(1_000)
     }
 
     /// Returns the number of non-leap seconds since January 1, 1970 0:00:00 UTC (aka "UNIX
@@ -147,8 +165,11 @@ impl Timestamptz {
             .map_err(|_| format!("'{time_zone}' is not a valid timezone"))
     }
 
-    pub fn from_protobuf(timestamp_micros: i64) -> ArrayResult<Self> {
-        Ok(Self(timestamp_micros))
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Timestamptz> {
+        let micros = cur
+            .read_i64::<BigEndian>()
+            .context("failed to read i64 from Timestamptz buffer")?;
+        Ok(Self(micros))
     }
 
     pub fn to_protobuf(self, output: &mut impl Write) -> ArrayResult<usize> {
@@ -164,6 +185,9 @@ impl<Tz: TimeZone> From<chrono::DateTime<Tz>> for Timestamptz {
 
 impl From<Timestamptz> for chrono::DateTime<Utc> {
     fn from(tz: Timestamptz) -> Self {
+        // Every fallible constructor validates representability, so this can fail only for
+        // values built by `from_micros_uncheck`: a contract violation, or a legacy out-of-range
+        // value read back from storage (#26397).
         Utc.timestamp_opt(tz.timestamp(), tz.timestamp_subsec_nanos())
             .unwrap()
     }
@@ -174,8 +198,8 @@ impl FromStr for Timestamptz {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         pub const ERROR_MSG: &str = concat!(
-            "Can't cast string to timestamp with time zone (expected format is YYYY-MM-DD HH:MM:SS[.D+{up to 6 digits}] followed by +hh:mm or literal Z)"
-            , "\nFor example: '2021-04-01 00:00:00+00:00'"
+            "Can't cast string to timestamp with time zone (expected format is YYYY-MM-DD HH:MM:SS[.D+{up to 6 digits}] followed by +hh:mm or literal Z)",
+            "\nFor example: '2021-04-01 00:00:00+00:00'"
         );
         // Try `speedate` first
         // * It is also used by `str_to_{date,time,timestamp}`
@@ -197,9 +221,6 @@ impl FromStr for Timestamptz {
         };
         if ret.time.tz_offset.is_none() {
             return Err(ERROR_MSG);
-        }
-        if ret.date.year < 1600 {
-            return Err("parsing timestamptz with year < 1600 unsupported");
         }
         Ok(Timestamptz(
             ret.timestamp_tz()
@@ -241,6 +262,26 @@ mod test {
     use super::*;
 
     #[test]
+    fn from_micros_checks_representability() {
+        // The range check must accept exactly what `DateTime::from_timestamp_micros` accepts.
+        for micros in [
+            0,
+            i64::MAX,
+            i64::MIN,
+            8_210_266_876_799_999_999,  // chrono max
+            8_210_266_876_800_000_000,  // chrono max + 1
+            -8_334_601_228_800_000_000, // chrono min
+            -8_334_601_228_800_000_001, // chrono min - 1
+        ] {
+            assert_eq!(
+                Timestamptz::from_micros(micros).is_some(),
+                DateTime::from_timestamp_micros(micros).is_some(),
+                "mismatch at {micros}"
+            );
+        }
+    }
+
+    #[test]
     fn parse() {
         assert!("1999-01-08 04:05:06".parse::<Timestamptz>().is_err());
         assert_eq!(
@@ -248,7 +289,7 @@ mod test {
             "2022-08-03 02:34:02-08:00".parse::<Timestamptz>().unwrap()
         );
 
-        let expected = Ok(Timestamptz::from_micros(1689130892000000));
+        let expected = Ok(Timestamptz::from_micros(1689130892000000).unwrap());
         // Most standard: ISO 8601 & RFC 3339
         assert_eq!("2023-07-12T03:01:32Z".parse(), expected);
         assert_eq!("2023-07-12T03:01:32+00:00".parse(), expected);

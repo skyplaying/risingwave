@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,5 +19,12 @@ fn main() {
     if let Err(e) = EmitBuilder::builder().git_sha(true).fail_on_error().emit() {
         // Leave the environment variable unset if error occurs.
         println!("cargo:warning={}", e.as_report())
+    }
+
+    // The macOS linker exports every global symbol of an executable by default, so the dyld export
+    // trie repeats the whole symbol string table (hundreds of MB for a dev build since the v0
+    // mangling scheme). Exported symbols are not used and already empty for Linux build.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-no_exported_symbols");
     }
 }

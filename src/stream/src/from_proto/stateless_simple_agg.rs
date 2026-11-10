@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@ use risingwave_expr::aggregate::AggCall;
 use risingwave_pb::stream_plan::SimpleAggNode;
 
 use super::*;
-use crate::executor::StatelessSimpleAggExecutor;
+use crate::executor::aggregate::StatelessSimpleAggExecutor;
 
 pub struct StatelessSimpleAggExecutorBuilder;
+
+impl_stream_node_body!(StatelessSimpleAgg(SimpleAggNode) => StatelessSimpleAggExecutorBuilder);
 
 impl ExecutorBuilder for StatelessSimpleAggExecutorBuilder {
     type Node = SimpleAggNode;

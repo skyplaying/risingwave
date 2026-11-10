@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use std::error::Error;
 use std::hash::Hash;
 
 use bytes::BytesMut;
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{IsNull, ToSql, Type, accepts, to_sql_checked};
 use risingwave_common_estimate_size::ZeroHeapSize;
 use serde::{Serialize, Serializer};
 
@@ -24,7 +24,7 @@ use crate::util::row_id::RowId;
 
 // Serial is an alias for i64
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Default, Hash)]
-pub struct Serial(i64);
+pub struct Serial(pub(crate) i64);
 
 impl From<Serial> for i64 {
     fn from(value: Serial) -> i64 {
@@ -72,17 +72,6 @@ impl crate::types::to_text::ToText for Serial {
         f: &mut W,
     ) -> std::fmt::Result {
         self.write(f)
-    }
-}
-
-impl crate::types::to_binary::ToBinary for Serial {
-    fn to_binary_with_type(
-        &self,
-        _ty: &crate::types::DataType,
-    ) -> super::to_binary::Result<Option<bytes::Bytes>> {
-        let mut output = bytes::BytesMut::new();
-        self.0.to_sql(&Type::ANY, &mut output).unwrap();
-        Ok(Some(output.freeze()))
     }
 }
 

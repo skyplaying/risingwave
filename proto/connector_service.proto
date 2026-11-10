@@ -5,6 +5,7 @@ package connector_service;
 import "catalog.proto";
 import "common.proto";
 import "plan_common.proto";
+import "stream_plan.proto";
 
 option java_outer_classname = "ConnectorServiceProto";
 option java_package = "com.risingwave.proto";
@@ -27,6 +28,10 @@ message SinkParam {
   string sink_from_name = 6;
   catalog.SinkFormatDesc format_desc = 7;
   string sink_name = 8;
+  // Backward-compatible replacement for `SINK_TYPE_FORCE_APPEND_ONLY`.
+  //
+  // Should not directly access this field. Use method `ignore_delete()` instead.
+  bool raw_ignore_delete = 9;
 }
 
 message SinkWriterStreamRequest {
@@ -147,23 +152,40 @@ message SinkCoordinatorStreamResponse {
 /* Source Service */
 
 message CdcMessage {
+  enum CdcMessageType {
+    UNSPECIFIED = 0;
+    HEARTBEAT = 1;
+    DATA = 2;
+    TRANSACTION_META = 3;
+    SCHEMA_CHANGE = 4;
+  }
+
   // The value of the Debezium message
   string payload = 1;
   string partition = 2;
   string offset = 3;
   string full_table_name = 4;
   int64 source_ts_ms = 5;
-  bool is_transaction_meta = 6;
+  CdcMessageType msg_type = 6;
+
   // The key of the Debezium message, which only used by `mongodb-cdc` connector.
   string key = 7;
+
+  // Deprecated: SourceType source_type = 8;
+  reserved "source_type";
+  reserved 8;
 }
 
 enum SourceType {
   UNSPECIFIED = 0;
   MYSQL = 1;
   POSTGRES = 2;
-  CITUS = 3;
+  reserved 3;
+  reserved "CITUS"; // removed connector
   MONGODB = 4;
+  SQL_SERVER = 5;
+  ORACLE = 6;
+  MARIADB = 7;
 }
 
 message GetEventStreamRequest {
@@ -217,16 +239,26 @@ message CoordinateRequest {
   message CommitRequest {
     uint64 epoch = 1;
     SinkMetadata metadata = 2;
+    stream_plan.SinkSchemaChange schema_change = 3;
+  }
+
+  message UpdateVnodeBitmapRequest {
+    common.Buffer vnode_bitmap = 1;
   }
 
   oneof msg {
     StartCoordinationRequest start_request = 1;
     CommitRequest commit_request = 2;
+    UpdateVnodeBitmapRequest update_vnode_request = 3;
+    bool stop = 4;
+    uint64 align_initial_epoch_request = 5;
   }
 }
 
 message CoordinateResponse {
-  message StartCoordinationResponse {}
+  message StartCoordinationResponse {
+    optional uint64 log_store_rewind_start_epoch = 1;
+  }
 
   message CommitResponse {
     uint64 epoch = 1;
@@ -235,9 +267,16 @@ message CoordinateResponse {
   oneof msg {
     StartCoordinationResponse start_response = 1;
     CommitResponse commit_response = 2;
+    bool stopped = 3;
+    uint64 align_initial_epoch_response = 4;
   }
 }
 
 service SinkCoordinationService {
   rpc Coordinate(stream CoordinateRequest) returns (stream CoordinateResponse);
+}
+
+message IcebergPkIndexPreCommitState {
+  bytes agg_result = 1;
+  int64 snapshot_id = 2;
 }

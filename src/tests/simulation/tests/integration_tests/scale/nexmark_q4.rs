@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use risingwave_simulation::cluster::Configuration;
-use risingwave_simulation::ctl_ext::predicate::{
-    identity_contains, upstream_fragment_count, BoxedPredicate,
-};
+use risingwave_simulation::cluster::{Configuration, KillOpts};
 use risingwave_simulation::nexmark::queries::q4::*;
 use risingwave_simulation::nexmark::{NexmarkCluster, THROUGHPUT};
 use risingwave_simulation::utils::AssertResult;
@@ -65,78 +62,8 @@ async fn nexmark_q4_ref() -> Result<()> {
     Ok(())
 }
 
-async fn nexmark_q4_common(predicates: impl IntoIterator<Item = BoxedPredicate>) -> Result<()> {
+async fn nexmark_q4_common(recovery: bool) -> Result<()> {
     let mut cluster = init().await?;
-
-    let fragment = cluster.locate_one_fragment(predicates).await?;
-    let id = fragment.id();
-
-    // 0s
-    wait_initial_data(&mut cluster)
-        .await?
-        .assert_result_ne(RESULT);
-
-    // 0~10s
-    cluster.reschedule(format!("{id}-[0,1]")).await?;
-
-    sleep(Duration::from_secs(5)).await;
-
-    // 5~15s
-    cluster.run(SELECT).await?.assert_result_ne(RESULT);
-    cluster.reschedule(format!("{id}-[2,3]+[0,1]")).await?;
-
-    sleep(Duration::from_secs(20)).await;
-
-    // 25~35s
-    cluster.run(SELECT).await?.assert_result_eq(RESULT);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn nexmark_q4_materialize_agg() -> Result<()> {
-    nexmark_q4_common([
-        identity_contains("materialize"),
-        identity_contains("hashagg"),
-    ])
-    .await
-}
-
-#[tokio::test]
-async fn nexmark_q4_source() -> Result<()> {
-    nexmark_q4_common([identity_contains("source: bid")]).await
-}
-
-#[tokio::test]
-async fn nexmark_q4_agg_join() -> Result<()> {
-    nexmark_q4_common([
-        identity_contains("hashagg"),
-        identity_contains("hashjoin"),
-        upstream_fragment_count(2),
-    ])
-    .await
-}
-
-#[tokio::test]
-async fn nexmark_q4_cascade() -> Result<()> {
-    let mut cluster = init().await?;
-
-    let fragment_1 = cluster
-        .locate_one_fragment([
-            identity_contains("materialize"),
-            identity_contains("hashagg"),
-        ])
-        .await?;
-    let id_1 = fragment_1.id();
-
-    let fragment_2 = cluster
-        .locate_one_fragment([
-            identity_contains("hashagg"),
-            identity_contains("hashjoin"),
-            upstream_fragment_count(2),
-        ])
-        .await?;
-    let id_2 = fragment_2.id();
 
     // 0s
     wait_initial_data(&mut cluster)
@@ -145,23 +72,39 @@ async fn nexmark_q4_cascade() -> Result<()> {
 
     // 0~10s
     cluster
-        .reschedule(format!("{id_1}-[0,1]; {id_2}-[0,2,4]"))
+        .run("alter materialized view nexmark_q4 set parallelism = 4")
         .await?;
-
     sleep(Duration::from_secs(5)).await;
 
     // 5~15s
     cluster.run(SELECT).await?.assert_result_ne(RESULT);
     cluster
-        .reschedule(format!("{id_1}-[2,4]+[0,1]; {id_2}-[3]+[0,4]"))
+        .run("alter materialized view nexmark_q4 set parallelism = 6")
         .await?;
 
     sleep(Duration::from_secs(20)).await;
+
+    if recovery {
+        // Trigger recovery
+        cluster.kill_node(&KillOpts::ALL).await;
+
+        sleep(Duration::from_secs(5)).await;
+    }
 
     // 25~35s
     cluster.run(SELECT).await?.assert_result_eq(RESULT);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn nexmark_q4_common_without_recovery() -> Result<()> {
+    nexmark_q4_common(false).await
+}
+
+#[tokio::test]
+async fn nexmark_q4_common_with_recovery() -> Result<()> {
+    nexmark_q4_common(true).await
 }
 
 // https://github.com/risingwavelabs/risingwave/issues/5567
@@ -169,21 +112,17 @@ async fn nexmark_q4_cascade() -> Result<()> {
 async fn nexmark_q4_materialize_agg_cache_invalidation() -> Result<()> {
     let mut cluster = init().await?;
 
-    let fragment = cluster
-        .locate_one_fragment([
-            identity_contains("materialize"),
-            identity_contains("hashagg"),
-        ])
+    cluster
+        .run("alter materialized view nexmark_q4 set parallelism = 1")
         .await?;
-    let id = fragment.id();
 
-    // Let parallel unit 0 handle all groups.
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
     sleep(Duration::from_secs(7)).await;
     let result_1 = cluster.run(SELECT).await?.assert_result_ne(RESULT);
 
     // Scale out.
-    cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    cluster
+        .run("alter materialized view nexmark_q4 set parallelism = 6")
+        .await?;
     sleep(Duration::from_secs(7)).await;
     cluster
         .run(SELECT)
@@ -191,10 +130,12 @@ async fn nexmark_q4_materialize_agg_cache_invalidation() -> Result<()> {
         .assert_result_ne(result_1)
         .assert_result_ne(RESULT);
 
-    // Let parallel unit 0 handle all groups again.
-    // Note that there're only 5 groups, so if the parallel unit 0 doesn't invalidate the cache
+    // Let worker slot 0 handle all groups again.
+    // Note that there're only 5 groups, so if the worker slot 0 doesn't invalidate the cache
     // correctly, it will yield the wrong result.
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    cluster
+        .run("alter materialized view nexmark_q4 set parallelism = 1")
+        .await?;
     sleep(Duration::from_secs(20)).await;
 
     cluster.run(SELECT).await?.assert_result_eq(RESULT);

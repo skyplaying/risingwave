@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,24 +16,21 @@ use itertools::Itertools;
 use risingwave_pb::catalog::Table;
 use risingwave_pb::stream_plan::stream_fragment_graph::StreamFragment;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::{agg_call_state, StreamNode};
+use risingwave_pb::stream_plan::{SourceBackfillNode, StreamNode, StreamScanNode, agg_call_state};
+
+#[macro_export]
+macro_rules! dispatch_stream_node_body {
+    ($body:expr, $node_body:ident, $node:ident => $call:expr) => {
+        ::risingwave_pb::__dispatch_stream_node_body!($body, $node_body, $node => $call)
+    };
+}
 
 /// A utility for visiting and mutating the [`NodeBody`] of the [`StreamNode`]s recursively.
-pub fn visit_stream_node<F>(stream_node: &mut StreamNode, mut f: F)
-where
-    F: FnMut(&mut NodeBody),
-{
-    fn visit_inner<F>(stream_node: &mut StreamNode, f: &mut F)
-    where
-        F: FnMut(&mut NodeBody),
-    {
+pub fn visit_stream_node_mut(stream_node: &mut StreamNode, mut f: impl FnMut(&mut NodeBody)) {
+    visit_stream_node_cont_mut(stream_node, |stream_node| {
         f(stream_node.node_body.as_mut().unwrap());
-        for input in &mut stream_node.input {
-            visit_inner(input, f);
-        }
-    }
-
-    visit_inner(stream_node, &mut f)
+        true
+    })
 }
 
 /// A utility for to accessing the [`StreamNode`] mutably. The returned bool is used to determine whether the access needs to continue.
@@ -56,14 +53,29 @@ where
     visit_inner(stream_node, &mut f)
 }
 
+/// A utility for visiting the [`NodeBody`] of the [`StreamNode`]s recursively.
+pub fn visit_stream_node_body(stream_node: &StreamNode, mut f: impl FnMut(&NodeBody)) {
+    visit_stream_node_cont(stream_node, |stream_node| {
+        f(stream_node.node_body.as_ref().unwrap());
+        true
+    })
+}
+
+pub fn visit_stream_node(stream_node: &StreamNode, mut f: impl FnMut(&StreamNode)) {
+    visit_stream_node_cont(stream_node, |stream_node| {
+        f(stream_node);
+        true
+    })
+}
+
 /// A utility for to accessing the [`StreamNode`] immutably. The returned bool is used to determine whether the access needs to continue.
-pub fn visit_stream_node_cont<F>(stream_node: &StreamNode, mut f: F)
+pub fn visit_stream_node_cont<'a, F>(stream_node: &'a StreamNode, mut f: F)
 where
-    F: FnMut(&StreamNode) -> bool,
+    F: FnMut(&'a StreamNode) -> bool,
 {
-    fn visit_inner<F>(stream_node: &StreamNode, f: &mut F)
+    fn visit_inner<'a, F>(stream_node: &'a StreamNode, f: &mut F)
     where
-        F: FnMut(&StreamNode) -> bool,
+        F: FnMut(&'a StreamNode) -> bool,
     {
         if !f(stream_node) {
             return;
@@ -78,11 +90,31 @@ where
 
 /// A utility for visiting and mutating the [`NodeBody`] of the [`StreamNode`]s in a
 /// [`StreamFragment`] recursively.
-pub fn visit_fragment<F>(fragment: &mut StreamFragment, f: F)
-where
-    F: FnMut(&mut NodeBody),
-{
-    visit_stream_node(fragment.node.as_mut().unwrap(), f)
+pub fn visit_fragment_mut(fragment: &mut StreamFragment, f: impl FnMut(&mut NodeBody)) {
+    visit_stream_node_mut(fragment.node.as_mut().unwrap(), f)
+}
+
+/// A utility for visiting the [`NodeBody`] of the [`StreamNode`]s in a
+/// [`StreamFragment`] recursively.
+pub fn visit_fragment(fragment: &StreamFragment, f: impl FnMut(&NodeBody)) {
+    visit_stream_node_body(fragment.node.as_ref().unwrap(), f)
+}
+
+/// Visit references to the Fetch task table used for job identity, not extra owned tables.
+pub fn visit_iceberg_completion_tables(
+    fragment: &mut StreamFragment,
+    mut f: impl FnMut(&mut risingwave_pb::plan_common::StorageTableDesc),
+) {
+    visit_fragment_mut(fragment, |body| {
+        if let NodeBody::Source(node) = body
+            && let Some(table) = node
+                .source_inner
+                .as_mut()
+                .and_then(|source| source.iceberg_fetch_state_table.as_mut())
+        {
+            f(table);
+        }
+    });
 }
 
 /// Visit the tables of a [`StreamNode`].
@@ -133,12 +165,7 @@ pub fn visit_stream_node_tables_inner<F>(
                 optional!(node.memo_table, "TemporalJoinMemo");
             }
             NodeBody::DynamicFilter(node) => {
-                if node.condition_always_relax {
-                    always!(node.left_table, "DynamicFilterLeftNotSatisfy");
-                } else {
-                    always!(node.left_table, "DynamicFilterLeft");
-                }
-
+                always!(node.left_table, "DynamicFilterLeft");
                 always!(node.right_table, "DynamicFilterRight");
             }
 
@@ -244,6 +271,14 @@ pub fn visit_stream_node_tables_inner<F>(
             // EOWC over window
             NodeBody::EowcOverWindow(node) => {
                 always!(node.state_table, "EowcOverWindow");
+                optional!(
+                    node.intermediate_state_table,
+                    "EowcOverWindowIntermediateState"
+                );
+                optional!(
+                    node.watermark_trigger_table,
+                    "EowcOverWindowWatermarkTrigger"
+                );
             }
 
             NodeBody::OverWindow(node) => {
@@ -265,18 +300,96 @@ pub fn visit_stream_node_tables_inner<F>(
                 always!(node.state_table, "StreamCdcScan")
             }
 
-            // Note: add internal tables for new nodes here.
-            NodeBody::Materialize(node) if !internal_tables_only => {
-                always!(node.table, "Materialize")
+            NodeBody::EowcGapFill(node) => {
+                always!(node.prev_row_table, "EowcGapFillPrevRowTable");
             }
+
+            NodeBody::GapFill(node) => {
+                always!(node.state_table, "GapFillStateTable");
+            }
+
+            NodeBody::MatchRecognize(node) => {
+                always!(node.state_table, "MatchRecognizeStateTable");
+            }
+
+            // Note: add internal tables for new nodes here.
+            NodeBody::Materialize(node) => {
+                if !internal_tables_only {
+                    // Note: Plan directly generated by frontend may not have the table filled,
+                    // as it is filled by the meta service during building fragments.
+                    // However, if caller requests to visit this table via `!internal_tables_only`,
+                    // we still assert on its existence to avoid undefined behavior.
+                    always!(node.table, "Materialize");
+                }
+                // Also visit the staging table if it exists (for refreshable tables)
+                optional!(node.staging_table, "MaterializeStaging");
+                optional!(node.refresh_progress_table, "MaterializeRefreshProgress");
+            }
+
+            // Global Approx Percentile
+            NodeBody::GlobalApproxPercentile(node) => {
+                always!(node.bucket_state_table, "GlobalApproxPercentileBucketState");
+                always!(node.count_state_table, "GlobalApproxPercentileCountState");
+            }
+
+            // AsOf join
+            NodeBody::AsOfJoin(node) => {
+                always!(node.left_table, "AsOfJoinLeft");
+                always!(node.right_table, "AsOfJoinRight");
+            }
+
+            // Synced Log Store
+            NodeBody::SyncLogStore(node) => {
+                always!(node.log_store_table, "StreamSyncLogStore");
+            }
+
+            // MaterializedExprs
+            NodeBody::MaterializedExprs(node) => {
+                always!(node.state_table, "MaterializedExprs");
+            }
+
+            // Vector Index Write
+            NodeBody::VectorIndexWrite(node) if !internal_tables_only => {
+                always!(node.table, "StreamVectorIndexWrite");
+            }
+
+            NodeBody::LocalityProvider(node) => {
+                always!(node.state_table, "LocalityProviderState");
+                always!(node.progress_table, "LocalityProviderProgress");
+                optional!(node.sort_buffer_table, "LocalityProviderSortBuffer");
+            }
+
+            NodeBody::IcebergWithPkIndexWriter(node) => {
+                always!(node.pk_index_table, "IcebergWithPkIndexWriter");
+            }
+
             _ => {}
         }
     };
     if visit_child_recursively {
-        visit_stream_node(stream_node, visit_body)
+        visit_stream_node_mut(stream_node, visit_body)
     } else {
         visit_body(stream_node.node_body.as_mut().unwrap())
     }
+}
+
+pub fn visit_stream_node_stream_scan(stream_node: &StreamNode, mut f: impl FnMut(&StreamScanNode)) {
+    visit_stream_node_body(stream_node, |body| {
+        if let NodeBody::StreamScan(node) = body {
+            f(node)
+        }
+    })
+}
+
+pub fn visit_stream_node_source_backfill(
+    stream_node: &StreamNode,
+    mut f: impl FnMut(&SourceBackfillNode),
+) {
+    visit_stream_node_body(stream_node, |body| {
+        if let NodeBody::SourceBackfill(node) = body {
+            f(node)
+        }
+    })
 }
 
 pub fn visit_stream_node_internal_tables<F>(stream_node: &mut StreamNode, f: F)
@@ -286,7 +399,6 @@ where
     visit_stream_node_tables_inner(stream_node, true, true, f)
 }
 
-#[allow(dead_code)]
 pub fn visit_stream_node_tables<F>(stream_node: &mut StreamNode, f: F)
 where
     F: FnMut(&mut Table, &str),
@@ -300,4 +412,14 @@ where
     F: FnMut(&mut Table, &str),
 {
     visit_stream_node_internal_tables(fragment.node.as_mut().unwrap(), f)
+}
+
+/// Visit the tables of a [`StreamFragment`].
+///
+/// Compared to [`visit_internal_tables`], this function also visits the table of `Materialize` node.
+pub fn visit_tables<F>(fragment: &mut StreamFragment, f: F)
+where
+    F: FnMut(&mut Table, &str),
+{
+    visit_stream_node_tables(fragment.node.as_mut().unwrap(), f)
 }

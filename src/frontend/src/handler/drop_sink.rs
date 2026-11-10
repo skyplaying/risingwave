@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,15 @@
 // limitations under the License.
 
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_pb::ddl_service::ReplaceTablePlan;
+use risingwave_common::catalog::ICEBERG_SINK_PREFIX;
 use risingwave_sqlparser::ast::ObjectName;
 
 use super::RwPgResponse;
+use super::util::{LongRunningNotificationAction, execute_with_long_running_notification};
 use crate::binder::Binder;
+use crate::catalog::RelationKind;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::error::Result;
-use crate::handler::create_sink::{insert_merger_to_union, reparse_table_for_sink};
 use crate::handler::HandlerArgs;
 
 pub async fn handle_drop_sink(
@@ -29,17 +30,17 @@ pub async fn handle_drop_sink(
     if_exists: bool,
     cascade: bool,
 ) -> Result<RwPgResponse> {
-    let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, sink_name) = Binder::resolve_schema_qualified_name(db_name, sink_name)?;
+    let session = handler_args.session.clone();
+    let db_name = &session.database();
+    let (schema_name, sink_name) = Binder::resolve_schema_qualified_name(db_name, &sink_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let sink = {
         let catalog_reader = session.env().catalog_reader().read_guard();
         let (sink, schema_name) =
-            match catalog_reader.get_sink_by_name(db_name, schema_path, &sink_name) {
+            match catalog_reader.get_any_sink_by_name(db_name, schema_path, &sink_name) {
                 Ok((sink, schema)) => (sink.clone(), schema),
                 Err(e) => {
                     return if if_exists {
@@ -47,8 +48,16 @@ pub async fn handle_drop_sink(
                             .notice(format!("sink \"{}\" does not exist, skipping", sink_name))
                             .into())
                     } else {
-                        Err(e.into())
-                    }
+                        Err(catalog_reader
+                            .wrong_kind_for_drop(
+                                db_name,
+                                schema_path,
+                                &sink_name,
+                                RelationKind::Sink,
+                            )
+                            .unwrap_or(e)
+                            .into())
+                    };
                 }
             };
 
@@ -57,45 +66,24 @@ pub async fn handle_drop_sink(
         sink
     };
 
-    let sink_id = sink.id;
-
-    let mut affected_table_change = None;
-    if let Some(target_table_id) = &sink.target_table {
-        let table_catalog = {
-            let reader = session.env().catalog_reader().read_guard();
-            let table = reader.get_table_by_id(target_table_id)?;
-            table.clone()
-        };
-
-        let (mut graph, mut table, source) =
-            reparse_table_for_sink(&session, &table_catalog).await?;
-
-        assert!(!table_catalog.incoming_sinks.is_empty());
-
-        table
-            .incoming_sinks
-            .clone_from(&table_catalog.incoming_sinks);
-
-        for _ in 0..(table_catalog.incoming_sinks.len() - 1) {
-            for fragment in graph.fragments.values_mut() {
-                if let Some(node) = &mut fragment.node {
-                    insert_merger_to_union(node);
-                }
-            }
-        }
-
-        affected_table_change = Some(ReplaceTablePlan {
-            source,
-            table: Some(table),
-            fragment_graph: Some(graph),
-            table_col_index_mapping: None,
-        });
+    if sink_name.starts_with(ICEBERG_SINK_PREFIX) {
+        return Err(crate::error::ErrorCode::NotSupported(
+            "Dropping Iceberg sinks is not supported".to_owned(),
+            "Please use DROP TABLE command.".to_owned(),
+        )
+        .into());
     }
 
+    let sink_id = sink.id;
+
     let catalog_writer = session.catalog_writer()?;
-    catalog_writer
-        .drop_sink(sink_id.sink_id, cascade, affected_table_change)
-        .await?;
+    execute_with_long_running_notification(
+        catalog_writer.drop_sink(sink_id, cascade),
+        &session,
+        "DROP SINK",
+        LongRunningNotificationAction::SuggestRecover,
+    )
+    .await?;
 
     Ok(PgResponse::empty_result(StatementType::DROP_SINK))
 }
@@ -123,7 +111,8 @@ mod tests {
         let catalog_reader = session.env().catalog_reader().read_guard();
         let schema_path = SchemaPath::Name(DEFAULT_SCHEMA_NAME);
 
-        let sink = catalog_reader.get_table_by_name(DEFAULT_DATABASE_NAME, schema_path, "snk");
+        let sink =
+            catalog_reader.get_created_table_by_name(DEFAULT_DATABASE_NAME, schema_path, "snk");
         assert!(sink.is_err());
     }
 }

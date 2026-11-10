@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::plan_node::*;
-use super::Rule;
-use crate::optimizer::rule::BoxedRule;
+use super::prelude::{PlanRef, *};
+use crate::optimizer::plan_node::*;
 
 /// Merges adjacent inner joins, filters and projections into a single `LogicalMultiJoin`.
 pub struct MergeMultiJoinRule {}
 
-impl Rule for MergeMultiJoinRule {
+impl Rule<Logical> for MergeMultiJoinRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let multijoin_builder = LogicalMultiJoinBuilder::new(plan);
         if multijoin_builder.inputs().len() <= 2 {
@@ -52,7 +51,7 @@ mod tests {
     #[tokio::test]
     async fn test_merge_multijoin_join() {
         let ty = DataType::Int32;
-        let ctx = OptimizerContext::mock().await;
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = (1..10)
             .map(|i| Field::with_name(ty.clone(), format!("v{}", i)))
             .collect();

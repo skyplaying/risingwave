@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,36 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(not(madsim), expect(unused_imports))]
-
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::fmt::Write;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use cfg_or_panic::cfg_or_panic;
 use clap::Parser;
 use itertools::Itertools;
-use rand::seq::{IteratorRandom, SliceRandom};
-use rand::{thread_rng, Rng};
+use rand::seq::IteratorRandom;
+use rand::{RngExt as _, rng as thread_rng};
 use risingwave_common::catalog::TableId;
-use risingwave_common::hash::ParallelUnitId;
-use risingwave_pb::meta::get_reschedule_plan_request::PbPolicy;
-use risingwave_pb::meta::table_fragments::fragment::FragmentDistributionType;
+use risingwave_common::hash::WorkerSlotId;
+use risingwave_common::id::WorkerId;
+use risingwave_connector::source::{SplitImpl, SplitMetaData};
+use risingwave_hummock_sdk::CompactionGroupId;
+use risingwave_pb::id::{ActorId, FragmentId};
+use risingwave_pb::meta::GetClusterInfoResponse;
 use risingwave_pb::meta::table_fragments::PbFragment;
-use risingwave_pb::meta::update_worker_node_schedulability_request::Schedulability;
-use risingwave_pb::meta::{GetClusterInfoResponse, GetReschedulePlanResponse};
 use risingwave_pb::stream_plan::StreamNode;
-use serde::de::IntoDeserializer;
 
 use self::predicate::BoxedPredicate;
 use crate::cluster::Cluster;
 
 /// Predicates used for locating fragments.
 pub mod predicate {
-    use risingwave_pb::stream_plan::stream_node::NodeBody;
     use risingwave_pb::stream_plan::DispatcherType;
+    use risingwave_pb::stream_plan::stream_node::NodeBody;
 
     use super::*;
 
@@ -49,7 +46,7 @@ pub mod predicate {
     pub type BoxedPredicate = Box<dyn Predicate>;
 
     fn root(fragment: &PbFragment) -> &StreamNode {
-        fragment.actors.first().unwrap().nodes.as_ref().unwrap()
+        fragment.nodes.as_ref().unwrap()
     }
 
     fn count(root: &StreamNode, p: &impl Fn(&StreamNode) -> bool) -> usize {
@@ -76,7 +73,7 @@ pub mod predicate {
         Box::new(p)
     }
 
-    /// There exists operators whose identity contains `s` in the fragment.
+    /// There exists operators whose identity contains `s` in the fragment (case insensitive).
     pub fn identity_contains(s: impl Into<String>) -> BoxedPredicate {
         let s: String = s.into();
         let p = move |f: &PbFragment| {
@@ -95,12 +92,6 @@ pub mod predicate {
                 !n.identity.to_lowercase().contains(&s.to_lowercase())
             })
         };
-        Box::new(p)
-    }
-
-    /// There're `n` upstream fragments of the fragment.
-    pub fn upstream_fragment_count(n: usize) -> BoxedPredicate {
-        let p = move |f: &PbFragment| f.upstream_fragment_ids.len() == n;
         Box::new(p)
     }
 
@@ -135,89 +126,56 @@ pub struct Fragment {
 
 impl Fragment {
     /// The fragment id.
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> FragmentId {
         self.inner.fragment_id
     }
 
-    /// Generate a reschedule plan for the fragment.
-    pub fn reschedule(
-        &self,
-        remove: impl AsRef<[ParallelUnitId]>,
-        add: impl AsRef<[ParallelUnitId]>,
-    ) -> String {
-        let remove = remove.as_ref();
-        let add = add.as_ref();
-
-        let mut f = String::new();
-        write!(f, "{}", self.id()).unwrap();
-        if !remove.is_empty() {
-            write!(f, " -{:?}", remove).unwrap();
-        }
-        if !add.is_empty() {
-            write!(f, " +{:?}", add).unwrap();
-        }
-        f
+    pub fn all_worker_count(&self) -> HashMap<WorkerId, usize> {
+        self.r
+            .worker_nodes
+            .iter()
+            .map(|w| (w.id, w.compute_node_parallelism()))
+            .collect()
     }
 
-    /// Generate a random reschedule plan for the fragment.
-    ///
-    /// Consumes `self` as the actor info will be stale after rescheduling.
-    pub fn random_reschedule(self) -> String {
-        let (all_parallel_units, current_parallel_units) = self.parallel_unit_usage();
-
-        let rng = &mut thread_rng();
-        let target_parallel_unit_count = match self.inner.distribution_type() {
-            FragmentDistributionType::Unspecified => unreachable!(),
-            FragmentDistributionType::Single => 1,
-            FragmentDistributionType::Hash => rng.gen_range(1..=all_parallel_units.len()),
-        };
-        let target_parallel_units: HashSet<_> = all_parallel_units
-            .choose_multiple(rng, target_parallel_unit_count)
-            .copied()
-            .collect();
-
-        let remove = current_parallel_units
-            .difference(&target_parallel_units)
-            .copied()
-            .collect_vec();
-        let add = target_parallel_units
-            .difference(&current_parallel_units)
-            .copied()
-            .collect_vec();
-
-        self.reschedule(remove, add)
+    pub fn all_worker_slots(&self) -> HashSet<WorkerSlotId> {
+        self.all_worker_count()
+            .into_iter()
+            .flat_map(|(k, v)| (0..v).map(move |idx| WorkerSlotId::new(k, idx as _)))
+            .collect()
     }
 
-    pub fn parallel_unit_usage(&self) -> (Vec<ParallelUnitId>, HashSet<ParallelUnitId>) {
-        let actor_to_parallel_unit: HashMap<_, _> = self
+    pub fn parallelism(&self) -> usize {
+        self.inner.actors.len()
+    }
+
+    pub fn used_worker_count(&self) -> HashMap<WorkerId, usize> {
+        let actor_to_worker: HashMap<_, _> = self
             .r
             .table_fragments
             .iter()
             .flat_map(|tf| {
-                tf.actor_status.iter().map(|(&actor_id, status)| {
-                    (
-                        actor_id,
-                        status.get_parallel_unit().unwrap().id as ParallelUnitId,
-                    )
-                })
+                tf.actor_status
+                    .iter()
+                    .map(|(&actor_id, status)| (actor_id, status.worker_id()))
             })
             .collect();
 
-        let all_parallel_units = self
-            .r
-            .worker_nodes
-            .iter()
-            .flat_map(|n| n.parallel_units.iter())
-            .map(|p| p.id as ParallelUnitId)
-            .collect_vec();
-        let current_parallel_units: HashSet<_> = self
-            .inner
+        self.inner
             .actors
             .iter()
-            .map(|a| actor_to_parallel_unit[&a.actor_id] as ParallelUnitId)
-            .collect();
+            .map(|a| actor_to_worker[&a.actor_id])
+            .fold(HashMap::<WorkerId, usize>::new(), |mut acc, num| {
+                *acc.entry(num).or_insert(0) += 1;
+                acc
+            })
+    }
 
-        (all_parallel_units, current_parallel_units)
+    pub fn used_worker_slots(&self) -> HashSet<WorkerSlotId> {
+        self.used_worker_count()
+            .into_iter()
+            .flat_map(|(k, v)| (0..v).map(move |idx| WorkerSlotId::new(k, idx as _)))
+            .collect()
     }
 }
 
@@ -284,16 +242,15 @@ impl Cluster {
     /// Locate some random fragments that are reschedulable.
     pub async fn locate_random_fragments(&mut self) -> Result<Vec<Fragment>> {
         let fragments = self.locate_fragments([predicate::can_reschedule()]).await?;
-        let len = thread_rng().gen_range(1..=fragments.len());
-        let selected = fragments
-            .into_iter()
-            .choose_multiple(&mut thread_rng(), len);
+        let len = thread_rng().random_range(1..=fragments.len());
+        let selected = fragments.into_iter().sample(&mut thread_rng(), len);
         Ok(selected)
     }
 
     /// Locate a fragment with the given id.
-    pub async fn locate_fragment_by_id(&mut self, id: u32) -> Result<Fragment> {
-        self.locate_one_fragment([predicate::id(id)]).await
+    pub async fn locate_fragment_by_id(&mut self, id: FragmentId) -> Result<Fragment> {
+        self.locate_one_fragment([predicate::id(id.as_raw_id())])
+            .await
     }
 
     #[cfg_or_panic(madsim)]
@@ -310,94 +267,23 @@ impl Cluster {
         Ok(response)
     }
 
-    // update node schedulability
-    #[cfg_or_panic(madsim)]
-    async fn update_worker_node_schedulability(
-        &self,
-        worker_ids: Vec<u32>,
-        target: Schedulability,
-    ) -> Result<()> {
-        let worker_ids = worker_ids
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect_vec();
+    /// `actor_id -> splits`
+    pub async fn list_source_splits(&self) -> Result<BTreeMap<ActorId, String>> {
+        let info = self.get_cluster_info().await?;
+        let mut res = BTreeMap::new();
 
-        let _ = self
-            .ctl
-            .spawn(async move {
-                risingwave_ctl::cmd_impl::scale::update_schedulability(
-                    &risingwave_ctl::common::CtlContext::default(),
-                    worker_ids,
-                    target,
-                )
-                .await
-            })
-            .await?;
-        Ok(())
-    }
+        for (actor_id, splits) in info.actor_splits {
+            let splits = splits
+                .splits
+                .iter()
+                .map(|split| SplitImpl::try_from(split).unwrap())
+                .map(|split| split.id())
+                .collect_vec()
+                .join(",");
+            res.insert(actor_id, splits);
+        }
 
-    pub async fn cordon_worker(&self, id: u32) -> Result<()> {
-        self.update_worker_node_schedulability(vec![id], Schedulability::Unschedulable)
-            .await
-    }
-
-    pub async fn uncordon_worker(&self, id: u32) -> Result<()> {
-        self.update_worker_node_schedulability(vec![id], Schedulability::Schedulable)
-            .await
-    }
-
-    /// Reschedule with the given `plan`. Check the document of
-    /// [`risingwave_ctl::cmd_impl::meta::reschedule`] for more details.
-    pub async fn reschedule(&mut self, plan: impl Into<String>) -> Result<()> {
-        self.reschedule_helper(plan, false).await
-    }
-
-    /// Same as reschedule, but resolve the no-shuffle upstream
-    pub async fn reschedule_resolve_no_shuffle(&mut self, plan: impl Into<String>) -> Result<()> {
-        self.reschedule_helper(plan, true).await
-    }
-
-    #[cfg_or_panic(madsim)]
-    async fn reschedule_helper(
-        &mut self,
-        plan: impl Into<String>,
-        resolve_no_shuffle_upstream: bool,
-    ) -> Result<()> {
-        let plan = plan.into();
-
-        let revision = self
-            .ctl
-            .spawn(async move {
-                let r = risingwave_ctl::cmd_impl::meta::get_cluster_info(
-                    &risingwave_ctl::common::CtlContext::default(),
-                )
-                .await?;
-
-                Ok::<_, anyhow::Error>(r.revision)
-            })
-            .await??;
-
-        self.ctl
-            .spawn(async move {
-                let revision = format!("{}", revision);
-                let mut v = vec![
-                    "meta",
-                    "reschedule",
-                    "--plan",
-                    plan.as_ref(),
-                    "--revision",
-                    &revision,
-                ];
-
-                if resolve_no_shuffle_upstream {
-                    v.push("--resolve-no-shuffle");
-                }
-
-                start_ctl(v).await
-            })
-            .await??;
-
-        Ok(())
+        Ok(res)
     }
 
     /// Pause all data sources in the cluster.
@@ -422,9 +308,13 @@ impl Cluster {
                 let mut command: Vec<String> = vec![
                     "throttle".into(),
                     "mv".into(),
-                    table_id.table_id.to_string(),
+                    "--id".into(),
+                    table_id.to_string(),
+                    "--throttle-type".into(),
+                    "backfill".into(),
                 ];
                 if let Some(rate_limit) = rate_limit {
+                    command.push("--rate".into());
                     command.push(rate_limit.to_string());
                 }
                 start_ctl(command).await
@@ -434,44 +324,58 @@ impl Cluster {
     }
 
     #[cfg_or_panic(madsim)]
-    pub async fn get_reschedule_plan(&self, policy: PbPolicy) -> Result<GetReschedulePlanResponse> {
-        let revision = self
-            .ctl
+    pub async fn split_compaction_group(
+        &mut self,
+        compaction_group_id: CompactionGroupId,
+        table_id: TableId,
+    ) -> Result<()> {
+        self.ctl
             .spawn(async move {
-                let r = risingwave_ctl::cmd_impl::meta::get_cluster_info(
-                    &risingwave_ctl::common::CtlContext::default(),
-                )
-                .await?;
-
-                Ok::<_, anyhow::Error>(r.revision)
+                let mut command: Vec<String> = vec![
+                    "hummock".into(),
+                    "split-compaction-group".into(),
+                    "--compaction-group-id".into(),
+                    compaction_group_id.to_string(),
+                    "--table-ids".into(),
+                    table_id.to_string(),
+                ];
+                start_ctl(command).await
             })
             .await??;
+        Ok(())
+    }
 
-        let resp = self
-            .ctl
+    #[cfg_or_panic(madsim)]
+    pub async fn trigger_manual_compaction(
+        &mut self,
+        compaction_group_id: CompactionGroupId,
+        level_id: u32,
+    ) -> Result<()> {
+        self.ctl
             .spawn(async move {
-                let r = risingwave_ctl::cmd_impl::meta::get_reschedule_plan(
-                    &risingwave_ctl::common::CtlContext::default(),
-                    policy,
-                    revision,
-                )
-                .await?;
-
-                Ok::<_, anyhow::Error>(r)
+                let mut command: Vec<String> = vec![
+                    "hummock".into(),
+                    "trigger-manual-compaction".into(),
+                    "--compaction-group-id".into(),
+                    compaction_group_id.to_string(),
+                    "--level".into(),
+                    level_id.to_string(),
+                ];
+                start_ctl(command).await
             })
             .await??;
-
-        Ok(resp)
+        Ok(())
     }
 }
 
 #[cfg_attr(not(madsim), allow(dead_code))]
-async fn start_ctl<S, I>(args: I) -> Result<()>
+pub(crate) async fn start_ctl<S, I>(args: I) -> Result<()>
 where
     S: Into<OsString>,
     I: IntoIterator<Item = S>,
 {
     let args = std::iter::once("ctl".into()).chain(args.into_iter().map(|s| s.into()));
     let opts = risingwave_ctl::CliOpts::parse_from(args);
-    risingwave_ctl::start_fallible(opts).await
+    let context = risingwave_ctl::common::CtlContext::default();
+    risingwave_ctl::start_fallible(opts, &context).await
 }

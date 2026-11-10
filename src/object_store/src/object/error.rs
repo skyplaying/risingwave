@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -101,14 +101,18 @@ impl ObjectError {
         false
     }
 
-    pub fn should_retry(&self) -> bool {
+    pub fn should_retry(&self, retry_opendal_s3_unknown_error: bool) -> bool {
         match self.inner() {
             ObjectErrorInner::S3 {
                 inner: _,
                 should_retry,
             } => *should_retry,
 
-            ObjectErrorInner::Opendal(e) => e.is_temporary(),
+            ObjectErrorInner::Opendal(e) => {
+                e.is_temporary()
+                    || (retry_opendal_s3_unknown_error
+                        && e.kind() == opendal::ErrorKind::Unexpected)
+            }
 
             ObjectErrorInner::Timeout(_) => true,
 

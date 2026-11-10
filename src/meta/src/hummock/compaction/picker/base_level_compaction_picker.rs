@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,17 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use risingwave_hummock_sdk::compaction_group::hummock_version_ext::HummockLevelsExt;
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::{CompactionConfig, InputLevel, Level, LevelType, OverlappingLevel};
+use risingwave_common::config::meta::default::compaction_config;
+use risingwave_hummock_sdk::level::{InputLevel, Level, Levels, OverlappingLevel};
+use risingwave_pb::hummock::{CompactionConfig, LevelType};
 
-use super::min_overlap_compaction_picker::NonOverlapSubLevelPicker;
+use super::non_overlap_sub_level_picker::NonOverlapSubLevelPicker;
 use super::{
     CompactionInput, CompactionPicker, CompactionTaskValidator, LocalPickerStatistic,
     ValidationRuleType,
 };
 use crate::hummock::compaction::picker::TrivialMovePicker;
-use crate::hummock::compaction::{create_overlap_strategy, CompactionDeveloperConfig};
+use crate::hummock::compaction::{CompactionDeveloperConfig, create_overlap_strategy};
 use crate::hummock::level_handler::LevelHandler;
 
 std::thread_local! {
@@ -47,11 +47,11 @@ impl CompactionPicker for LevelCompactionPicker {
         level_handlers: &[LevelHandler],
         stats: &mut LocalPickerStatistic,
     ) -> Option<CompactionInput> {
-        let l0 = levels.l0.as_ref().unwrap();
+        let l0 = &levels.l0;
         if l0.sub_levels.is_empty() {
             return None;
         }
-        if l0.sub_levels[0].level_type != LevelType::Nonoverlapping as i32
+        if l0.sub_levels[0].level_type != LevelType::Nonoverlapping
             && l0.sub_levels[0].table_infos.len() > 1
         {
             stats.skip_by_overlapping += 1;
@@ -132,8 +132,21 @@ impl LevelCompactionPicker {
         }
 
         let overlap_strategy = create_overlap_strategy(self.config.compaction_mode());
-        let trivial_move_picker =
-            TrivialMovePicker::new(0, self.target_level, overlap_strategy.clone());
+        let trivial_move_picker = TrivialMovePicker::new(
+            0,
+            self.target_level,
+            overlap_strategy.clone(),
+            if self.compaction_task_validator.is_enable() {
+                // tips: Older versions of the compaction group will be upgraded without this configuration, we leave it with its default behaviour and enable it manually when needed.
+                self.config.sst_allowed_trivial_move_min_size.unwrap_or(0)
+            } else {
+                0
+            },
+            self.config
+                .sst_allowed_trivial_move_max_count
+                .unwrap_or(compaction_config::sst_allowed_trivial_move_max_count())
+                as usize,
+        );
 
         trivial_move_picker.pick_trivial_move_task(
             &l0.sub_levels[0].table_infos,
@@ -166,6 +179,12 @@ impl LevelCompactionPicker {
             self.config.level0_max_compact_file_number,
             overlap_strategy.clone(),
             self.developer_config.enable_check_task_level_overlap,
+            self.config
+                .max_l0_compact_level_count
+                .unwrap_or(compaction_config::max_l0_compact_level_count()) as usize,
+            self.config
+                .enable_optimize_l0_interval_selection
+                .unwrap_or(compaction_config::enable_optimize_l0_interval_selection()),
         );
 
         let mut max_vnode_partition_idx = 0;
@@ -176,61 +195,50 @@ impl LevelCompactionPicker {
             max_vnode_partition_idx = idx;
         }
 
-        let l0_select_tables_vec = non_overlap_sub_level_picker.pick_l0_multi_non_overlap_level(
+        let candidate_l0_plans = non_overlap_sub_level_picker.pick_l0_multi_non_overlap_level(
             &l0.sub_levels[..=max_vnode_partition_idx],
             &level_handlers[0],
         );
-        if l0_select_tables_vec.is_empty() {
+        if candidate_l0_plans.is_empty() {
             stats.skip_by_pending_files += 1;
             return None;
         }
 
-        let mut skip_by_pending = false;
-        let mut input_levels = vec![];
+        let mut all_pending = true;
+        for input in candidate_l0_plans {
+            let mut overlap_info = overlap_strategy.create_overlap_info();
+            for (_, tables) in &input.sstable_infos {
+                for sst in tables {
+                    overlap_info.update(&sst.key_range);
+                }
+            }
+            let target_range = overlap_info.check_multiple_overlap(&target_level.table_infos);
+            let target_level_files = if target_range.is_empty() {
+                &[][..]
+            } else {
+                &target_level.table_infos[target_range]
+            };
 
-        for input in l0_select_tables_vec {
-            let l0_select_tables = input
-                .sstable_infos
-                .iter()
-                .flat_map(|select_tables| select_tables.clone())
-                .collect_vec();
-
-            let target_level_ssts = overlap_strategy
-                .check_base_level_overlap(&l0_select_tables, &target_level.table_infos);
-
-            let mut target_level_size = 0;
+            let mut target_file_size = 0;
             let mut pending_compact = false;
-            for sst in &target_level_ssts {
+            for sst in target_level_files {
                 if level_handlers[target_level.level_idx as usize].is_pending_compact(&sst.sst_id) {
                     pending_compact = true;
                     break;
                 }
-
-                target_level_size += sst.file_size;
+                target_file_size += sst.sst_size;
             }
-
             if pending_compact {
-                skip_by_pending = true;
                 continue;
             }
+            all_pending = false;
 
-            input_levels.push((input, target_level_size, target_level_ssts));
-        }
-
-        if input_levels.is_empty() {
-            if skip_by_pending {
-                stats.skip_by_pending_files += 1;
-            }
-            return None;
-        }
-
-        for (input, target_file_size, target_level_files) in input_levels {
             let mut select_level_inputs = input
                 .sstable_infos
                 .into_iter()
-                .map(|table_infos| InputLevel {
+                .map(|(_, table_infos)| InputLevel {
                     level_idx: 0,
-                    level_type: LevelType::Nonoverlapping as i32,
+                    level_type: LevelType::Nonoverlapping,
                     table_infos,
                 })
                 .collect_vec();
@@ -239,7 +247,7 @@ impl LevelCompactionPicker {
             select_level_inputs.push(InputLevel {
                 level_idx: target_level.level_idx,
                 level_type: target_level.level_type,
-                table_infos: target_level_files,
+                table_infos: target_level_files.to_vec(),
             });
 
             let result = CompactionInput {
@@ -264,8 +272,9 @@ impl LevelCompactionPicker {
                     });
 
                     // reduce log
-                    if log_counter % 100 == 0 {
-                        tracing::warn!("skip task with level count: {}, file count: {}, select size: {}, target size: {}, target level size: {}",
+                    if log_counter.is_multiple_of(100) {
+                        tracing::warn!(
+                            "skip task with level count: {}, file count: {}, select size: {}, target size: {}, target level size: {}",
                             result.input_levels.len(),
                             result.total_file_count,
                             result.select_input_size,
@@ -279,6 +288,10 @@ impl LevelCompactionPicker {
 
             return Some(result);
         }
+        // Preserve the pending statistic: validator rejection is a separate reason to skip.
+        if all_pending {
+            stats.skip_by_pending_files += 1;
+        }
         None
     }
 }
@@ -290,6 +303,141 @@ pub mod tests {
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::compaction::selector::tests::*;
     use crate::hummock::compaction::{CompactionMode, TierCompactionPicker};
+
+    fn candidate_fixture(count: usize, target_size: u64) -> (OverlappingLevel, Level) {
+        let sub_levels = (0..2)
+            .map(|level_idx| {
+                let table_infos = (0..count)
+                    .map(|idx| {
+                        generate_table(
+                            (level_idx * count + idx) as u64,
+                            1,
+                            idx * 10,
+                            idx * 10 + 9,
+                            1,
+                        )
+                    })
+                    .collect();
+                Level {
+                    sub_level_id: level_idx as u64,
+                    level_type: LevelType::Nonoverlapping,
+                    table_infos,
+                    total_file_size: count as u64 * 10,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let table_infos = (0..count)
+            .map(|idx| {
+                let mut sst =
+                    generate_table_impl((2 * count + idx) as u64, 1, idx * 10, idx * 10 + 9, 1);
+                sst.sst_size = target_size;
+                sst.into()
+            })
+            .collect();
+        (
+            OverlappingLevel {
+                sub_levels,
+                total_file_size: count as u64 * 20,
+                ..Default::default()
+            },
+            Level {
+                level_idx: 1,
+                level_type: LevelType::Nonoverlapping,
+                table_infos,
+                total_file_size: count as u64 * target_size,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn test_candidate_pending_and_validation_statistics() {
+        let picker = create_compaction_picker_for_test();
+        for (target_size, pending_count, succeeds, write_amp_skips, pending_skips) in [
+            (10, 0, true, 0, 0),
+            (10, 7, true, 0, 0),
+            (10, 8, false, 0, 1),
+            (100, 0, false, 8, 0),
+            (100, 7, false, 1, 0),
+            (100, 8, false, 0, 1),
+        ] {
+            let (l0, target) = candidate_fixture(8, target_size);
+            let mut handlers = vec![LevelHandler::new(0), LevelHandler::new(1)];
+            for sst in target.table_infos.iter().take(pending_count) {
+                handlers[1].test_add_pending_sst(sst.sst_id, 1);
+            }
+            let mut stats = LocalPickerStatistic::default();
+            let result = picker.pick_multi_level_to_base(&l0, &target, 0, &handlers, &mut stats);
+            assert_eq!(
+                result.is_some(),
+                succeeds,
+                "target_size={target_size}, pending={pending_count}"
+            );
+            assert_eq!(stats.skip_by_write_amp_limit, write_amp_skips);
+            assert_eq!(stats.skip_by_pending_files, pending_skips);
+            assert_eq!(stats.skip_by_count_limit, 0);
+            assert_eq!(stats.skip_by_overlapping, 0);
+            if let Some(result) = result {
+                assert_eq!(
+                    result.input_levels[0].table_infos[0].sst_id,
+                    (8 + pending_count) as u64
+                );
+                assert_eq!(
+                    result.input_levels[1].table_infos[0].sst_id,
+                    pending_count as u64
+                );
+                assert_eq!(
+                    result.input_levels[2].table_infos[0].sst_id,
+                    (16 + pending_count) as u64
+                );
+                assert_eq!(result.select_input_size, 20);
+                assert_eq!(result.target_input_size, 10);
+                assert_eq!(result.total_file_count, 3);
+            }
+        }
+    }
+
+    // Run explicitly with cargo test --release -p risingwave_meta bench_level_to_base -- --ignored --nocapture --test-threads=1.
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_level_to_base() {
+        use std::hint::black_box;
+        use std::time::Duration;
+
+        let mut criterion = criterion::Criterion::default()
+            .sample_size(30)
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(3));
+        let picker = create_compaction_picker_for_test();
+        for (name, count, target_size, pending_count) in [
+            ("small", 8, 10, 0),
+            ("first_valid", 256, 10, 0),
+            ("late_valid", 256, 10, 255),
+            ("all_pending", 256, 10, 256),
+            ("all_rejected", 256, 100, 0),
+        ] {
+            let (l0, target) = candidate_fixture(count, target_size);
+            let mut handlers = vec![LevelHandler::new(0), LevelHandler::new(1)];
+            for sst in target.table_infos.iter().take(pending_count) {
+                handlers[1].test_add_pending_sst(sst.sst_id, 1);
+            }
+            criterion.bench_function(&format!("level_to_base/{name}"), |b| {
+                b.iter(|| {
+                    let mut stats = LocalPickerStatistic::default();
+                    let result = picker.pick_multi_level_to_base(
+                        black_box(&l0),
+                        black_box(&target),
+                        0,
+                        black_box(&handlers),
+                        &mut stats,
+                    );
+                    black_box((result, stats))
+                })
+            });
+        }
+        criterion.final_summary();
+    }
 
     fn create_compaction_picker_for_test() -> LevelCompactionPicker {
         let config = Arc::new(
@@ -312,11 +460,11 @@ pub mod tests {
             ],
         );
         let mut levels = Levels {
-            l0: Some(OverlappingLevel {
+            l0: OverlappingLevel {
                 total_file_size: l0.total_file_size,
                 uncompressed_file_size: l0.total_file_size,
                 sub_levels: vec![l0],
-            }),
+            },
             levels: vec![generate_level(
                 1,
                 vec![
@@ -325,7 +473,6 @@ pub mod tests {
                     generate_table(1, 1, 201, 210, 1),
                 ],
             )],
-            member_table_ids: vec![1],
             ..Default::default()
         };
         let mut local_stats = LocalPickerStatistic::default();
@@ -335,8 +482,8 @@ pub mod tests {
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
             .unwrap();
         assert_eq!(ret.input_levels[0].table_infos.len(), 1);
-        assert_eq!(ret.input_levels[0].table_infos[0].get_sst_id(), 4);
-        assert_eq!(ret.input_levels[1].table_infos[0].get_sst_id(), 1);
+        assert_eq!(ret.input_levels[0].table_infos[0].sst_id, 4);
+        assert_eq!(ret.input_levels[1].table_infos[0].sst_id, 1);
 
         ret.add_pending_task(0, &mut levels_handler);
         {
@@ -347,14 +494,14 @@ pub mod tests {
                 .unwrap();
 
             assert_eq!(ret2.input_levels[0].table_infos.len(), 1);
-            assert_eq!(ret2.input_levels[0].table_infos[0].get_sst_id(), 6);
-            assert_eq!(ret2.input_levels[1].table_infos[0].get_sst_id(), 5);
+            assert_eq!(ret2.input_levels[0].table_infos[0].sst_id, 6);
+            assert_eq!(ret2.input_levels[1].table_infos[0].sst_id, 5);
         }
 
-        levels.l0.as_mut().unwrap().sub_levels[0]
+        levels.l0.sub_levels[0]
             .table_infos
-            .retain(|table| table.get_sst_id() != 4);
-        levels.l0.as_mut().unwrap().total_file_size -= ret.input_levels[0].table_infos[0].file_size;
+            .retain(|table| table.sst_id != 4);
+        levels.l0.total_file_size -= ret.input_levels[0].table_infos[0].file_size;
 
         levels_handler[0].remove_task(0);
         levels_handler[1].remove_task(0);
@@ -363,11 +510,11 @@ pub mod tests {
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
             .unwrap();
         assert_eq!(ret.input_levels.len(), 3);
-        assert_eq!(ret.input_levels[0].table_infos[0].get_sst_id(), 6);
-        assert_eq!(ret.input_levels[1].table_infos[0].get_sst_id(), 5);
+        assert_eq!(ret.input_levels[0].table_infos[0].sst_id, 6);
+        assert_eq!(ret.input_levels[1].table_infos[0].sst_id, 5);
         assert_eq!(ret.input_levels[2].table_infos.len(), 2);
-        assert_eq!(ret.input_levels[2].table_infos[0].get_sst_id(), 3);
-        assert_eq!(ret.input_levels[2].table_infos[1].get_sst_id(), 2);
+        assert_eq!(ret.input_levels[2].table_infos[0].sst_id, 3);
+        assert_eq!(ret.input_levels[2].table_infos[1].sst_id, 2);
         ret.add_pending_task(1, &mut levels_handler);
 
         let mut local_stats = LocalPickerStatistic::default();
@@ -384,10 +531,11 @@ pub mod tests {
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
             .unwrap();
         assert_eq!(ret.input_levels.len(), 3);
-        assert_eq!(ret.input_levels[0].table_infos[0].get_sst_id(), 6);
-        assert_eq!(ret.input_levels[1].table_infos[0].get_sst_id(), 5);
+        assert_eq!(ret.input_levels[0].table_infos[0].sst_id, 6);
+        assert_eq!(ret.input_levels[1].table_infos[0].sst_id, 5);
         assert_eq!(ret.input_levels[2].table_infos.len(), 2);
     }
+
     #[test]
     fn test_selecting_key_range_overlap() {
         // When picking L0->L1, all L1 files overlapped with selecting_key_range should be picked.
@@ -396,29 +544,45 @@ pub mod tests {
                 .level0_tier_compact_file_number(2)
                 .compaction_mode(CompactionMode::Range as i32)
                 .level0_sub_level_compact_level_count(1)
+                .enable_optimize_l0_interval_selection(Some(false))
                 .build(),
         );
+
+        let config_enable_optimize_l0_interval_selection = Arc::new(
+            CompactionConfigBuilder::new()
+                .level0_tier_compact_file_number(2)
+                .compaction_mode(CompactionMode::Range as i32)
+                .level0_sub_level_compact_level_count(1)
+                .enable_optimize_l0_interval_selection(Some(true))
+                .build(),
+        );
+
         let mut picker =
             LevelCompactionPicker::new(1, config, Arc::new(CompactionDeveloperConfig::default()));
 
+        let mut picker_enable_optimize_l0_interval_selection = LevelCompactionPicker::new(
+            1,
+            config_enable_optimize_l0_interval_selection,
+            Arc::new(CompactionDeveloperConfig::default()),
+        );
+
         let levels = vec![Level {
             level_idx: 1,
-            level_type: LevelType::Nonoverlapping as i32,
+            level_type: LevelType::Nonoverlapping,
             table_infos: vec![
                 generate_table(3, 1, 0, 50, 1),
-                generate_table(4, 1, 150, 200, 1),
+                generate_table(4, 1, 150, 180, 1),
                 generate_table(5, 1, 250, 300, 1),
             ],
             ..Default::default()
         }];
         let mut levels = Levels {
             levels,
-            l0: Some(OverlappingLevel {
+            l0: OverlappingLevel {
                 sub_levels: vec![],
                 total_file_size: 0,
                 uncompressed_file_size: 0,
-            }),
-            member_table_ids: vec![1],
+            },
             ..Default::default()
         };
         push_tables_level0_nonoverlapping(&mut levels, vec![generate_table(1, 1, 50, 140, 2)]);
@@ -430,34 +594,82 @@ pub mod tests {
             ],
         );
 
-        let levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
+        {
+            let mut levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
 
-        let mut local_stats = LocalPickerStatistic::default();
-        let ret = picker
-            .pick_compaction(&levels, &levels_handler, &mut local_stats)
-            .unwrap();
+            let mut local_stats = LocalPickerStatistic::default();
+            let ret = picker_enable_optimize_l0_interval_selection
+                .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                .unwrap();
 
-        // pick
-        // l0 [sst_1]
-        // l1 [sst_3]
-        assert_eq!(ret.input_levels.len(), 2);
-        assert_eq!(
-            ret.input_levels[0]
-                .table_infos
-                .iter()
-                .map(|t| t.get_sst_id())
-                .collect_vec(),
-            vec![1]
-        );
+            // pick
+            // l0 [sst_8]
+            assert_eq!(ret.input_levels.len(), 2);
+            assert_eq!(
+                ret.input_levels[0]
+                    .table_infos
+                    .iter()
+                    .map(|t| t.sst_id)
+                    .collect_vec(),
+                vec![8]
+            );
+            // trivial_move
+            assert!(ret.input_levels[1].table_infos.is_empty());
 
-        assert_eq!(
-            ret.input_levels[1]
-                .table_infos
-                .iter()
-                .map(|t| t.get_sst_id())
-                .collect_vec(),
-            vec![3,]
-        );
+            ret.add_pending_task(0, &mut levels_handler);
+
+            let ret = picker_enable_optimize_l0_interval_selection
+                .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                .unwrap();
+
+            assert_eq!(ret.input_levels.len(), 2);
+            assert_eq!(
+                ret.input_levels[0]
+                    .table_infos
+                    .iter()
+                    .map(|t| t.sst_id)
+                    .collect_vec(),
+                vec![7]
+            );
+
+            assert_eq!(
+                ret.input_levels[1]
+                    .table_infos
+                    .iter()
+                    .map(|t| t.sst_id)
+                    .collect_vec(),
+                vec![5]
+            );
+        }
+
+        {
+            let levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
+
+            let mut local_stats = LocalPickerStatistic::default();
+            let ret = picker
+                .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                .unwrap();
+
+            // pick
+            assert_eq!(ret.input_levels.len(), 2);
+            assert_eq!(
+                ret.input_levels[0]
+                    .table_infos
+                    .iter()
+                    .map(|t| t.sst_id.as_raw_id())
+                    .collect_vec(),
+                vec![1]
+            );
+
+            assert_eq!(
+                ret.input_levels[1]
+                    .table_infos
+                    .iter()
+                    .map(|t| t.sst_id.as_raw_id())
+                    .collect_vec(),
+                vec![3]
+            );
+        }
     }
 
     #[test]
@@ -467,7 +679,7 @@ pub mod tests {
         let mut picker = create_compaction_picker_for_test();
         let levels = vec![Level {
             level_idx: 1,
-            level_type: LevelType::Nonoverlapping as i32,
+            level_type: LevelType::Nonoverlapping,
             table_infos: vec![],
             total_file_size: 0,
             sub_level_id: 0,
@@ -476,12 +688,11 @@ pub mod tests {
         }];
         let mut levels = Levels {
             levels,
-            l0: Some(OverlappingLevel {
+            l0: OverlappingLevel {
                 sub_levels: vec![],
                 total_file_size: 0,
                 uncompressed_file_size: 0,
-            }),
-            member_table_ids: vec![1],
+            },
             ..Default::default()
         };
         push_tables_level0_nonoverlapping(
@@ -532,7 +743,7 @@ pub mod tests {
         let mut levels = Levels {
             levels: vec![Level {
                 level_idx: 1,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(1, 1, 100, 399, 2),
                     generate_table(2, 1, 400, 699, 2),
@@ -543,7 +754,7 @@ pub mod tests {
                 uncompressed_file_size: 900,
                 ..Default::default()
             }],
-            l0: Some(generate_l0_nonoverlapping_sublevels(vec![])),
+            l0: generate_l0_nonoverlapping_sublevels(vec![]),
             ..Default::default()
         };
         push_tables_level0_nonoverlapping(
@@ -557,11 +768,7 @@ pub mod tests {
 
         let mut levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
         let mut local_stats = LocalPickerStatistic::default();
-        levels_handler[0].add_pending_task(
-            1,
-            4,
-            &levels.l0.as_ref().unwrap().sub_levels[0].table_infos,
-        );
+        levels_handler[0].add_pending_task(1, 4, &levels.l0.sub_levels[0].table_infos);
         let ret = picker.pick_compaction(&levels, &levels_handler, &mut local_stats);
         // Skip this compaction because the write amplification is too large.
         assert!(ret.is_none());
@@ -580,12 +787,11 @@ pub mod tests {
         ]);
         // We can set level_type only because the input above is valid.
         for s in &mut l0.sub_levels {
-            s.level_type = LevelType::Nonoverlapping as i32;
+            s.level_type = LevelType::Nonoverlapping;
         }
         let levels = Levels {
-            l0: Some(l0),
+            l0,
             levels: vec![generate_level(1, vec![generate_table(3, 1, 0, 100000, 1)])],
-            member_table_ids: vec![1],
             ..Default::default()
         };
         let levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
@@ -606,7 +812,7 @@ pub mod tests {
         let ret = picker
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
             .unwrap();
-        assert_eq!(ret.input_levels[0].table_infos[0].get_sst_id(), 7);
+        assert_eq!(ret.input_levels[0].table_infos[0].sst_id, 7);
         assert_eq!(
             3,
             ret.input_levels.iter().filter(|l| l.level_idx == 0).count()
@@ -634,7 +840,7 @@ pub mod tests {
         let ret = picker
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
             .unwrap();
-        assert_eq!(ret.input_levels[0].table_infos[0].get_sst_id(), 6);
+        assert_eq!(ret.input_levels[0].table_infos[0].sst_id, 6);
         assert_eq!(
             2,
             ret.input_levels.iter().filter(|l| l.level_idx == 0).count()
@@ -661,16 +867,15 @@ pub mod tests {
         ]);
 
         let levels = Levels {
-            l0: Some(l0),
+            l0,
             levels: vec![generate_level(1, vec![generate_table(3, 1, 0, 100000, 1)])],
-            member_table_ids: vec![1],
             ..Default::default()
         };
         let mut levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
         let mut local_stats = LocalPickerStatistic::default();
 
         // Create a pending sub-level.
-        let pending_level = levels.l0.as_ref().unwrap().sub_levels[1].clone();
+        let pending_level = levels.l0.sub_levels[1].clone();
         assert_eq!(pending_level.sub_level_id, 1);
         let tier_task_input = CompactionInput {
             input_levels: vec![InputLevel {
@@ -728,9 +933,8 @@ pub mod tests {
         ]);
 
         let levels = Levels {
-            l0: Some(l0),
+            l0,
             levels: vec![generate_level(1, vec![generate_table(3, 1, 1, 100, 1)])],
-            member_table_ids: vec![1],
             ..Default::default()
         };
         let mut levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];

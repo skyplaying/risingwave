@@ -1,0 +1,690 @@
+// Copyright 2026 RisingWave Labs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use anyhow::Context;
+use futures::FutureExt;
+use futures::stream::{self, StreamExt};
+use iceberg::writer::PositionDeleteInput;
+use itertools::Itertools;
+use risingwave_common::array::stream_record::Record;
+use risingwave_common::array::{DataChunk, Op};
+use risingwave_common::bail;
+use risingwave_common::id::SinkId;
+use risingwave_common::row::{Project, RowExt};
+use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
+use risingwave_common::util::epoch::EpochPair;
+use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_connector::sink::iceberg::PkIndexDataFileLocator;
+use risingwave_pb::connector_service::SinkMetadata;
+use risingwave_pb::id::IcebergCompactionTaskId;
+use risingwave_pb::stream_plan::iceberg_pk_index_compaction_context::Phase;
+use risingwave_pb::stream_plan::stream_node::StreamKind;
+use risingwave_pb::stream_service::PbIcebergPkIndexSinkRole;
+use risingwave_storage::StateStore;
+use uuid::Uuid;
+
+use crate::common::change_buffer::output_kind;
+use crate::common::compact_chunk::{InconsistencyBehavior, StreamChunkCompactor};
+use crate::executor::prelude::*;
+use crate::task::LocalBarrierManager;
+
+type PkRow<'a> = Project<'a, RowRef<'a>>;
+
+fn new_chunk_builder(chunk_size: usize) -> DataChunkBuilder {
+    DataChunkBuilder::new(vec![DataType::Varchar, DataType::Int64], chunk_size)
+}
+
+fn append_row(builder: &mut DataChunkBuilder, file_path: &str, position: i64) -> Option<DataChunk> {
+    builder.append_one_row([
+        Some(ScalarRefImpl::Utf8(file_path)),
+        Some(ScalarRefImpl::Int64(position)),
+    ])
+}
+
+/// Input-selection state for the writer's dual-input compaction protocol.
+#[derive(Debug)]
+pub enum WriterInputMode {
+    Normal,
+    ResolvingRight {
+        task_id: IcebergCompactionTaskId,
+        begin_epoch: EpochPair,
+    },
+    AligningReplacementInput {
+        task_id: IcebergCompactionTaskId,
+        barrier: Barrier,
+    },
+}
+
+/// Trait abstracting the Iceberg data file writing for testability.
+///
+/// Implementations are responsible for writing rows to Iceberg data files
+/// and tracking row positions. Commit is handled by the executor, not the writer.
+#[async_trait::async_trait]
+pub trait IcebergWriter: Send + 'static {
+    /// Write a batch of insert rows. Returns the position of each row in the chunk (in order).
+    async fn write_chunk(
+        &mut self,
+        chunk: DataChunk,
+    ) -> StreamExecutorResult<Vec<PositionDeleteInput>>;
+
+    /// Flush current data files on barrier. Returns serialized commit metadata,
+    /// or `None` if no data was written since the last flush.
+    async fn flush(&mut self) -> StreamExecutorResult<Option<SinkMetadata>>;
+}
+
+/// Writer Executor for iceberg pk-index sink with PK index
+///
+/// This stateful executor maintains a PK index that maps primary key values to
+/// their position in data files (`file_path`, `position`). It processes change logs
+/// from upstream:
+///
+/// - **Insert**: Writes the row to a data file via [`IcebergWriter`], records the
+///   position in the PK index state table.
+/// - **Delete**: Looks up the PK index to find the data file position, emits a
+///   delete position message downstream to the position-delete merger, removes from index.
+/// - **Update**: Treated as Delete + Insert. The planner guarantees the old and
+///   new rows share the same PK, so the executor can reuse the projected PK from
+///   the old row when updating the PK index.
+pub struct WriterExecutor<S, W>
+where
+    S: StateStore,
+    W: IcebergWriter,
+{
+    ctx: ActorContextRef,
+    input: Option<Executor>,
+    resolver_input: Option<Executor>,
+    /// Column indices of the primary key in the input schema.
+    pk_indices: Vec<usize>,
+    /// State table storing the PK index: `pk_columns` -> (data file, `position`).
+    /// Schema: [`pk_col_0`, ..., `pk_col_n`, data file, `position`: Int64], where the data file
+    /// column is `file_path`: Varchar in the legacy layout, or `file_uuid`: Bytea otherwise.
+    pk_index_state_table: StateTable<S>,
+    /// The Iceberg data file writer.
+    writer: W,
+    /// Rebuilds data file paths from the uuids stored in the PK index. `None` for the legacy
+    /// layout, where the PK index stores full paths.
+    data_file_locator: Option<PkIndexDataFileLocator>,
+    /// Buffer for accumulating delete position messages before the next barrier flush.
+    delete_position_buffer: Option<DataChunkBuilder>,
+    mode: WriterInputMode,
+    chunk_size: usize,
+    /// Maximum number of PK index lookups in flight at the same time.
+    lookup_concurrency: usize,
+    /// Maximum number of input rows merged into one batch from already-buffered chunks.
+    max_batch_rows: usize,
+    sink_id: SinkId,
+    local_barrier_manager: LocalBarrierManager,
+}
+
+impl<S, W> WriterExecutor<S, W>
+where
+    S: StateStore,
+    W: IcebergWriter,
+{
+    #[expect(clippy::too_many_arguments)]
+    pub fn new(
+        ctx: ActorContextRef,
+        input: Executor,
+        resolver_input: Executor,
+        pk_indices: Vec<usize>,
+        pk_index_state_table: StateTable<S>,
+        writer: W,
+        data_file_locator: Option<PkIndexDataFileLocator>,
+        chunk_size: usize,
+        lookup_concurrency: usize,
+        max_batch_rows: usize,
+        sink_id: SinkId,
+        local_barrier_manager: LocalBarrierManager,
+    ) -> Self {
+        Self {
+            ctx,
+            input: Some(input),
+            resolver_input: Some(resolver_input),
+            pk_indices,
+            pk_index_state_table,
+            writer,
+            data_file_locator,
+            delete_position_buffer: None,
+            mode: WriterInputMode::Normal,
+            chunk_size,
+            lookup_concurrency: lookup_concurrency.max(1),
+            max_batch_rows: max_batch_rows.max(1),
+            sink_id,
+            local_barrier_manager,
+        }
+    }
+
+    /// Removes `index_row` from the PK index and records its Iceberg position as a position delete.
+    fn delete_index_row(
+        &mut self,
+        index_row: OwnedRow,
+        delete_position_buffer: &mut DataChunkBuilder,
+    ) -> StreamExecutorResult<Option<DataChunk>> {
+        let num_cols = index_row.len();
+        let data_file = index_row
+            .datum_at(num_cols - 2)
+            .context("data file should not be null")?;
+        let position = index_row
+            .datum_at(num_cols - 1)
+            .context("position should not be null")?
+            .into_int64();
+        let chunk = match &self.data_file_locator {
+            None => append_row(delete_position_buffer, data_file.into_utf8(), position),
+            Some(locator) => {
+                let file_path = locator
+                    .file_path_from_bytes(data_file.into_bytea())
+                    .map_err(|e| StreamExecutorError::sink_error(e, self.sink_id))?;
+                append_row(delete_position_buffer, &file_path, position)
+            }
+        };
+        self.pk_index_state_table.delete(index_row);
+        Ok(chunk)
+    }
+
+    // Process a batch of stream chunks:
+    //
+    // 1. Compact all chunks together by `pk_indices` so each PK appears in at most one surviving
+    //    change, and any `+/-` cancellations across the batch are absorbed up front. After this
+    //    step every record is a standalone `Insert`, `Delete`, or `Update {old, new}`. A PK whose
+    //    old and new rows are not adjacent shows up as a `Delete` followed later by an `Insert`.
+    // 2. Look up `pk_index_state_table` for every `Delete` / `Update` concurrently. Lookups do not
+    //    depend on each other because PKs are unique after compaction, and none of them can observe
+    //    writes from this batch because the index is only modified in the next steps.
+    // 3. Walk the records in order: emit a position delete and clear the index entry for every
+    //    found row, and buffer `Insert` / `Update::new` rows into a single batched write.
+    // 4. Write all buffered inserts in one `write_chunk` call and persist the returned Iceberg
+    //    positions back to `pk_index_state_table`.
+    //
+    // `pk_index_state_table` and `delete_position_buffer` live until the next barrier, so a later
+    // batch in the same checkpoint observes earlier writes/deletes via the state table.
+    #[try_stream(ok = DataChunk, error = StreamExecutorError)]
+    async fn process_chunks(&mut self, chunks: Vec<StreamChunk>) {
+        let Some(first) = chunks.first() else {
+            return Ok(());
+        };
+        // Invariant: every input column is visible and written to Iceberg verbatim. The planner
+        // (`promote_iceberg_pk_index_stream_key` in `stream_sink.rs`) enforces this by promoting
+        // hidden stream-key columns to visible and by not adding the extra partition column for
+        // pk-index sinks, so the writer has no hidden-column projection and writes the whole row.
+        let data_types = first.data_types();
+        // An upper bound on appended rows: each surviving record contributes at most one row
+        // (Insert / Update::new), and `records()` yields at most `capacity` records per chunk.
+        let insert_capacity = chunks.iter().map(|c| c.capacity()).sum::<usize>() + 1;
+
+        // `StreamSink::sink_type_in_prop` maps Iceberg's `type='upsert'` to a retract sink,
+        // and `derive_sink_type` rejects upsert input. Only retract or append-only input can
+        // reach this writer, so inserts cannot replace existing Iceberg rows.
+        let chunks =
+            StreamChunkCompactor::new(self.pk_indices.clone(), chunks, StreamKind::Retract)
+                .into_compacted_chunks_inline::<{ output_kind::RETRACT }>(
+                    InconsistencyBehavior::Panic,
+                );
+        let pk_indices = self.pk_indices.clone();
+        let records = chunks.iter().flat_map(|c| c.records()).collect_vec();
+
+        // The compactor groups by `pk_indices`, so `Update`'s old and new rows share the same PK.
+        let lookup_pks = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Insert { .. } => None,
+                Record::Delete { old_row } => Some((*old_row).project(&pk_indices)),
+                Record::Update { new_row, .. } => Some((*new_row).project(&pk_indices)),
+            })
+            .collect_vec();
+        let mut index_rows = lookup_index_rows(
+            &self.pk_index_state_table,
+            &lookup_pks,
+            self.lookup_concurrency,
+        )
+        .await?
+        .into_iter();
+
+        let mut delete_position_buffer = self
+            .delete_position_buffer
+            .take()
+            .unwrap_or_else(|| new_chunk_builder(self.chunk_size));
+        let mut insert_chunk = DataChunkBuilder::new(data_types, insert_capacity);
+        let mut insert_pks: Vec<PkRow<'_>> = Vec::new();
+
+        for record in records {
+            let new_row = match record {
+                Record::Insert { new_row } => Some(new_row),
+                Record::Delete { .. } => None,
+                Record::Update { new_row, .. } => Some(new_row),
+            };
+            if !matches!(record, Record::Insert { .. })
+                && let Some(index_row) = index_rows
+                    .next()
+                    .expect("one lookup result per delete or update")
+                && let Some(chunk) =
+                    self.delete_index_row(index_row, &mut delete_position_buffer)?
+            {
+                yield chunk;
+            }
+            if let Some(new_row) = new_row {
+                let overflow = insert_chunk.append_one_row(new_row);
+                debug_assert!(overflow.is_none(), "insert chunk exceeds capacity");
+                insert_pks.push(new_row.project(&pk_indices));
+            }
+        }
+        debug_assert!(index_rows.next().is_none());
+
+        if !insert_pks.is_empty() {
+            let write_chunk = insert_chunk.finish();
+            let positions = self.writer.write_chunk(write_chunk).await?;
+
+            // Rows of one write mostly land in the same data file, so reuse the last parsed uuid.
+            let mut last_file: Option<(&str, Uuid)> = None;
+            for (pk, pos) in insert_pks.into_iter().zip_eq_fast(positions.iter()) {
+                let mut index_row_data = Vec::with_capacity(pk_indices.len() + 2);
+                for datum in pk.iter() {
+                    index_row_data.push(datum);
+                }
+                let file_uuid = match (&self.data_file_locator, last_file) {
+                    (None, _) => None,
+                    (Some(_), Some((path, uuid))) if path == &*pos.path => Some(uuid),
+                    (Some(locator), _) => {
+                        let uuid = locator
+                            .file_uuid(&pos.path)
+                            .map_err(|e| StreamExecutorError::sink_error(e, self.sink_id))?;
+                        last_file = Some((&*pos.path, uuid));
+                        Some(uuid)
+                    }
+                };
+                let data_file = match &file_uuid {
+                    None => ScalarRefImpl::Utf8(&pos.path),
+                    Some(uuid) => ScalarRefImpl::Bytea(uuid.as_bytes()),
+                };
+                index_row_data.push(Some(data_file));
+                index_row_data.push(Some(ScalarRefImpl::Int64(pos.pos)));
+                self.pk_index_state_table.insert(index_row_data.as_slice());
+            }
+        }
+
+        self.delete_position_buffer = Some(delete_position_buffer);
+        self.pk_index_state_table.try_flush().await?;
+    }
+
+    async fn apply_resolver_chunk(&mut self, chunk: StreamChunk) -> StreamExecutorResult<()> {
+        for (op, row) in chunk.rows() {
+            if op != Op::Insert {
+                bail!(
+                    "iceberg pk-index writer {} expected resolver inserts, got {op:?}",
+                    self.sink_id
+                );
+            }
+            self.pk_index_state_table.insert(row);
+        }
+        self.pk_index_state_table.try_flush().await?;
+        Ok(())
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn checkpoint_barrier(&mut self, barrier: Barrier) {
+        barrier.assume_no_update_vnode_bitmap(self.ctx.id)?;
+        let mut metadata = None;
+        if barrier.is_checkpoint() {
+            if let Some(chunk) = self
+                .delete_position_buffer
+                .take()
+                .and_then(|mut builder| builder.consume_all())
+            {
+                yield Message::Chunk(chunk.into());
+            }
+            metadata = self.writer.flush().await?;
+        }
+
+        self.pk_index_state_table
+            .commit_assert_no_update_vnode_bitmap(barrier.epoch)
+            .await?;
+        if let Some(metadata) = metadata
+            && metadata.metadata.is_some()
+        {
+            self.local_barrier_manager
+                .report_iceberg_pk_index_sink_metadata(
+                    barrier.epoch,
+                    self.sink_id,
+                    self.ctx.id,
+                    PbIcebergPkIndexSinkRole::Writer,
+                    Some(metadata),
+                );
+        }
+        yield Message::Barrier(barrier);
+    }
+
+    fn validate_compaction_barrier(
+        &self,
+        barrier: &Barrier,
+        expected_task: IcebergCompactionTaskId,
+        expected_phase: Phase,
+        expected_prev: u64,
+    ) -> StreamExecutorResult<()> {
+        if !barrier.is_checkpoint() || barrier.epoch.prev != expected_prev {
+            bail!(
+                "iceberg pk-index writer {} expected checkpoint {:?} starting at {}, got {:?}",
+                self.sink_id,
+                expected_phase,
+                expected_prev,
+                barrier
+            );
+        }
+        match barrier.iceberg_pk_index_compaction() {
+            Some(context)
+                if context.sink_id == self.sink_id
+                    && context.task_id == expected_task
+                    && context.phase == expected_phase as i32 =>
+            {
+                Ok(())
+            }
+            _ => bail!(
+                "iceberg pk-index writer {} expected matching {:?} context for task {}, got {:?}",
+                self.sink_id,
+                expected_phase,
+                expected_task,
+                barrier
+            ),
+        }
+    }
+
+    fn validate_aligned_barriers(
+        &self,
+        left: &Barrier,
+        right: &Barrier,
+    ) -> StreamExecutorResult<()> {
+        if left.epoch != right.epoch || left.kind != right.kind || left.mutation != right.mutation {
+            bail!(
+                "iceberg pk-index writer {} received mismatched left/right barriers: left={:?}, right={:?}",
+                self.sink_id,
+                left,
+                right
+            );
+        }
+        Ok(())
+    }
+
+    fn compaction_begin(
+        &self,
+        barrier: &Barrier,
+    ) -> StreamExecutorResult<Option<IcebergCompactionTaskId>> {
+        let context = match barrier.iceberg_pk_index_compaction() {
+            Some(context) if context.sink_id == self.sink_id => context,
+            _ => return Ok(None),
+        };
+        if context.phase == Phase::End as i32 {
+            bail!(
+                "iceberg pk-index writer {} received unexpected End in Normal mode for task {}",
+                self.sink_id,
+                context.task_id
+            );
+        }
+        if context.phase != Phase::Begin as i32 {
+            bail!(
+                "iceberg pk-index writer {} expected Begin context for task {}, got {:?}",
+                self.sink_id,
+                context.task_id,
+                context.phase
+            );
+        }
+        Ok(Some(context.task_id))
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn execute_inner(mut self) {
+        let mut input = self.input.take().unwrap().execute();
+        let mut resolver_input = self.resolver_input.take().unwrap().execute();
+
+        // Consume the first barrier.
+        let barrier = expect_first_barrier(&mut input).await?;
+        let remap_first = expect_first_barrier(&mut resolver_input).await?;
+        self.validate_aligned_barriers(&barrier, &remap_first)?;
+        let first_epoch = barrier.epoch;
+        yield Message::Barrier(barrier);
+        self.pk_index_state_table.init_epoch(first_epoch).await?;
+
+        loop {
+            let mode = std::mem::replace(&mut self.mode, WriterInputMode::Normal);
+            match mode {
+                WriterInputMode::Normal => {
+                    let mut completed = false;
+                    #[for_await]
+                    for msg in self.execute_normal(&mut input, &mut resolver_input, &mut completed)
+                    {
+                        yield msg?;
+                    }
+                    if completed {
+                        break;
+                    }
+                }
+                WriterInputMode::ResolvingRight {
+                    task_id,
+                    begin_epoch,
+                } => {
+                    #[for_await]
+                    for msg in
+                        self.execute_resolving_right(&mut resolver_input, task_id, begin_epoch)
+                    {
+                        yield msg?;
+                    }
+                }
+                WriterInputMode::AligningReplacementInput { task_id, barrier } => {
+                    #[for_await]
+                    for msg in self.execute_aligning_replacement_input(&mut input, task_id, barrier)
+                    {
+                        yield msg?;
+                    }
+                }
+            }
+        }
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn execute_normal<'a>(
+        &'a mut self,
+        input: &'a mut BoxedMessageStream,
+        resolver_input: &'a mut BoxedMessageStream,
+        completed: &'a mut bool,
+    ) {
+        // The next input item that has been polled while batching but not yet handled.
+        // `Some(None)` means the input has ended.
+        let mut peeked: Option<Option<Message>> = None;
+        loop {
+            let next = match peeked.take() {
+                Some(next) => next,
+                None => input.next().await.transpose()?,
+            };
+            let Some(msg) = next else {
+                break;
+            };
+            match msg {
+                Message::Chunk(chunk) => {
+                    // Merge chunks that are already buffered so their PK lookups run in one
+                    // concurrent round. Never wait for more input here: a backlogged input fills
+                    // the batch, while an idle one adds no latency.
+                    let mut batch_rows = chunk.cardinality();
+                    let mut chunks = vec![chunk];
+                    while batch_rows < self.max_batch_rows {
+                        match input.next().now_or_never() {
+                            Some(Some(Ok(Message::Chunk(chunk)))) => {
+                                batch_rows += chunk.cardinality();
+                                chunks.push(chunk);
+                            }
+                            Some(next) => {
+                                peeked = Some(next.transpose()?);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    #[for_await]
+                    for chunk in self.process_chunks(chunks) {
+                        yield Message::Chunk(chunk?.into());
+                    }
+                }
+                Message::Watermark(watermark) => {
+                    yield Message::Watermark(watermark);
+                }
+                Message::Barrier(barrier) => {
+                    let msg = next_msg(resolver_input).await?;
+                    let remap_barrier = match msg {
+                        Message::Barrier(b) => b,
+                        _ => bail!(
+                            "iceberg pk-index writer {} expected barrier on remap input, got {msg:?}",
+                            self.sink_id
+                        ),
+                    };
+                    self.validate_aligned_barriers(&barrier, &remap_barrier)?;
+                    let begin = self.compaction_begin(&barrier)?;
+                    let epoch = barrier.epoch;
+                    #[for_await]
+                    for msg in self.checkpoint_barrier(barrier) {
+                        yield msg?;
+                    }
+
+                    if let Some(task_id) = begin {
+                        self.mode = WriterInputMode::ResolvingRight {
+                            task_id,
+                            begin_epoch: epoch,
+                        };
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        *completed = true;
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn execute_resolving_right<'a>(
+        &'a mut self,
+        resolver_input: &'a mut BoxedMessageStream,
+        task_id: IcebergCompactionTaskId,
+        begin_epoch: EpochPair,
+    ) {
+        #[for_await]
+        for msg in resolver_input {
+            match msg? {
+                Message::Chunk(chunk) => {
+                    self.apply_resolver_chunk(chunk).await?;
+                }
+                Message::Watermark(_) => bail!(
+                    "iceberg pk-index writer {} received watermark on remap input while resolving task {}",
+                    self.sink_id,
+                    task_id
+                ),
+                Message::Barrier(barrier) => {
+                    self.validate_compaction_barrier(
+                        &barrier,
+                        task_id,
+                        Phase::End,
+                        begin_epoch.curr,
+                    )?;
+                    self.mode = WriterInputMode::AligningReplacementInput { task_id, barrier };
+                    return Ok(());
+                }
+            }
+        }
+
+        bail!(
+            "iceberg pk-index writer {} resolver input closed before switch-to-input for task {}",
+            self.sink_id,
+            task_id
+        );
+    }
+
+    #[try_stream(ok = Message, error = StreamExecutorError)]
+    async fn execute_aligning_replacement_input<'a>(
+        &'a mut self,
+        input: &'a mut BoxedMessageStream,
+        task_id: IcebergCompactionTaskId,
+        expected: Barrier,
+    ) {
+        #[for_await]
+        for msg in input {
+            match msg? {
+                Message::Chunk(_) => bail!(
+                    "iceberg pk-index writer {} received a chunk from replacement input before its initial barrier for task {}",
+                    self.sink_id,
+                    task_id
+                ),
+                Message::Watermark(_) => bail!(
+                    "iceberg pk-index writer {} received watermark from replacement input before its initial barrier for task {}",
+                    self.sink_id,
+                    task_id
+                ),
+                Message::Barrier(barrier) => {
+                    self.validate_aligned_barriers(&barrier, &expected)?;
+                    #[for_await]
+                    for msg in self.checkpoint_barrier(barrier) {
+                        yield msg?;
+                    }
+                    self.mode = WriterInputMode::Normal;
+                    return Ok(());
+                }
+            }
+        }
+
+        bail!(
+            "iceberg pk-index writer {} replacement input closed before its initial barrier for task {}",
+            self.sink_id,
+            task_id
+        );
+    }
+}
+
+impl<S, W> Execute for WriterExecutor<S, W>
+where
+    S: StateStore,
+    W: IcebergWriter,
+{
+    fn execute(self: Box<Self>) -> BoxedMessageStream {
+        self.execute_inner().boxed()
+    }
+}
+
+/// Looks up the PK index rows of `pks` with at most `concurrency` lookups in flight.
+/// Results are returned in the same order as `pks`.
+async fn lookup_index_rows<S: StateStore>(
+    table: &StateTable<S>,
+    pks: &[PkRow<'_>],
+    concurrency: usize,
+) -> StreamExecutorResult<Vec<Option<OwnedRow>>> {
+    let mut index_rows = vec![None; pks.len()];
+    // `buffer_unordered` keeps a slow lookup from blocking the others; results are put back by
+    // index to keep the output deterministic.
+    let mut lookups = stream::iter(pks.iter().enumerate())
+        .map(|(i, pk)| async move { table.get_row(pk).await.map(|row| (i, row)) })
+        .buffer_unordered(concurrency);
+    while let Some(result) = lookups.next().await {
+        let (i, row) = result?;
+        index_rows[i] = row;
+    }
+    Ok(index_rows)
+}
+
+async fn next_msg(input: &mut BoxedMessageStream) -> StreamExecutorResult<Message> {
+    input
+        .next()
+        .await
+        .ok_or_else(|| {
+            StreamExecutorError::channel_closed(
+                "iceberg pk-index writer input channel closed unexpectedly",
+            )
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+#[path = "writer_test.rs"]
+mod tests;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,4 +59,14 @@ pub enum BackupError {
         #[backtrace]
         anyhow::Error,
     ),
+}
+
+impl From<std::io::Error> for BackupError {
+    fn from(err: std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            Self::Decoding(anyhow::anyhow!("unexpected EOF while decoding meta snapshot").into())
+        } else {
+            Self::BackupStorage(err.into())
+        }
+    }
 }

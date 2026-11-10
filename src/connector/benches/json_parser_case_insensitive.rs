@@ -14,7 +14,7 @@
 
 //! Benchmarking JSON parsers for scenarios with exact key matches and case-insensitive key matches.
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use maplit::hashmap;
 use rand::Rng;
@@ -22,12 +22,31 @@ use risingwave_common::types::DataType;
 use risingwave_connector::parser::{
     ByteStreamSourceParserImpl, CommonParserConfig, ParserConfig, SpecificParserConfig,
 };
-use risingwave_connector::source::{SourceColumnDesc, SourceMessage};
+use risingwave_connector::source::{
+    SourceChunkStream, SourceColumnDesc, SourceMessage, SourceMessageEvent, SourceReaderEvent,
+};
 use serde_json::json;
 use tokio::runtime::Runtime;
 
 type Input = Vec<Vec<SourceMessage>>;
 type Parser = ByteStreamSourceParserImpl;
+
+fn into_data_chunk_stream(
+    stream: impl futures::Stream<Item = risingwave_connector::error::ConnectorResult<SourceReaderEvent>>
+    + Send
+    + 'static,
+) -> impl SourceChunkStream {
+    use futures::TryStreamExt;
+
+    stream
+        .try_filter_map(|event| async move {
+            Ok(match event {
+                SourceReaderEvent::DataChunk(chunk) => Some(chunk),
+                SourceReaderEvent::SplitProgress(_) => None,
+            })
+        })
+        .boxed()
+}
 
 fn gen_input(mode: &str, chunk_size: usize, chunk_num: usize) -> Input {
     let mut input = Vec::with_capacity(chunk_num);
@@ -40,10 +59,10 @@ fn gen_input(mode: &str, chunk_size: usize, chunk_num: usize) -> Input {
                     .to_vec(),
                 "mismatch" => {
                     let convert_case = |s: &str| -> String {
-                        let mut rng = rand::thread_rng();
-                        let mut result = "".to_string();
+                        let mut rng = rand::rng();
+                        let mut result = "".to_owned();
                         for char in s.chars() {
-                            if rng.gen_bool(0.5) {
+                            if rng.random_bool(0.5) {
                                 result.push(char.to_uppercase().to_string().parse().unwrap());
                             } else {
                                 result.push(char.to_lowercase().to_string().parse().unwrap());
@@ -88,10 +107,18 @@ fn create_parser(chunk_size: usize, chunk_num: usize, mode: &str) -> (Parser, In
 }
 
 async fn parse(parser: Parser, input: Input) {
-    parser
-        .into_stream(futures::stream::iter(input.into_iter().map(Ok)).boxed())
-        .count() // consume the stream
-        .await;
+    into_data_chunk_stream(
+        parser.parse_stream_with_events(
+            futures::stream::iter(
+                input
+                    .into_iter()
+                    .map(|batch| Ok(SourceMessageEvent::Data(batch))),
+            )
+            .boxed(),
+        ),
+    )
+    .count() // consume the stream
+    .await;
 }
 
 fn do_bench(c: &mut Criterion, mode: &str) {

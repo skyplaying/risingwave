@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ use super::*;
 use crate::executor::FilterExecutor;
 
 pub struct CdcFilterExecutorBuilder;
+
+impl_stream_node_body!(CdcFilter(CdcFilterNode) => CdcFilterExecutorBuilder);
 
 /// `CdcFilter` is an extension to the Filter executor
 impl ExecutorBuilder for CdcFilterExecutorBuilder {

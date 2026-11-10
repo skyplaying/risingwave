@@ -1,0 +1,23 @@
+statement ok
+DROP SOURCE supplier_raw CASCADE;
+
+statement ok
+DROP SOURCE region_raw CASCADE;
+
+statement ok
+DROP SOURCE nation_raw CASCADE;
+
+statement ok
+DROP SOURCE lineitem_raw CASCADE;
+
+statement ok
+DROP SOURCE orders_raw CASCADE;
+
+statement ok
+DROP SOURCE customer_raw CASCADE;
+
+statement ok
+DROP SOURCE partsupp_raw CASCADE;
+
+statement ok
+DROP SOURCE part_raw CASCADE;

@@ -1,0 +1,38 @@
+statement ok
+SET RW_IMPLICIT_FLUSH TO true;
+
+statement ok
+SET QUERY_MODE TO local;
+
+statement ok
+CREATE TABLE t (k INT);
+
+query I
+SELECT *  FROM t;
+----
+
+query error Time-travel version expired: table [0-9]+, epoch 0
+SELECT * FROM t FOR SYSTEM_TIME AS OF 963716300;
+
+
+query error Time-travel version expired: table [0-9]+, epoch 0
+SELECT * FROM t FOR SYSTEM_TIME AS OF '2000-02-20T12:13:14-08:30';
+
+
+query error Time-travel version expired: table [0-9]+, epoch 0
+SELECT * FROM t FOR SYSTEM_TIME AS OF NOW() - '100' YEAR;
+
+
+query I
+SELECT *  FROM t FOR SYSTEM_TIME AS OF '2130-02-10T12:13:14-08:30';
+----
+
+query I
+SELECT *  FROM t FOR SYSTEM_TIME AS OF 5066075780;
+----
+
+statement ok
+DROP TABLE t;
+
+statement ok
+SET QUERY_MODE TO auto;

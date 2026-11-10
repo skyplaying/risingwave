@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+use std::time::Duration;
 
 use anyhow::anyhow;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -65,7 +67,15 @@ impl TestSuite {
         Self { config }
     }
 
+    fn init_logger() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_ansi(false)
+            .try_init();
+    }
+
     pub async fn test(&self) -> anyhow::Result<()> {
+        Self::init_logger();
         self.binary_param_and_result().await?;
         self.dql_dml_with_param().await?;
         self.max_row().await?;
@@ -75,7 +85,10 @@ impl TestSuite {
         self.simple_cancel(true).await?;
         self.complex_cancel(false).await?;
         self.complex_cancel(true).await?;
+        self.subscription_fetch_cancel(false).await?;
+        self.subscription_fetch_cancel(true).await?;
         self.subquery_with_param().await?;
+        self.create_mview_with_parameter().await?;
         Ok(())
     }
 
@@ -378,13 +391,36 @@ impl TestSuite {
                 .is_err(),
             true
         );
-        test_eq!(
-            client
-                .query("create materialized view v as select $1", &[])
-                .await
-                .is_err(),
-            true
-        );
+
+        Ok(())
+    }
+
+    async fn create_mview_with_parameter(&self) -> anyhow::Result<()> {
+        let client = self.create_client(false).await?;
+
+        let statement = client
+            .prepare_typed(
+                "create materialized view mv as select $1 as x",
+                &[Type::INT4],
+            )
+            .await?;
+
+        client.execute(&statement, &[&42_i32]).await?;
+
+        let rows = client.query("select * from mv", &[]).await?;
+        test_eq!(rows.len(), 1);
+        test_eq!(rows.first().unwrap().get::<usize, i32>(0), 42);
+
+        // Test renaming mv because it relies on parsing and rewrite the `create MV` query
+        client
+            .execute("alter materialized view mv rename to mv2", &[])
+            .await?;
+
+        let rows = client.query("select * from mv2", &[]).await?;
+        test_eq!(rows.len(), 1);
+        test_eq!(rows.first().unwrap().get::<usize, i32>(0), 42);
+
+        client.execute("drop materialized view mv2", &[]).await?;
 
         Ok(())
     }
@@ -496,7 +532,15 @@ impl TestSuite {
         ";
 
         let query_handle = tokio::spawn(async move {
-            client.query(query_sql, &[]).await.unwrap();
+            let result = client.query(query_sql, &[]).await;
+            match result {
+                Ok(_) => {
+                    tracing::error!("Query should be canceled");
+                }
+                Err(e) => {
+                    tracing::error!("Query failed with error: {:?}", e);
+                }
+            };
         });
 
         select! {
@@ -504,7 +548,7 @@ impl TestSuite {
                 tracing::error!("Failed to cancel query")
             },
             _ = cancel_token.cancel_query(NoTls) => {
-                tracing::trace!("Cancel query successfully")
+                tracing::info!("Cancel query successfully")
             },
         }
 
@@ -540,6 +584,55 @@ impl TestSuite {
         new_client.execute("drop table t1", &[]).await?;
         new_client.execute("drop table t2", &[]).await?;
         new_client.execute("drop table t3", &[]).await?;
+        Ok(())
+    }
+
+    async fn subscription_fetch_cancel(&self, is_distributed: bool) -> anyhow::Result<()> {
+        let client = self.create_client(is_distributed).await?;
+        let suffix = if is_distributed { "dist" } else { "local" };
+        let table_name = format!("sub_cancel_t_{suffix}");
+        let subscription_name = format!("sub_cancel_{suffix}");
+
+        client
+            .execute(&format!("create table {table_name}(v int)"), &[])
+            .await?;
+        client
+            .execute(
+                &format!("create subscription {subscription_name} from {table_name} with(retention = '1D')"),
+                &[],
+            )
+            .await?;
+        client
+            .execute(
+                &format!("declare cur subscription cursor for {subscription_name} since now()"),
+                &[],
+            )
+            .await?;
+
+        let cancel_token = client.cancel_token();
+        let fetch_handle = tokio::spawn(async move {
+            client
+                .query("fetch 1 from cur with (timeout = '60s')", &[])
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel_token.cancel_query(NoTls).await?;
+
+        let result = tokio::time::timeout(Duration::from_secs(10), fetch_handle).await??;
+        if result.is_ok() {
+            return Err(anyhow!(
+                "subscription cursor fetch should be cancelled by CancelRequest"
+            ));
+        }
+
+        let cleanup_client = self.create_client(is_distributed).await?;
+        cleanup_client
+            .execute(&format!("drop subscription {subscription_name}"), &[])
+            .await?;
+        cleanup_client
+            .execute(&format!("drop table {table_name}"), &[])
+            .await?;
         Ok(())
     }
 

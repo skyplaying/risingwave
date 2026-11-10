@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,19 +19,18 @@ use anyhow::anyhow;
 use risingwave_common::system_param::common::CommonHandler;
 use risingwave_common::system_param::reader::SystemParamsReader;
 use risingwave_common::system_param::{
-    check_missing_params, derive_missing_fields, set_system_param,
+    check_missing_params, derive_missing_fields, set_system_param, validate_init_system_params,
 };
 use risingwave_common::{for_all_params, key_of};
-use risingwave_meta_model_v2::prelude::SystemParameter;
-use risingwave_meta_model_v2::system_parameter;
-use risingwave_pb::meta::subscribe_response::{Info, Operation};
+use risingwave_meta_model::prelude::SystemParameter;
+use risingwave_meta_model::system_parameter;
 use risingwave_pb::meta::PbSystemParams;
+use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use sea_orm::ActiveValue::Set;
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, TransactionTrait};
-use tokio::sync::oneshot::Sender;
+use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::RwLock;
+use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
-use tracing::info;
 
 use crate::controller::SqlMetaStore;
 use crate::manager::{LocalNotification, NotificationManagerRef};
@@ -54,13 +53,14 @@ macro_rules! impl_system_params_from_db {
     ($({ $field:ident, $type:ty, $($rest:tt)* },)*) => {
         /// Try to deserialize deprecated fields as well.
         /// Warn if there are unrecognized fields.
+        #[expect(deprecated)]
         pub fn system_params_from_db(mut models: Vec<system_parameter::Model>) -> MetaResult<PbSystemParams> {
             let mut params = PbSystemParams::default();
             models.retain(|model| {
                 match model.name.as_str() {
                     $(
                         key_of!($field) => {
-                            params.$field = Some(model.value.parse::<$type>().unwrap());
+                            params.$field = Some(model.value.parse::<$type>().unwrap().into());
                             false
                         }
                     )*
@@ -80,6 +80,7 @@ macro_rules! impl_system_params_from_db {
 /// Derive serialization to db models.
 macro_rules! impl_system_params_to_models {
     ($({ $field:ident, $type:ty, $default:expr, $is_mutable:expr, $($rest:tt)* },)*) => {
+        #[expect(deprecated)]
         #[allow(clippy::vec_init_then_push)]
         pub fn system_params_to_model(params: &PbSystemParams) -> MetaResult<Vec<system_parameter::ActiveModel>> {
             check_missing_params(params).map_err(|e| anyhow!(e))?;
@@ -107,6 +108,7 @@ macro_rules! impl_system_params_to_models {
 // params are not set. The new field is not initialized either, just leave it as `None`.
 macro_rules! impl_merge_params {
     ($({ $field:ident, $($rest:tt)* },)*) => {
+        #[expect(deprecated)]
         fn merge_params(mut persisted: PbSystemParams, init: PbSystemParams) -> PbSystemParams {
             $(
                 match (persisted.$field.as_ref(), init.$field) {
@@ -142,10 +144,9 @@ impl SystemParamsController {
         let db = sql_meta_store.conn;
         let params = SystemParameter::find().all(&db).await?;
         let params = merge_params(system_params_from_db(params)?, init_params);
-
-        info!("system parameters: {:?}", params);
+        tracing::info!(initial_params = ?SystemParamsReader::new(&params), "initialize system parameters");
         check_missing_params(&params).map_err(|e| anyhow!(e))?;
-
+        validate_init_system_params(&params).map_err(|e| anyhow!(e))?;
         let ctl = Self {
             db,
             notification_manager,
@@ -181,7 +182,7 @@ impl SystemParamsController {
     pub async fn set_param(&self, name: &str, value: Option<String>) -> MetaResult<PbSystemParams> {
         let mut params_guard = self.params.write().await;
 
-        let Some(param) = SystemParameter::find_by_id(name.to_string())
+        let Some(param) = SystemParameter::find_by_id(name.to_owned())
             .one(&self.db)
             .await?
         else {
@@ -200,7 +201,7 @@ impl SystemParamsController {
         };
 
         param.value = Set(new_value);
-        param.update(&self.db).await?;
+        SystemParameter::update(param).exec(&self.db).await?;
         *params_guard = params.clone();
 
         // Run common handler.
@@ -210,8 +211,7 @@ impl SystemParamsController {
 
         // Sync params to other managers on the meta node only once, since it's infallible.
         self.notification_manager
-            .notify_local_subscribers(LocalNotification::SystemParamsChange(params.clone().into()))
-            .await;
+            .notify_local_subscribers(LocalNotification::SystemParamsChange(params.clone().into()));
 
         // Sync params to worker nodes.
         self.notify_workers(&params);
@@ -265,10 +265,9 @@ mod tests {
     use crate::manager::MetaSrvEnv;
 
     #[tokio::test]
-    #[cfg(not(madsim))]
     async fn test_system_params() {
-        let env = MetaSrvEnv::for_test_with_sql_meta_store().await;
-        let meta_store = env.meta_store().as_sql().clone();
+        let env = MetaSrvEnv::for_test().await;
+        let meta_store = env.meta_store();
         let init_params = system_params_for_test();
 
         // init system parameter controller as first launch.
@@ -295,7 +294,10 @@ mod tests {
             is_mutable: Set(true),
             description: Set(None),
         };
-        deprecated_param.insert(&system_param_ctl.db).await.unwrap();
+        SystemParameter::insert(deprecated_param)
+            .exec(&system_param_ctl.db)
+            .await
+            .unwrap();
 
         // init system parameter controller as not first launch.
         let system_param_ctl = SystemParamsController::new(
@@ -306,11 +308,13 @@ mod tests {
         .await
         .unwrap();
         // check deprecated params are cleaned up.
-        assert!(SystemParameter::find_by_id("deprecated_param".to_string())
-            .one(&system_param_ctl.db)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            SystemParameter::find_by_id("deprecated_param".to_owned())
+                .one(&system_param_ctl.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
         // check new params are set.
         let params = system_param_ctl.get_pb_params().await;
         assert_eq!(params, new_params);

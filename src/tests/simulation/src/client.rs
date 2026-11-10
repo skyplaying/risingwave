@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,14 @@
 
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use itertools::Itertools;
-use lru::{Iter, LruCache};
 use risingwave_sqlparser::ast::Statement;
 use risingwave_sqlparser::parser::Parser;
+use shell_words::split;
 use sqllogictest::{DBOutput, DefaultColumnType};
+
+use crate::ctl_ext::start_ctl;
 
 /// A RisingWave client.
 pub struct RisingWave {
@@ -33,43 +36,16 @@ pub struct RisingWave {
 
 /// `SetStmts` stores and compacts all `SET` statements that have been executed in the client
 /// history.
+#[derive(Default)]
 pub struct SetStmts {
-    stmts_cache: LruCache<String, String>,
-}
-
-impl Default for SetStmts {
-    fn default() -> Self {
-        Self {
-            stmts_cache: LruCache::unbounded(),
-        }
-    }
-}
-
-struct SetStmtsIterator<'a, 'b>
-where
-    'a: 'b,
-{
-    _stmts: &'a SetStmts,
-    stmts_iter: core::iter::Rev<Iter<'b, String, String>>,
-}
-
-impl<'a, 'b> SetStmtsIterator<'a, 'b> {
-    fn new(stmts: &'a SetStmts) -> Self {
-        Self {
-            _stmts: stmts,
-            stmts_iter: stmts.stmts_cache.iter().rev(),
-        }
-    }
+    // variable name -> last set statement
+    stmts: IndexMap<String, String>,
 }
 
 impl SetStmts {
     fn push(&mut self, sql: &str) {
         let ast = Parser::parse_sql(sql).expect("a set statement should be parsed successfully");
-        match ast
-            .into_iter()
-            .exactly_one()
-            .expect("should contain only one statement")
-        {
+        match Itertools::exactly_one(ast.into_iter()).expect("should contain only one statement") {
             // record `local` for variable and `SetTransaction` if supported in the future.
             Statement::SetVariable {
                 local: _,
@@ -78,19 +54,14 @@ impl SetStmts {
             } => {
                 let key = variable.real_value().to_lowercase();
                 // store complete sql as value.
-                self.stmts_cache.put(key, sql.to_string());
+                self.stmts.insert(key, sql.to_owned());
             }
             _ => unreachable!(),
         }
     }
-}
 
-impl Iterator for SetStmtsIterator<'_, '_> {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (_, stmt) = self.stmts_iter.next()?;
-        Some(stmt.clone())
+    fn replay_iter(&self) -> impl Iterator<Item = &str> + '_ {
+        self.stmts.values().map(|s| s.as_str())
     }
 }
 
@@ -130,8 +101,8 @@ impl RisingWave {
             }
         });
         // replay all SET statements
-        for stmt in SetStmtsIterator::new(set_stmts) {
-            client.simple_query(&stmt).await?;
+        for stmt in set_stmts.replay_iter() {
+            client.simple_query(stmt).await?;
         }
         Ok((client, task))
     }
@@ -152,6 +123,46 @@ impl RisingWave {
 impl Drop for RisingWave {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+fn parse_risedev_ctl_args(command: &std::process::Command) -> Option<Vec<String>> {
+    let program = command.get_program().to_str()?;
+    if program != "bash" && !program.ends_with("/bash") {
+        return None;
+    }
+
+    let mut args = command.get_args();
+    if args.next()?.to_str()? != "-c" {
+        return None;
+    }
+    let script = args.next()?.to_str()?;
+    if args.next().is_some() {
+        return None;
+    }
+
+    let mut parts = split(script).ok()?;
+    if parts.len() < 2 || parts[0] != "./risedev" || parts[1] != "ctl" {
+        return None;
+    }
+    Some(parts.split_off(2))
+}
+
+fn command_output(exit_code: i32, stderr: Vec<u8>) -> std::process::Output {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: vec![],
+            stderr,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        unimplemented!("simulation mode does not support non-unix platforms")
     }
 }
 
@@ -184,12 +195,12 @@ impl sqllogictest::AsyncDB for RisingWave {
                         match row.get(i) {
                             Some(v) => {
                                 if v.is_empty() {
-                                    row_vec.push("(empty)".to_string());
+                                    row_vec.push("(empty)".to_owned());
                                 } else {
-                                    row_vec.push(v.to_string());
+                                    row_vec.push(v.to_owned());
                                 }
                             }
-                            None => row_vec.push("NULL".to_string()),
+                            None => row_vec.push("NULL".to_owned()),
                         }
                     }
                 }
@@ -212,6 +223,8 @@ impl sqllogictest::AsyncDB for RisingWave {
         }
     }
 
+    async fn shutdown(&mut self) {}
+
     fn engine_name(&self) -> &str {
         "risingwave"
     }
@@ -220,7 +233,28 @@ impl sqllogictest::AsyncDB for RisingWave {
         tokio::time::sleep(dur).await
     }
 
-    async fn run_command(_command: std::process::Command) -> std::io::Result<std::process::Output> {
+    async fn run_command(command: std::process::Command) -> std::io::Result<std::process::Output> {
+        if let Some(ctl_args) = parse_risedev_ctl_args(&command) {
+            let output = match start_ctl(ctl_args).await {
+                Ok(()) => command_output(0, vec![]),
+                Err(err) => command_output(1, format!("{err:#}\n").into_bytes()),
+            };
+            return Ok(output);
+        }
         unimplemented!("spawning process is not supported in simulation mode")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_output_uses_exit_code_and_stderr() {
+        let output = command_output(1, b"ctl failed\n".to_vec());
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.stderr, b"ctl failed\n");
     }
 }

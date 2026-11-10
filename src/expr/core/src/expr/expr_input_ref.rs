@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ use risingwave_common::types::{DataType, Datum};
 use risingwave_pb::expr::ExprNode;
 
 use super::{BoxedExpression, Build};
-use crate::expr::Expression;
 use crate::Result;
+use crate::expr::{ExpressionInfo, SyncExpression};
 
 /// A reference to a column in input relation.
 #[derive(Debug, Clone)]
@@ -30,23 +30,24 @@ pub struct InputRefExpression {
     idx: usize,
 }
 
-#[async_trait::async_trait]
-impl Expression for InputRefExpression {
+impl ExpressionInfo for InputRefExpression {
     fn return_type(&self) -> DataType {
         self.return_type.clone()
     }
 
-    async fn eval(&self, input: &DataChunk) -> Result<ArrayRef> {
+    fn input_ref_index(&self) -> Option<usize> {
+        Some(self.idx)
+    }
+}
+
+impl SyncExpression for InputRefExpression {
+    fn eval(&self, input: &DataChunk) -> Result<ArrayRef> {
         Ok(input.column_at(self.idx).clone())
     }
 
-    async fn eval_row(&self, input: &OwnedRow) -> Result<Datum> {
+    fn eval_row(&self, input: &OwnedRow) -> Result<Datum> {
         let cell = input.index(self.idx).as_ref().cloned();
         Ok(cell)
-    }
-
-    fn input_ref_index(&self) -> Option<usize> {
-        Some(self.idx)
     }
 }
 
@@ -91,7 +92,7 @@ mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::{DataType, Datum};
 
-    use crate::expr::{Expression, InputRefExpression};
+    use crate::expr::{InputRefExpression, SyncExpression};
 
     #[tokio::test]
     async fn test_eval_row_input_ref() {
@@ -100,7 +101,7 @@ mod tests {
 
         for (i, expected) in datums.iter().enumerate() {
             let expr = InputRefExpression::new(DataType::Int32, i);
-            let result = expr.eval_row(&input_row).await.unwrap();
+            let result = expr.eval_row(&input_row).unwrap();
             assert_eq!(*expected, result);
         }
     }

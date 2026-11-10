@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,10 +13,8 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 use std::{fmt, vec};
 
-use fixedbitset::FixedBitSet;
 use itertools::{Either, Itertools};
 use pretty_xmlish::{Pretty, StrAssocArr};
 use risingwave_common::catalog::{Field, FieldDisplay, Schema};
@@ -24,24 +22,27 @@ use risingwave_common::types::DataType;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::{ColumnOrder, ColumnOrderDisplay, OrderType};
 use risingwave_common::util::value_encoding::DatumToProtoExt;
-use risingwave_expr::aggregate::{agg_kinds, AggKind};
-use risingwave_expr::sig::{FuncBuilder, FUNCTION_REGISTRY};
+use risingwave_expr::aggregate::{AggType, PbAggKind, agg_types};
+use risingwave_expr::sig::{FUNCTION_REGISTRY, FuncBuilder};
 use risingwave_pb::expr::{PbAggCall, PbConstant};
-use risingwave_pb::stream_plan::{agg_call_state, AggCallState as AggCallStatePb};
+use risingwave_pb::stream_plan::{AggCallState as PbAggCallState, agg_call_state};
 
 use super::super::utils::TableCatalogBuilder;
-use super::{impl_distill_unit_from_fields, stream, GenericPlanNode, GenericPlanRef};
-use crate::catalog::function_catalog::FunctionCatalog;
+use super::{GenericPlanNode, GenericPlanRef, PhysicalPlanRef, impl_distill_unit_from_fields};
+use crate::TableCatalog;
+use crate::error::{ErrorCode, Result};
 use crate::expr::{Expr, ExprRewriter, ExprVisitor, InputRef, InputRefDisplay, Literal};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
-use crate::optimizer::plan_node::batch::BatchPlanRef;
-use crate::optimizer::property::{Distribution, FunctionalDependencySet, RequiredDist};
+use crate::optimizer::plan_node::batch::BatchPlanNodeMetadata;
+use crate::optimizer::plan_node::{BatchPlanRef, StreamPlanNodeMetadata, StreamPlanRef};
+use crate::optimizer::property::{
+    Distribution, FunctionalDependencySet, RequiredDist, WatermarkColumns,
+};
 use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::utils::{
     ColIndexMapping, ColIndexMappingRewriteExt, Condition, ConditionDisplay, IndexRewriter,
     IndexSet,
 };
-use crate::TableCatalog;
 
 /// [`Agg`] groups input data by their group key and computes aggregation functions.
 ///
@@ -59,6 +60,16 @@ pub struct Agg<PlanRef> {
 }
 
 impl<PlanRef: GenericPlanRef> Agg<PlanRef> {
+    pub(crate) fn clone_with_input<OtherPlanRef>(&self, input: OtherPlanRef) -> Agg<OtherPlanRef> {
+        Agg {
+            agg_calls: self.agg_calls.clone(),
+            group_key: self.group_key.clone(),
+            grouping_sets: self.grouping_sets.clone(),
+            input,
+            enable_two_phase: self.enable_two_phase,
+        }
+    }
+
     pub(crate) fn rewrite_exprs(&mut self, r: &mut dyn ExprRewriter) {
         self.agg_calls.iter_mut().for_each(|call| {
             call.filter = call.filter.clone().rewrite_expr(r);
@@ -106,13 +117,16 @@ impl<PlanRef: GenericPlanRef> Agg<PlanRef> {
         self.two_phase_agg_enabled()
             && !self.agg_calls.is_empty()
             && self.agg_calls.iter().all(|call| {
-                let agg_kind_ok = !matches!(call.agg_kind, agg_kinds::simply_cannot_two_phase!());
-                let order_ok = matches!(call.agg_kind, agg_kinds::result_unaffected_by_order_by!())
-                    || call.order_by.is_empty();
+                let agg_type_ok = !matches!(call.agg_type, agg_types::simply_cannot_two_phase!());
+                let order_ok = matches!(
+                    call.agg_type,
+                    agg_types::result_unaffected_by_order_by!()
+                        | AggType::Builtin(PbAggKind::ApproxPercentile)
+                ) || call.order_by.is_empty();
                 let distinct_ok =
-                    matches!(call.agg_kind, agg_kinds::result_unaffected_by_distinct!())
+                    matches!(call.agg_type, agg_types::result_unaffected_by_distinct!())
                         || !call.distinct;
-                agg_kind_ok && order_ok && distinct_ok
+                agg_type_ok && order_ok && distinct_ok
             })
     }
 
@@ -133,16 +147,47 @@ impl<PlanRef: GenericPlanRef> Agg<PlanRef> {
     /// See if all stream aggregation calls have a stateless local agg counterpart.
     pub(crate) fn all_local_aggs_are_stateless(&self, stream_input_append_only: bool) -> bool {
         self.agg_calls.iter().all(|c| {
-            matches!(c.agg_kind, agg_kinds::single_value_state!())
-                || (matches!(c.agg_kind, agg_kinds::single_value_state_iff_in_append_only!() if stream_input_append_only))
+            matches!(c.agg_type, agg_types::single_value_state!())
+                || (matches!(c.agg_type, agg_types::single_value_state_iff_in_append_only!() if stream_input_append_only))
         })
     }
 
-    pub(crate) fn watermark_group_key(&self, input_watermark_columns: &FixedBitSet) -> Vec<usize> {
-        self.group_key
+    pub(crate) fn eowc_window_column(
+        &self,
+        input_watermark_columns: &WatermarkColumns,
+    ) -> Result<usize> {
+        let group_key_with_wtmk = self
+            .group_key
             .indices()
-            .filter(|&idx| input_watermark_columns.contains(idx))
-            .collect()
+            .filter_map(|idx| {
+                input_watermark_columns
+                    .get_group(idx)
+                    .map(|group| (idx, group))
+            })
+            .collect::<Vec<_>>();
+
+        if group_key_with_wtmk.is_empty() {
+            return Err(ErrorCode::NotSupported(
+                "Emit-On-Window-Close mode requires a watermark column in GROUP BY.".to_owned(),
+                "Please try to GROUP BY a watermark column".to_owned(),
+            )
+            .into());
+        }
+        if group_key_with_wtmk.len() == 1
+            || group_key_with_wtmk
+                .iter()
+                .map(|(_, group)| group)
+                .all_equal()
+        {
+            // 1. only one watermark column, should be the window column
+            // 2. all watermark columns belong to the same group, choose the first one as the window column
+            return Ok(group_key_with_wtmk[0].0);
+        }
+        Err(ErrorCode::NotSupported(
+            "Emit-On-Window-Close mode requires that watermark columns in GROUP BY are derived from the same upstream column.".to_owned(),
+            "Please try to remove undesired columns from GROUP BY".to_owned(),
+        )
+        .into())
     }
 
     pub fn new(agg_calls: Vec<PlanAggCall>, group_key: IndexSet, input: PlanRef) -> Self {
@@ -167,7 +212,7 @@ impl<PlanRef: GenericPlanRef> Agg<PlanRef> {
     }
 }
 
-impl<PlanRef: BatchPlanRef> Agg<PlanRef> {
+impl Agg<BatchPlanRef> {
     // Check if the input is already sorted on group keys.
     pub(crate) fn input_provides_order_on_group_keys(&self) -> bool {
         let mut input_order_prefix = IndexSet::empty();
@@ -229,8 +274,8 @@ pub enum AggCallState {
 }
 
 impl AggCallState {
-    pub fn into_prost(self, state: &mut BuildFragmentGraphState) -> AggCallStatePb {
-        AggCallStatePb {
+    pub fn into_prost(self, state: &mut BuildFragmentGraphState) -> PbAggCallState {
+        PbAggCallState {
             inner: Some(match self {
                 AggCallState::Value => {
                     agg_call_state::Inner::ValueState(agg_call_state::ValueState {})
@@ -273,10 +318,10 @@ pub struct MaterializedInputState {
     pub order_columns: Vec<ColumnOrder>,
 }
 
-impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
+impl Agg<StreamPlanRef> {
     pub fn infer_tables(
         &self,
-        me: impl stream::StreamPlanRef,
+        me: impl StreamPlanNodeMetadata,
         vnode_col_idx: Option<usize>,
         window_col_idx: Option<usize>,
     ) -> (
@@ -348,12 +393,12 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
     /// Infer `AggCallState`s for streaming agg.
     pub fn infer_stream_agg_state(
         &self,
-        me: impl stream::StreamPlanRef,
+        me: impl StreamPlanNodeMetadata,
         vnode_col_idx: Option<usize>,
         window_col_idx: Option<usize>,
     ) -> Vec<AggCallState> {
         let in_fields = self.input.schema().fields().to_vec();
-        let in_pks = self.input.stream_key().unwrap().to_vec();
+        let in_pks = self.input.expect_stream_key().to_vec();
         let in_append_only = self.input.append_only();
         let in_dist_key = self.input.distribution().dist_column_indices().to_vec();
 
@@ -412,37 +457,36 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
 
         self.agg_calls
             .iter()
-            .map(|agg_call| match agg_call.agg_kind {
-                agg_kinds::single_value_state_iff_in_append_only!() if in_append_only => {
+            .map(|agg_call| match agg_call.agg_type {
+                agg_types::single_value_state_iff_in_append_only!() if in_append_only => {
                     AggCallState::Value
                 }
-                agg_kinds::single_value_state!() => AggCallState::Value,
-                AggKind::Min
-                | AggKind::Max
-                | AggKind::FirstValue
-                | AggKind::LastValue
-                | AggKind::StringAgg
-                | AggKind::ArrayAgg
-                | AggKind::JsonbAgg
-                | AggKind::JsonbObjectAgg => {
+                agg_types::single_value_state!() => AggCallState::Value,
+                agg_types::materialized_input_state!() => {
                     // columns with order requirement in state table
                     let sort_keys = {
-                        match agg_call.agg_kind {
-                            AggKind::Min => {
+                        match agg_call.agg_type {
+                            AggType::Builtin(PbAggKind::Min) => {
                                 vec![(OrderType::ascending(), agg_call.inputs[0].index)]
                             }
-                            AggKind::Max => {
+                            AggType::Builtin(PbAggKind::Max) => {
                                 vec![(OrderType::descending(), agg_call.inputs[0].index)]
                             }
-                            AggKind::FirstValue
-                            | AggKind::LastValue
-                            | AggKind::StringAgg
-                            | AggKind::ArrayAgg
-                            | AggKind::JsonbAgg => {
+                            AggType::Builtin(
+                                PbAggKind::FirstValue
+                                | PbAggKind::LastValue
+                                | PbAggKind::StringAgg
+                                | PbAggKind::ArrayAgg
+                                | PbAggKind::JsonbAgg
+                                | PbAggKind::PercentileCont
+                                | PbAggKind::PercentileDisc
+                                | PbAggKind::Mode,
+                            )
+                            | AggType::WrapScalar(_) => {
                                 if agg_call.order_by.is_empty() {
                                     me.ctx().warn_to_user(format!(
                                         "{} without ORDER BY may produce non-deterministic result",
-                                        agg_call.agg_kind,
+                                        agg_call.agg_type,
                                     ));
                                 }
                                 agg_call
@@ -450,7 +494,10 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
                                     .iter()
                                     .map(|o| {
                                         (
-                                            if agg_call.agg_kind == AggKind::LastValue {
+                                            if matches!(
+                                                agg_call.agg_type,
+                                                AggType::Builtin(PbAggKind::LastValue)
+                                            ) {
                                                 o.order_type.reverse()
                                             } else {
                                                 o.order_type
@@ -460,7 +507,7 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
                                     })
                                     .collect()
                             }
-                            AggKind::JsonbObjectAgg => agg_call
+                            AggType::Builtin(PbAggKind::JsonbObjectAgg) => agg_call
                                 .order_by
                                 .iter()
                                 .map(|o| (o.order_type, o.column_index))
@@ -480,13 +527,20 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
                     };
 
                     // other columns that should be contained in state table
-                    let include_keys = match agg_call.agg_kind {
-                        AggKind::FirstValue
-                        | AggKind::LastValue
-                        | AggKind::StringAgg
-                        | AggKind::ArrayAgg
-                        | AggKind::JsonbAgg
-                        | AggKind::JsonbObjectAgg => {
+                    let include_keys = match agg_call.agg_type {
+                        // `agg_types::materialized_input_state` except for `min`/`max`
+                        AggType::Builtin(
+                            PbAggKind::FirstValue
+                            | PbAggKind::LastValue
+                            | PbAggKind::StringAgg
+                            | PbAggKind::ArrayAgg
+                            | PbAggKind::JsonbAgg
+                            | PbAggKind::JsonbObjectAgg
+                            | PbAggKind::PercentileCont
+                            | PbAggKind::PercentileDisc
+                            | PbAggKind::Mode,
+                        )
+                        | AggType::WrapScalar(_) => {
                             agg_call.inputs.iter().map(|i| i.index).collect()
                         }
                         _ => vec![],
@@ -495,11 +549,13 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
                     let state = gen_materialized_input_state(sort_keys, extra_keys, include_keys);
                     AggCallState::MaterializedInput(Box::new(state))
                 }
-                agg_kinds::rewritten!() => {
+                agg_types::rewritten!() => {
                     unreachable!("should have been rewritten")
                 }
-                agg_kinds::unimplemented_in_stream!() => {
-                    unreachable!("should have been banned")
+                AggType::Builtin(
+                    PbAggKind::Unspecified | PbAggKind::UserDefined | PbAggKind::WrapScalar,
+                ) => {
+                    unreachable!("invalid agg kind")
                 }
             })
             .collect()
@@ -522,14 +578,21 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
             .iter()
             .zip_eq_fast(&mut out_fields[self.group_key.len()..])
         {
-            if agg_call.agg_kind == AggKind::UserDefined {
-                // for user defined aggregate, the state type is always BYTEA
-                field.data_type = DataType::Bytea;
-                continue;
-            }
+            let agg_kind = match agg_call.agg_type {
+                AggType::UserDefined(_) => {
+                    // for user defined aggregate, the state type is always BYTEA
+                    field.data_type = DataType::Bytea;
+                    continue;
+                }
+                AggType::WrapScalar(_) => {
+                    // for wrapped scalar function, the state is always NULL
+                    continue;
+                }
+                AggType::Builtin(kind) => kind,
+            };
             let sig = FUNCTION_REGISTRY
                 .get(
-                    agg_call.agg_kind,
+                    agg_kind,
                     &agg_call
                         .inputs
                         .iter()
@@ -627,8 +690,6 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
                     table_builder.add_column(&Field {
                         data_type: DataType::Int64,
                         name: format!("count_for_agg_call_{}", call_index),
-                        sub_fields: vec![],
-                        type_name: String::default(),
                     });
                 }
                 table_builder
@@ -644,7 +705,9 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
             })
             .collect()
     }
+}
 
+impl<PlanRef: GenericPlanRef> Agg<PlanRef> {
     pub fn decompose(self) -> (Vec<PlanAggCall>, IndexSet, Vec<IndexSet>, PlanRef, bool) {
         (
             self.agg_calls,
@@ -681,15 +744,15 @@ impl<PlanRef: stream::StreamPlanRef> Agg<PlanRef> {
     }
 }
 
-impl_distill_unit_from_fields!(Agg, stream::StreamPlanRef);
+impl_distill_unit_from_fields!(Agg, GenericPlanRef);
 
 /// Rewritten version of [`crate::expr::AggCall`] which uses `InputRef` instead of `ExprImpl`.
 /// Refer to [`crate::optimizer::plan_node::logical_agg::LogicalAggBuilder::try_rewrite_agg_call`]
 /// for more details.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PlanAggCall {
-    /// Kind of aggregation function
-    pub agg_kind: AggKind,
+    /// Type of aggregation function
+    pub agg_type: AggType,
 
     /// Data type of the returned column
     pub return_type: DataType,
@@ -710,14 +773,11 @@ pub struct PlanAggCall {
     /// `filter` evaluates to `true` will be fed to the aggregate function.
     pub filter: Condition,
     pub direct_args: Vec<Literal>,
-
-    /// Catalog of user defined aggregate function.
-    pub user_defined: Option<Arc<FunctionCatalog>>,
 }
 
 impl fmt::Debug for PlanAggCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.agg_kind)?;
+        write!(f, "{}", self.agg_type)?;
         if !self.inputs.is_empty() {
             write!(f, "(")?;
             for (idx, input) in self.inputs.iter().enumerate() {
@@ -765,14 +825,30 @@ impl PlanAggCall {
         });
     }
 
-    pub fn to_protobuf(&self) -> PbAggCall {
-        PbAggCall {
-            r#type: self.agg_kind.to_protobuf().into(),
+    /// Serialize the aggregate call. Returns an error if the filter contains an impure expression
+    /// on a retract stream, which may lead to inconsistent results.
+    pub fn to_protobuf_checked_pure(&self, retract: bool) -> crate::error::Result<PbAggCall> {
+        Ok(PbAggCall {
+            kind: match &self.agg_type {
+                AggType::Builtin(kind) => *kind,
+                AggType::UserDefined(_) => PbAggKind::UserDefined,
+                AggType::WrapScalar(_) => PbAggKind::WrapScalar,
+            }
+            .into(),
             return_type: Some(self.return_type.to_protobuf()),
             args: self.inputs.iter().map(InputRef::to_proto).collect(),
             distinct: self.distinct,
-            order_by: self.order_by.iter().map(ColumnOrder::to_protobuf).collect(),
-            filter: self.filter.as_expr_unless_true().map(|x| x.to_expr_proto()),
+            order_by: self
+                .order_by
+                .iter()
+                .copied()
+                .map(ColumnOrder::to_protobuf)
+                .collect(),
+            filter: self
+                .filter
+                .as_expr_unless_true()
+                .map(|x| x.to_expr_proto_checked_pure(retract, "AGGREGATE FILTER condition"))
+                .transpose()?,
             direct_args: self
                 .direct_args
                 .iter()
@@ -781,17 +857,28 @@ impl PlanAggCall {
                     r#type: Some(x.return_type().to_protobuf()),
                 })
                 .collect(),
-            udf: self.user_defined.as_ref().map(|c| c.as_ref().into()),
-        }
+            udf: match &self.agg_type {
+                AggType::UserDefined(udf) => Some(udf.clone()),
+                _ => None,
+            },
+            scalar: match &self.agg_type {
+                AggType::WrapScalar(expr) => Some(expr.clone()),
+                _ => None,
+            },
+        })
+    }
+
+    pub fn to_protobuf(&self) -> PbAggCall {
+        self.to_protobuf_checked_pure(false).unwrap()
     }
 
     pub fn partial_to_total_agg_call(&self, partial_output_idx: usize) -> PlanAggCall {
-        let total_agg_kind = self
-            .agg_kind
+        let total_agg_type = self
+            .agg_type
             .partial_to_total()
             .expect("unsupported kinds shouldn't get here");
         PlanAggCall {
-            agg_kind: total_agg_kind,
+            agg_type: total_agg_type,
             inputs: vec![InputRef::new(partial_output_idx, self.return_type.clone())],
             order_by: vec![], // order must make no difference when we use 2-phase agg
             filter: Condition::true_cond(),
@@ -801,14 +888,13 @@ impl PlanAggCall {
 
     pub fn count_star() -> Self {
         PlanAggCall {
-            agg_kind: AggKind::Count,
+            agg_type: PbAggKind::Count.into(),
             return_type: DataType::Int64,
             inputs: vec![],
             distinct: false,
             order_by: vec![],
             filter: Condition::true_cond(),
             direct_args: vec![],
-            user_defined: None,
         }
     }
 
@@ -830,7 +916,7 @@ pub struct PlanAggCallDisplay<'a> {
 impl fmt::Debug for PlanAggCallDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let that = self.plan_agg_call;
-        write!(f, "{}", that.agg_kind)?;
+        write!(f, "{}", that.agg_type)?;
         if !that.inputs.is_empty() {
             write!(f, "(")?;
             for (idx, input) in that.inputs.iter().enumerate() {

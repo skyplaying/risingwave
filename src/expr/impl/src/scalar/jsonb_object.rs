@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use jsonbb::Builder;
-use risingwave_common::types::{JsonbVal, ListRef};
+use risingwave_common::types::ListRef;
 use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 /// Builds a JSON object out of a text array.
 ///
@@ -44,32 +43,31 @@ use risingwave_expr::{function, ExprError, Result};
 /// {"a": null}
 /// ```
 #[function("jsonb_object(varchar[]) -> jsonb")]
-fn jsonb_object_1d(array: ListRef<'_>) -> Result<JsonbVal> {
+fn jsonb_object_1d(array: ListRef<'_>, writer: &mut jsonbb::Builder) -> Result<()> {
     if array.len() % 2 == 1 {
         return Err(ExprError::InvalidParam {
             name: "array",
             reason: "array must have even number of elements".into(),
         });
     }
-    let mut builder = Builder::<Vec<u8>>::new();
-    builder.begin_object();
+    writer.begin_object();
     for [key, value] in array.iter().array_chunks() {
         match key {
-            Some(s) => builder.add_string(s.into_utf8()),
+            Some(s) => writer.add_string(s.into_utf8()),
             None => {
                 return Err(ExprError::InvalidParam {
                     name: "array",
                     reason: "null value not allowed for object key".into(),
-                })
+                });
             }
         }
         match value {
-            Some(s) => builder.add_string(s.into_utf8()),
-            None => builder.add_null(),
+            Some(s) => writer.add_string(s.into_utf8()),
+            None => writer.add_null(),
         }
     }
-    builder.end_object();
-    Ok(builder.finish().into())
+    writer.end_object();
+    Ok(())
 }
 
 /// Builds a JSON object out of a text array.
@@ -87,17 +85,15 @@ fn jsonb_object_1d(array: ListRef<'_>) -> Result<JsonbVal> {
 /// ----
 /// {"a": "1", "b": "def", "c": "3.5"}
 ///
-/// # FIXME: `null` should be parsed as a null value instead of a "null" string.
-/// # query error null value not allowed for object key
-/// # select jsonb_object('{{a, 1}, {null, "def"}, {c, 3.5}}' :: text[][]);
+/// query error null value not allowed for object key
+/// select jsonb_object('{{a, 1}, {null, "def"}, {c, 3.5}}' :: text[][]);
 ///
 /// query error array must have two columns
 /// select jsonb_object('{{a, 1, 2}, {b, "def"}, {c, 3.5}}' :: text[][]);
 /// ```
 #[function("jsonb_object(varchar[][]) -> jsonb")]
-fn jsonb_object_2d(array: ListRef<'_>) -> Result<JsonbVal> {
-    let mut builder = Builder::<Vec<u8>>::new();
-    builder.begin_object();
+fn jsonb_object_2d(array: ListRef<'_>, writer: &mut jsonbb::Builder) -> Result<()> {
+    writer.begin_object();
     for kv in array.iter() {
         let Some(kv) = kv else {
             return Err(ExprError::InvalidParam {
@@ -113,21 +109,21 @@ fn jsonb_object_2d(array: ListRef<'_>) -> Result<JsonbVal> {
             });
         }
         match kv.get(0).unwrap() {
-            Some(s) => builder.add_string(s.into_utf8()),
+            Some(s) => writer.add_string(s.into_utf8()),
             None => {
                 return Err(ExprError::InvalidParam {
                     name: "array",
                     reason: "null value not allowed for object key".into(),
-                })
+                });
             }
         }
         match kv.get(1).unwrap() {
-            Some(s) => builder.add_string(s.into_utf8()),
-            None => builder.add_null(),
+            Some(s) => writer.add_string(s.into_utf8()),
+            None => writer.add_null(),
         }
     }
-    builder.end_object();
-    Ok(builder.finish().into())
+    writer.end_object();
+    Ok(())
 }
 
 /// This form of `jsonb_object` takes keys and values pairwise from separate text arrays.
@@ -144,35 +140,37 @@ fn jsonb_object_2d(array: ListRef<'_>) -> Result<JsonbVal> {
 /// query error mismatched array dimensions
 /// select jsonb_object('{a,b}', '{1,2,3}');
 ///
-/// # FIXME: `null` should be parsed as a null value instead of a "null" string.
-/// # query error null value not allowed for object key
-/// # select jsonb_object('{a,null}', '{1,2}');
+/// query error null value not allowed for object key
+/// select jsonb_object('{a,null}', '{1,2}');
 /// ```
 #[function("jsonb_object(varchar[], varchar[]) -> jsonb")]
-fn jsonb_object_kv(keys: ListRef<'_>, values: ListRef<'_>) -> Result<JsonbVal> {
+fn jsonb_object_kv(
+    keys: ListRef<'_>,
+    values: ListRef<'_>,
+    writer: &mut jsonbb::Builder,
+) -> Result<()> {
     if keys.len() != values.len() {
         return Err(ExprError::InvalidParam {
             name: "values",
             reason: "mismatched array dimensions".into(),
         });
     }
-    let mut builder = Builder::<Vec<u8>>::new();
-    builder.begin_object();
+    writer.begin_object();
     for (key, value) in keys.iter().zip_eq_fast(values.iter()) {
         match key {
-            Some(s) => builder.add_string(s.into_utf8()),
+            Some(s) => writer.add_string(s.into_utf8()),
             None => {
                 return Err(ExprError::InvalidParam {
                     name: "keys",
                     reason: "null value not allowed for object key".into(),
-                })
+                });
             }
         }
         match value {
-            Some(s) => builder.add_string(s.into_utf8()),
-            None => builder.add_null(),
+            Some(s) => writer.add_string(s.into_utf8()),
+            None => writer.add_null(),
         }
     }
-    builder.end_object();
-    Ok(builder.finish().into())
+    writer.end_object();
+    Ok(())
 }

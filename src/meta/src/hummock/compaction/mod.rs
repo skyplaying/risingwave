@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,30 +15,38 @@
 #![expect(clippy::arc_with_non_send_sync, reason = "FIXME: later")]
 
 pub mod compaction_config;
+pub(crate) mod in_progress_compaction;
 mod overlap_strategy;
-use risingwave_common::catalog::TableOption;
-use risingwave_pb::hummock::compact_task::{self, TaskType};
+use risingwave_common::catalog::{TableId, TableOption};
+use risingwave_hummock_sdk::compact_task::CompactTask;
+use risingwave_hummock_sdk::level::Levels;
+use risingwave_pb::hummock::compact_task::{self};
 
 mod picker;
 pub mod selector;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use picker::{LevelCompactionPicker, TierCompactionPicker};
-use risingwave_hummock_sdk::{can_concat, CompactionGroupId, HummockCompactionTaskId};
+use risingwave_hummock_sdk::filter_utils::{
+    must_resolve_sstable_filter_layout, must_resolve_sstable_filter_type,
+};
+use risingwave_hummock_sdk::table_watermark::TableWatermarks;
+use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
+use risingwave_hummock_sdk::{CompactionGroupId, HummockCompactionTaskId};
 use risingwave_pb::hummock::compaction_config::CompactionMode;
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::{CompactTask, CompactionConfig, LevelType};
-pub use selector::CompactionSelector;
+use risingwave_pb::hummock::{CompactionConfig, PbSstableFilterLayout, PbSstableFilterType};
+pub use selector::{CompactionSelector, CompactionSelectorContext};
 
 use self::selector::{EmergencySelector, LocalSelectorStatistic};
-use super::check_cg_write_limit;
+use super::GroupStateValidator;
+use crate::MetaOpts;
+use crate::hummock::compaction::in_progress_compaction::InProgressCompactionView;
 use crate::hummock::compaction::overlap_strategy::{OverlapStrategy, RangeOverlapStrategy};
 use crate::hummock::compaction::picker::CompactionInput;
 use crate::hummock::level_handler::LevelHandler;
 use crate::hummock::model::CompactionGroup;
-use crate::MetaOpts;
 
 #[derive(Clone)]
 pub struct CompactStatus {
@@ -66,6 +74,8 @@ pub struct CompactionTask {
     pub input: CompactionInput,
     pub base_level: usize,
     pub compression_algorithm: String,
+    pub sstable_filter_type: PbSstableFilterType,
+    pub sstable_filter_layout: PbSstableFilterLayout,
     pub target_file_size: u64,
     pub compaction_task_type: compact_task::TaskType,
 }
@@ -89,91 +99,67 @@ impl CompactStatus {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub fn get_compact_task(
         &mut self,
         levels: &Levels,
+        member_table_ids: &BTreeSet<TableId>,
         task_id: HummockCompactionTaskId,
         group: &CompactionGroup,
         stats: &mut LocalSelectorStatistic,
-        selector: &mut Box<dyn CompactionSelector>,
-        table_id_to_options: HashMap<u32, TableOption>,
+        selector: &mut dyn CompactionSelector,
+        table_id_to_options: &HashMap<TableId, TableOption>,
         developer_config: Arc<CompactionDeveloperConfig>,
+        table_watermarks: &HashMap<TableId, Arc<TableWatermarks>>,
+        state_table_info: &HummockVersionStateTableInfo,
+        in_progress_compactions: &InProgressCompactionView,
     ) -> Option<CompactionTask> {
+        let selector_context = CompactionSelectorContext {
+            group,
+            levels,
+            member_table_ids,
+            level_handlers: &mut self.level_handlers,
+            selector_stats: stats,
+            table_id_to_options,
+            developer_config: developer_config.clone(),
+            table_watermarks,
+            state_table_info,
+            in_progress_compactions,
+        };
         // When we compact the files, we must make the result of compaction meet the following
         // conditions, for any user key, the epoch of it in the file existing in the lower
         // layer must be larger.
-        if let Some(task) = selector.pick_compaction(
-            task_id,
-            group,
-            levels,
-            &mut self.level_handlers,
-            stats,
-            table_id_to_options.clone(),
-            developer_config.clone(),
-        ) {
-            return Some(task);
-        } else {
-            let compaction_group_config = &group.compaction_config;
-            if check_cg_write_limit(levels, compaction_group_config.as_ref()).is_write_stop()
-                && compaction_group_config.enable_emergency_picker
-            {
-                return EmergencySelector::default().pick_compaction(
-                    task_id,
-                    group,
-                    levels,
-                    &mut self.level_handlers,
-                    stats,
-                    table_id_to_options,
-                    developer_config,
-                );
+        match selector.pick_compaction(task_id, selector_context) {
+            Some(task) => {
+                return Some(task);
+            }
+            _ => {
+                let compaction_group_config = &group.compaction_config;
+                let group_state =
+                    GroupStateValidator::group_state(levels, compaction_group_config.as_ref());
+                if (group_state.is_write_stop() || group_state.is_emergency())
+                    && compaction_group_config.enable_emergency_picker
+                {
+                    let selector_context = CompactionSelectorContext {
+                        group,
+                        levels,
+                        member_table_ids,
+                        level_handlers: &mut self.level_handlers,
+                        selector_stats: stats,
+                        table_id_to_options,
+                        developer_config,
+                        table_watermarks,
+                        state_table_info,
+                        in_progress_compactions,
+                    };
+                    return EmergencySelector::default().pick_compaction(task_id, selector_context);
+                }
             }
         }
 
         None
     }
 
-    pub fn is_trivial_move_task(task: &CompactTask) -> bool {
-        if task.task_type() != TaskType::Dynamic && task.task_type() != TaskType::Emergency {
-            return false;
-        }
-
-        if task.input_ssts.len() == 1 {
-            return task.input_ssts[0].level_idx == 0
-                && can_concat(&task.input_ssts[0].table_infos);
-        } else if task.input_ssts.len() != 2
-            || task.input_ssts[0].level_type() != LevelType::Nonoverlapping
-        {
-            return false;
-        }
-
-        // it may be a manual compaction task
-        if task.input_ssts[0].level_idx == task.input_ssts[1].level_idx
-            && task.input_ssts[0].level_idx > 0
-        {
-            return false;
-        }
-
-        if task.input_ssts[1].level_idx == task.target_level
-            && task.input_ssts[1].table_infos.is_empty()
-        {
-            return true;
-        }
-
-        false
-    }
-
-    pub fn is_trivial_reclaim(task: &CompactTask) -> bool {
-        let exist_table_ids = HashSet::<u32>::from_iter(task.existing_table_ids.clone());
-        task.input_ssts.iter().all(|level| {
-            level.table_infos.iter().all(|sst| {
-                sst.table_ids
-                    .iter()
-                    .all(|table_id| !exist_table_ids.contains(table_id))
-            })
-        })
-    }
-
-    /// Declares a task as either succeeded, failed or canceled.
     pub fn report_compact_task(&mut self, compact_task: &CompactTask) {
         for level in &compact_task.input_ssts {
             self.level_handlers[level.level_idx as usize].remove_task(compact_task.task_id);
@@ -201,6 +187,16 @@ pub fn create_compaction_task(
 
     CompactionTask {
         compression_algorithm: get_compression_algorithm(
+            compaction_config,
+            base_level,
+            input.target_level,
+        ),
+        sstable_filter_type: must_resolve_sstable_filter_type(
+            compaction_config,
+            base_level,
+            input.target_level,
+        ),
+        sstable_filter_layout: must_resolve_sstable_filter_layout(
             compaction_config,
             base_level,
             input.target_level,

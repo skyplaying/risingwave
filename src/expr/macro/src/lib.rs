@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lint_reasons)]
-#![feature(let_chains)]
-
 use std::vec;
 
-use context::{generate_captured_function, CaptureContextAttr, DefineContextAttr};
+use context::{CaptureContextAttr, DefineContextAttr, generate_captured_function};
 use proc_macro::TokenStream;
+use proc_macro_error::proc_macro_error;
 use proc_macro2::TokenStream as TokenStream2;
 use syn::{Error, ItemFn, Result};
 
 mod context;
-mod gen;
+mod r#gen;
 mod parse;
 mod types;
 mod utils;
 
 /// Defining the RisingWave SQL function from a Rust function.
 ///
-/// [Online version of this doc.](https://risingwavelabs.github.io/risingwave/risingwave_expr_macro/attr.function.html)
+/// [Online version of this doc.](https://risingwavelabs.github.io/risingwave/rustdoc/risingwave_expr_macro/attr.function.html)
 ///
 /// # Table of Contents
 ///
@@ -44,7 +42,7 @@ mod utils;
 ///     - [Return Value](#return-value)
 ///     - [Variadic Function](#variadic-function)
 ///     - [Optimization](#optimization)
-///     - [Functions Returning Strings](#functions-returning-strings)
+///     - [Writer Style Function](#writer-style-function)
 ///     - [Preprocessing Constant Arguments](#preprocessing-constant-arguments)
 ///     - [Context](#context)
 ///     - [Async Function](#async-function)
@@ -70,8 +68,8 @@ mod utils;
 /// name ( [arg_types],* [...] ) [ -> [setof] return_type ]
 /// ```
 ///
-/// Where `name` is the function name in `snake_case`, which must match the function name defined
-/// in `prost`.
+/// Where `name` is the function name in `snake_case`, which must match the function name (in `UPPER_CASE`) defined
+/// in `proto/expr.proto`.
 ///
 /// `arg_types` is a comma-separated list of argument types. The allowed data types are listed in
 /// in the `name` column of the appendix's [type matrix]. Wildcards or `auto` can also be used, as
@@ -98,7 +96,7 @@ mod utils;
 /// }
 /// ```
 ///
-/// ## Type Expansion
+/// ## Type Expansion with `*`
 ///
 /// Types can be automatically expanded to multiple types using wildcards. Here are some examples:
 ///
@@ -115,13 +113,17 @@ mod utils;
 /// #[function("cast(varchar) -> int64")]
 /// ```
 ///
-/// Please note the difference between `*` and `any`. `*` will generate a function for each type,
+/// Please note the difference between `*` and `any`: `*` will generate a function for each type,
 /// whereas `any` will only generate one function with a dynamic data type `Scalar`.
+/// This is similar to `impl T` and `dyn T` in Rust. The performance of using `*` would be much better than `any`.
+/// But we do not always prefer `*` due to better performance. In some cases, using `any` is more convenient.
+/// For example, in array functions, the element type of `ListValue` is `Scalar(Ref)Impl`.
+/// It is unnecessary to convert it from/into various `T`.
 ///
-/// ## Automatic Type Inference
+/// ## Automatic Type Inference with `auto`
 ///
 /// Correspondingly, the return type can be denoted as `auto` to be automatically inferred based on
-/// the input types. It will be inferred as the smallest type that can accommodate all input types.
+/// the input types. It will be inferred as the _smallest type_ that can accommodate all input types.
 ///
 /// For example, `#[function("add(*int, *int) -> auto")]` will be expanded to:
 ///
@@ -142,10 +144,10 @@ mod utils;
 /// #[function("neg(int64) -> int64")]
 /// ```
 ///
-/// ## Custom Type Inference Function
+/// ## Custom Type Inference Function with `type_infer`
 ///
 /// A few functions might have a return type that dynamically changes based on the input argument
-/// types, such as `unnest`.
+/// types, such as `unnest`. This is mainly for composite types like `anyarray`, `struct`, and `anymap`.
 ///
 /// In such cases, the `type_infer` option can be used to specify a function to infer the return
 /// type based on the input argument types. Its function signature is
@@ -163,7 +165,7 @@ mod utils;
 /// )]
 /// ```
 ///
-/// This type inference function will be invoked at the frontend.
+/// This type inference function will be invoked at the frontend (`infer_type_with_sigmap`).
 ///
 /// # Rust Function Signature
 ///
@@ -182,8 +184,9 @@ mod utils;
 ///
 /// ## Nullable Arguments
 ///
-/// The functions above will only be called when all arguments are not null. If null arguments need
-/// to be considered, the `Option` type can be used:
+/// The functions above will only be called when all arguments are not null.
+/// It will return null if any argument is null.
+/// If null arguments need to be considered, the `Option` type can be used:
 ///
 /// ```ignore
 /// #[function("trim_array(anyarray, int32) -> anyarray")]
@@ -192,11 +195,11 @@ mod utils;
 ///
 /// This function will be called when `n` is null, but not when `array` is null.
 ///
-/// ## Return Value
+/// ## Return `NULL`s and Errors
 ///
 /// Similarly, the return value type can be one of the following:
 ///
-/// - `T`: Indicates that a non-null value is always returned, and errors will not occur.
+/// - `T`: Indicates that a non-null value is always returned (for non-null inputs), and errors will not occur.
 /// - `Option<T>`: Indicates that a null value may be returned, but errors will not occur.
 /// - `Result<T>`: Indicates that an error may occur, but a null value will not be returned.
 /// - `Result<Option<T>>`: Indicates that a null value may be returned, and an error may also occur.
@@ -224,33 +227,41 @@ mod utils;
 ///
 /// See `risingwave_common::row::Row` for more details.
 ///
-/// ## Functions Returning Strings
+/// ## Writer Style Function
 ///
-/// For functions that return varchar types, you can also use the writer style function signature to
-/// avoid memory copying and dynamic memory allocation:
+/// For functions that return large or variable-length values (varchar, bytea, jsonb, anyarray),
+/// prefer a writer-style signature to avoid extra allocations and copying.
+///
+/// The evaluation framework uses builders and per-row writers:
+/// - Allocate a column builder for the result once.
+/// - For each row, create a writer backed by the builder (no per-row heap alloc).
+/// - Call the function with the writer so it writes the output directly into the builder.
+/// - If the call succeeds, finalize the writer; on error or null, rollback and append NULL.
+///
+/// This pattern minimizes heap allocations and copies for these types.
 ///
 /// ```ignore
 /// #[function("trim(varchar) -> varchar")]
-/// fn trim(s: &str, writer: &mut impl Write) {
+/// fn trim(s: &str, writer: &mut impl std::fmt::Write) {
 ///     writer.write_str(s.trim()).unwrap();
 /// }
 /// ```
 ///
-/// If errors may be returned, then the return value should be `Result<()>`:
+/// If the function may return an error, use `Result<()>`:
 ///
 /// ```ignore
 /// #[function("trim(varchar) -> varchar")]
-/// fn trim(s: &str, writer: &mut impl Write) -> Result<()> {
+/// fn trim(s: &str, writer: &mut impl std::fmt::Write) -> Result<()> {
 ///     writer.write_str(s.trim()).unwrap();
 ///     Ok(())
 /// }
 /// ```
 ///
-/// If null values may be returned, then the return value should be `Option<()>`:
+/// If the function may return NULL, use `Option<()>`:
 ///
 /// ```ignore
 /// #[function("trim(varchar) -> varchar")]
-/// fn trim(s: &str, writer: &mut impl Write) -> Option<()> {
+/// fn trim(s: &str, writer: &mut impl std::fmt::Write) -> Option<()> {
 ///     if s.is_empty() {
 ///         None
 ///     } else {
@@ -259,6 +270,15 @@ mod utils;
 ///     }
 /// }
 /// ```
+///
+/// Writer types:
+/// - For `varchar`: `&mut impl std::fmt::Write`
+/// - For `bytea`: `&mut impl std::io::Write`
+/// - For `jsonb`: `&mut jsonbb::Builder`
+/// - For `anyarray`: `&mut impl risingwave_common::array::ListWrite`
+///
+/// Note: Use fully-qualified trait paths (for example, `impl std::fmt::Write`).
+/// Partial or relative paths (such as `impl Write` or `impl ::std::fmt::Write`) are not recognized.
 ///
 /// ## Preprocessing Constant Arguments
 ///
@@ -402,6 +422,7 @@ mod utils;
 ///
 /// [type matrix]: #appendix-type-matrix
 #[proc_macro_attribute]
+#[proc_macro_error]
 pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     fn inner(attr: TokenStream, item: TokenStream) -> Result<TokenStream2> {
         let fn_attr: FunctionAttr = syn::parse(attr)?;
@@ -419,6 +440,16 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Different from `#[function]`, which implements the `Expression` trait for a rust scalar function,
+/// `#[build_function]` is used when you already implemented `Expression` manually.
+///
+/// The expected input is a "build" function:
+/// ```ignore
+/// fn(data_type: DataType, children: Vec<BoxedExpression>) -> Result<BoxedExpression>
+/// ```
+///
+/// It generates the function descriptor using the "build" function and
+/// registers the description to the `FUNC_SIG_MAP`.
 #[proc_macro_attribute]
 pub fn build_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     fn inner(attr: TokenStream, item: TokenStream) -> Result<TokenStream2> {
@@ -517,8 +548,8 @@ struct UserFunctionAttr {
     async_: bool,
     /// Whether contains argument `&Context`.
     context: bool,
-    /// Whether contains argument `&mut impl Write`.
-    write: bool,
+    /// The writer type kind, if any, such as `impl std::fmt::Write`.
+    writer_type_kind: Option<WriterTypeKind>,
     /// Whether the last argument type is `retract: bool`.
     retract: bool,
     /// Whether each argument type is `Option<T>`.
@@ -584,6 +615,14 @@ impl AggregateFnOrImpl {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WriterTypeKind {
+    FmtWrite,      // std::fmt::Write
+    IoWrite,       // std::io::Write
+    JsonbbBuilder, // jsonbb::Builder
+    ListWrite,     // risingwave_common::array::ListWrite
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ReturnTypeKind {
     T,
@@ -607,7 +646,7 @@ impl UserFunctionAttr {
     /// Returns true if the function is like `fn(T1, T2, .., Tn) -> T`.
     fn is_pure(&self) -> bool {
         !self.async_
-            && !self.write
+            && self.writer_type_kind.is_none()
             && !self.context
             && self.args_option.iter().all(|b| !b)
             && self.return_type_kind == ReturnTypeKind::T
@@ -619,7 +658,7 @@ impl UserFunctionAttr {
 pub fn define_context(def: TokenStream) -> TokenStream {
     fn inner(def: TokenStream) -> Result<TokenStream2> {
         let attr: DefineContextAttr = syn::parse(def)?;
-        attr.gen()
+        attr.r#gen()
     }
 
     match inner(def) {
@@ -637,6 +676,8 @@ pub fn capture_context(attr: TokenStream, item: TokenStream) -> TokenStream {
     fn inner(attr: TokenStream, item: TokenStream) -> Result<TokenStream2> {
         let attr: CaptureContextAttr = syn::parse(attr)?;
         let user_fn: ItemFn = syn::parse(item)?;
+
+        // Generate captured function
         generate_captured_function(attr, user_fn)
     }
     match inner(attr, item) {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,12 @@ import {
   HStack,
   Input,
   Select,
+  Table,
+  TableContainer,
+  Tbody,
+  Td,
   Text,
+  Tr,
   VStack,
 } from "@chakra-ui/react"
 import * as d3 from "d3"
@@ -35,26 +40,35 @@ import { parseAsInteger, useQueryState } from "nuqs"
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
 import FragmentDependencyGraph from "../components/FragmentDependencyGraph"
 import FragmentGraph from "../components/FragmentGraph"
+import TimeControls from "../components/TimeControls"
 import Title from "../components/Title"
 import useErrorToast from "../hook/useErrorToast"
 import useFetch from "../lib/api/fetch"
 import {
-  BackPressureInfo,
-  calculateBPRate,
-  fetchEmbeddedBackPressure,
-  fetchPrometheusBackPressure,
-} from "../lib/api/metric"
-import { getFragments, getStreamingJobs } from "../lib/api/streaming"
+  getFragmentsByJobId,
+  getRelationIdInfos,
+  getStreamingJobs,
+} from "../lib/api/streaming"
+import {
+  TimeParams,
+  createStreamingStatsRefresh,
+} from "../lib/api/streamingStats"
 import { FragmentBox } from "../lib/layout"
 import { TableFragments, TableFragments_Fragment } from "../proto/gen/meta"
+import {
+  ChannelDeltaStats,
+  ChannelStats,
+  FragmentStats,
+} from "../proto/gen/monitor_service"
 import { Dispatcher, MergeNode, StreamNode } from "../proto/gen/stream_plan"
 
 interface DispatcherNode {
   [actorId: number]: Dispatcher[]
+  fragment: TableFragments_Fragment
 }
 
 // Refresh interval (ms) for back pressure stats
-const INTERVAL = 5000
+const INTERVAL_MS = 5000
 
 /** Associated data of each plan node in the fragment graph, including the dispatchers. */
 export interface PlanNodeDatum {
@@ -102,15 +116,19 @@ function buildPlanNodeDependency(
     dispatcherName = "noDispatcher"
   }
 
-  const dispatcherNode = fragment.actors.reduce((obj, actor) => {
+  let dispatcherNode = fragment.actors.reduce((obj, actor) => {
     obj[actor.actorId] = actor.dispatcher
     return obj
   }, {} as DispatcherNode)
+  dispatcherNode.fragment = {
+    ...fragment,
+    actors: [],
+  }
 
-  return d3.hierarchy({
+  return d3.hierarchy<PlanNodeDatum>({
     name: dispatcherName,
     actorIds: fragment.actors.map((a) => a.actorId.toString()),
-    children: firstActor.nodes ? [hierarchyActorNode(firstActor.nodes)] : [],
+    children: fragment.nodes ? [hierarchyActorNode(fragment.nodes)] : [],
     operatorId: "dispatcher",
     node: dispatcherNode,
   })
@@ -148,16 +166,11 @@ function buildFragmentDependencyAsEdges(
     const parentIds = new Set<number>()
     const externalParentIds = new Set<number>()
 
-    for (const actor of fragment.actors) {
-      for (const upstreamActorId of actor.upstreamActorId) {
-        const upstreamFragmentId = actorToFragmentMapping.get(upstreamActorId)
-        if (upstreamFragmentId) {
-          parentIds.add(upstreamFragmentId)
-        } else {
-          for (const m of findMergeNodes(actor.nodes!)) {
-            externalParentIds.add(m.upstreamFragmentId)
-          }
-        }
+    for (const upstreamFragmentId of fragment.upstreamFragmentIds) {
+      if (fragments.fragments[upstreamFragmentId]) {
+        parentIds.add(upstreamFragmentId)
+      } else {
+        externalParentIds.add(upstreamFragmentId)
       }
     }
     nodes.push({
@@ -174,56 +187,89 @@ function buildFragmentDependencyAsEdges(
   return nodes
 }
 
-const SIDEBAR_WIDTH = 200
+const SIDEBAR_WIDTH = 225
 
-type BackPressureDataSource = "Embedded" | "Prometheus"
-const backPressureDataSources: BackPressureDataSource[] = [
-  "Embedded",
-  "Prometheus",
-]
+export class ChannelStatsSnapshot {
+  // The first fetch result.
+  // key: `<fragmentId>_<downstreamFragmentId>`
+  metrics: Map<string, ChannelStats>
 
-// The state of the embedded back pressure metrics.
-// The metrics from previous fetch are stored here to calculate the rate.
-interface EmbeddedBackPressureInfo {
-  previous: BackPressureInfo[]
-  current: BackPressureInfo[]
+  // The time of the current fetch in milliseconds. (`Date.now()`)
+  time: number
+
+  constructor(metrics: Map<string, ChannelStats>, time: number) {
+    this.metrics = metrics
+    this.time = time
+  }
+
+  getRate(initial: ChannelStatsSnapshot): Map<string, ChannelDeltaStats> {
+    const result = new Map<string, ChannelDeltaStats>()
+    for (const [key, s] of this.metrics) {
+      const init = initial.metrics.get(key)
+      if (init) {
+        const delta = this.time - initial.time // in microseconds
+        result.set(key, {
+          actorCount: s.actorCount,
+          backpressureRate:
+            (s.outputBlockingDuration - init.outputBlockingDuration) /
+            init.actorCount /
+            delta /
+            1000000,
+          recvThroughput: ((s.recvRowCount - init.recvRowCount) / delta) * 1000,
+          sendThroughput: ((s.sendRowCount - init.sendRowCount) / delta) * 1000,
+        })
+      }
+    }
+    return result
+  }
 }
 
 export default function Streaming() {
-  const { response: relationList } = useFetch(getStreamingJobs)
-  const { response: fragmentList } = useFetch(getFragments)
+  const { response: streamingJobList } = useFetch(getStreamingJobs)
+  const { response: relationIdInfos } = useFetch(getRelationIdInfos)
 
-  const [relationId, setRelationId] = useQueryState("id", parseAsInteger)
+  const [jobId, setJobId] = useQueryState("id", parseAsInteger)
   const [selectedFragmentId, setSelectedFragmentId] = useState<number>()
+  const [tableFragments, setTableFragments] = useState<TableFragments>()
+
+  const job = useMemo(
+    () => streamingJobList?.find((j) => j.id === jobId),
+    [streamingJobList, jobId]
+  )
 
   const toast = useErrorToast()
 
+  useEffect(() => {
+    if (jobId) {
+      setTableFragments(undefined)
+      getFragmentsByJobId(jobId).then((tf) => {
+        setTableFragments(tf)
+      })
+    }
+  }, [jobId])
+
   const fragmentDependencyCallback = useCallback(() => {
-    if (fragmentList) {
-      if (relationId) {
-        const fragments = fragmentList.find((x) => x.tableId === relationId)
-        if (fragments) {
-          const fragmentDep = buildFragmentDependencyAsEdges(fragments)
-          return {
-            fragments,
-            fragmentDep,
-            fragmentDepDag: dagStratify()(fragmentDep),
-          }
-        }
+    if (tableFragments) {
+      const fragmentDep = buildFragmentDependencyAsEdges(tableFragments)
+      return {
+        fragments: tableFragments,
+        fragmentDep,
+        fragmentDepDag: dagStratify()(fragmentDep),
       }
     }
-  }, [fragmentList, relationId])
+  }, [tableFragments])
 
   useEffect(() => {
-    if (relationList) {
-      if (!relationId) {
-        if (relationList.length > 0) {
-          setRelationId(relationList[0].id)
+    if (streamingJobList) {
+      if (!jobId) {
+        if (streamingJobList.length > 0) {
+          setJobId(streamingJobList[0].id)
         }
       }
     }
-  }, [relationId, relationList, setRelationId])
+  }, [jobId, streamingJobList, setJobId])
 
+  // The table fragments of the selected fragment id
   const fragmentDependency = fragmentDependencyCallback()?.fragmentDep
   const fragmentDependencyDag = fragmentDependencyCallback()?.fragmentDepDag
   const fragments = fragmentDependencyCallback()?.fragments
@@ -252,121 +298,79 @@ export default function Streaming() {
 
   const handleSearchFragment = () => {
     const searchFragIdInt = parseInt(searchFragId)
-    if (fragmentList) {
-      for (const tf of fragmentList) {
-        for (const fragmentId in tf.fragments) {
-          if (tf.fragments[fragmentId].fragmentId == searchFragIdInt) {
-            setRelationId(tf.tableId)
+    if (relationIdInfos) {
+      let map = relationIdInfos.map
+      for (const relationId in map) {
+        const fragmentIdToRelationId = map[relationId].map
+        for (const fragmentId in fragmentIdToRelationId) {
+          if (parseInt(fragmentId) == searchFragIdInt) {
+            setJobId(parseInt(relationId))
             setSelectedFragmentId(searchFragIdInt)
             return
           }
         }
       }
     }
-
     toast(new Error(`Fragment ${searchFragIdInt} not found`))
   }
 
   const handleSearchActor = () => {
     const searchActorIdInt = parseInt(searchActorId)
-    if (fragmentList) {
-      for (const tf of fragmentList) {
-        for (const fragmentId in tf.fragments) {
-          const fragment = tf.fragments[fragmentId]
-          for (const actor of fragment.actors) {
-            if (actor.actorId == searchActorIdInt) {
-              setRelationId(tf.tableId)
-              setSelectedFragmentId(fragment.fragmentId)
-              return
-            }
+    if (relationIdInfos) {
+      let map = relationIdInfos.map
+      for (const relationId in map) {
+        const fragmentIdToRelationId = map[relationId].map
+        for (const fragmentId in fragmentIdToRelationId) {
+          let actorIds = fragmentIdToRelationId[fragmentId].ids
+          if (actorIds.includes(searchActorIdInt)) {
+            setJobId(parseInt(relationId))
+            setSelectedFragmentId(parseInt(fragmentId))
+            return
           }
         }
       }
     }
-
     toast(new Error(`Actor ${searchActorIdInt} not found`))
   }
 
-  const [backPressureDataSource, setBackPressureDataSource] =
-    useState<BackPressureDataSource>("Embedded")
+  // Keep the initial snapshot to calculate the rate of back pressure
+  const [channelStats, setChannelStats] =
+    useState<Map<string, ChannelDeltaStats>>()
 
-  // Periodically fetch Prometheus back-pressure from Meta node
-  const { response: promethusMetrics } = useFetch(
-    fetchPrometheusBackPressure,
-    INTERVAL,
-    backPressureDataSource === "Prometheus"
-  )
+  const [fragmentStats, setFragmentStats] = useState<{
+    [key: number]: FragmentStats
+  }>()
 
-  // Periodically fetch embedded back-pressure from Meta node
-  // Didn't call `useFetch()` because the `setState` way is special.
-  const [embeddedBackPressureInfo, setEmbeddedBackPressureInfo] =
-    useState<EmbeddedBackPressureInfo>()
+  // Time parameters state
+  const [timeParams, setTimeParams] = useState<TimeParams>()
+
   useEffect(() => {
-    if (backPressureDataSource === "Embedded") {
-      const interval = setInterval(() => {
-        fetchEmbeddedBackPressure().then(
-          (newBP) => {
-            console.log(newBP)
-            setEmbeddedBackPressureInfo((prev) =>
-              prev
-                ? {
-                    previous: prev.current,
-                    current: newBP,
-                  }
-                : {
-                    previous: newBP, // Use current value to show zero rate, but it's fine
-                    current: newBP,
-                  }
-            )
-          },
-          (e) => {
-            console.error(e)
-            toast(e, "error")
-          }
-        )
-      }, INTERVAL)
-      return () => {
-        clearInterval(interval)
-      }
-    }
-  }, [backPressureDataSource, toast])
+    let initialSnapshot: ChannelStatsSnapshot | undefined
 
-  const backPressures = useMemo(() => {
-    if (promethusMetrics || embeddedBackPressureInfo) {
-      let map = new Map()
+    const refresh = createStreamingStatsRefresh(
+      {
+        setChannelStats,
+        setFragmentStats,
+        toast,
+      },
+      initialSnapshot,
+      "fragment",
+      timeParams
+    )
 
-      if (backPressureDataSource === "Embedded" && embeddedBackPressureInfo) {
-        const metrics = calculateBPRate(
-          embeddedBackPressureInfo.current,
-          embeddedBackPressureInfo.previous,
-          INTERVAL
-        )
-        for (const m of metrics.outputBufferBlockingDuration) {
-          map.set(
-            `${m.metric.fragmentId}_${m.metric.downstreamFragmentId}`,
-            m.sample[0].value
-          )
-        }
-      } else if (backPressureDataSource === "Prometheus" && promethusMetrics) {
-        for (const m of promethusMetrics.outputBufferBlockingDuration) {
-          if (m.sample.length > 0) {
-            // Note: We issue an instant query to Prometheus to get the most recent value.
-            // So there should be only one sample here.
-            //
-            // Due to https://github.com/risingwavelabs/risingwave/issues/15280, it's still
-            // possible that an old version of meta service returns a range-query result.
-            // So we take the one with the latest timestamp here.
-            const value = _(m.sample).maxBy((s) => s.timestamp)!.value * 100
-            map.set(
-              `${m.metric.fragment_id}_${m.metric.downstream_fragment_id}`,
-              value
-            )
-          }
-        }
-      }
-      return map
+    refresh() // run once immediately
+    const interval = setInterval(refresh, INTERVAL_MS) // and then run every interval
+    return () => {
+      clearInterval(interval)
     }
-  }, [backPressureDataSource, promethusMetrics, embeddedBackPressureInfo])
+  }, [toast, timeParams])
+
+  const handleTimeParamsChange = (timestamp?: number, offset?: number) => {
+    setTimeParams({
+      at: timestamp,
+      timeOffset: offset,
+    })
+  }
 
   const retVal = (
     <Flex p={3} height="calc(100vh - 20px)" flexDirection="column">
@@ -379,42 +383,72 @@ export default function Streaming() {
           width={SIDEBAR_WIDTH}
           height="full"
         >
+          <TimeControls onApply={handleTimeParamsChange} />
           <FormControl>
-            <FormLabel>Relations</FormLabel>
+            <FormLabel>Streaming Jobs</FormLabel>
             <Input
               list="relationList"
               spellCheck={false}
               onChange={(event) => {
-                const id = relationList?.find(
+                const id = streamingJobList?.find(
                   (x) => x.name == event.target.value
                 )?.id
                 if (id) {
-                  setRelationId(id)
+                  setJobId(id)
                 }
               }}
               placeholder="Search..."
               mb={2}
             ></Input>
             <datalist id="relationList">
-              {relationList &&
-                relationList.map((r) => (
+              {streamingJobList &&
+                streamingJobList.map((r) => (
                   <option value={r.name} key={r.id}>
                     ({r.id}) {r.name}
                   </option>
                 ))}
             </datalist>
             <Select
-              value={relationId ?? undefined}
-              onChange={(event) => setRelationId(parseInt(event.target.value))}
+              value={jobId ?? undefined}
+              onChange={(event) => setJobId(parseInt(event.target.value))}
             >
-              {relationList &&
-                relationList.map((r) => (
+              {streamingJobList &&
+                streamingJobList.map((r) => (
                   <option value={r.id} key={r.name}>
                     ({r.id}) {r.name}
                   </option>
                 ))}
             </Select>
           </FormControl>
+          {job && (
+            <FormControl>
+              <FormLabel>Information</FormLabel>
+              <TableContainer>
+                <Table size="sm">
+                  <Tbody>
+                    <Tr>
+                      <Td fontWeight="medium">Type</Td>
+                      <Td isNumeric>{job.type}</Td>
+                    </Tr>
+                    <Tr>
+                      <Td fontWeight="medium">Status</Td>
+                      <Td isNumeric>{job.jobStatus}</Td>
+                    </Tr>
+                    <Tr>
+                      <Td fontWeight="medium">Parallelism</Td>
+                      <Td isNumeric>{job.parallelism}</Td>
+                    </Tr>
+                    <Tr>
+                      <Td fontWeight="medium" paddingEnd={0}>
+                        Max Parallelism
+                      </Td>
+                      <Td isNumeric>{job.maxParallelism}</Td>
+                    </Tr>
+                  </Tbody>
+                </Table>
+              </TableContainer>
+            </FormControl>
+          )}
           <FormControl>
             <FormLabel>Goto</FormLabel>
             <VStack spacing={2}>
@@ -435,25 +469,6 @@ export default function Streaming() {
                 <Button onClick={(_) => handleSearchActor()}>Go</Button>
               </HStack>
             </VStack>
-          </FormControl>
-          <FormControl>
-            <FormLabel>Back Pressure Data Source</FormLabel>
-            <Select
-              value={backPressureDataSource}
-              onChange={(event) =>
-                setBackPressureDataSource(
-                  event.target.value as BackPressureDataSource
-                )
-              }
-              defaultValue="Embedded"
-            >
-              <option value="Embedded" key="Embedded">
-                Embedded (5 secs)
-              </option>
-              <option value="Prometheus" key="Prometheus">
-                Prometheus (1 min)
-              </option>
-            </Select>
           </FormControl>
           <Flex height="full" width="full" flexDirection="column">
             <Text fontWeight="semibold">Fragments</Text>
@@ -484,7 +499,8 @@ export default function Streaming() {
               selectedFragmentId={selectedFragmentId?.toString()}
               fragmentDependency={fragmentDependency}
               planNodeDependencies={planNodeDependencies}
-              backPressures={backPressures}
+              channelStats={channelStats}
+              fragmentStats={fragmentStats}
             />
           )}
         </Box>

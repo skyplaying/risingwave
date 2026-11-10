@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,36 +28,43 @@ use parse_display::{Display, FromStr};
 use paste::paste;
 use postgres_types::{FromSql, IsNull, ToSql, Type};
 use risingwave_common_estimate_size::{EstimateSize, ZeroHeapSize};
-use risingwave_pb::data::data_type::PbTypeName;
 use risingwave_pb::data::PbDataType;
+use risingwave_pb::data::data_type::PbTypeName;
+use rw_iter_util::ZipEqFast as _;
 use serde::{Deserialize, Serialize, Serializer};
 use strum_macros::EnumDiscriminants;
 use thiserror_ext::AsReport;
 
 use crate::array::{
-    ArrayBuilderImpl, ArrayError, ArrayResult, PrimitiveArrayItemType, NULL_VAL_FOR_HASH,
+    ArrayBuilderImpl, ArrayError, ArrayResult, NULL_VAL_FOR_HASH, PrimitiveArrayItemType,
 };
-pub use crate::array::{ListRef, ListValue, StructRef, StructValue};
+// Complex type's value is based on the array
+pub use crate::array::{
+    ListRef, ListValue, MapRef, MapValue, StructRef, StructValue, VectorRef, VectorVal,
+};
 use crate::cast::{str_to_bool, str_to_bytea};
+use crate::catalog::ColumnId;
 use crate::error::BoxedError;
 use crate::{
-    dispatch_data_types, dispatch_scalar_ref_variants, dispatch_scalar_variants,
-    for_all_scalar_variants, for_all_type_pairs,
+    dispatch_data_types, dispatch_scalar_ref_variants, dispatch_scalar_variants, for_all_variants,
 };
 
+mod cow;
 mod datetime;
 mod decimal;
 mod fields;
 mod from_sql;
 mod interval;
 mod jsonb;
+mod list_type;
 mod macros;
+mod map_type;
 mod native_type;
 mod num256;
 mod ops;
 mod ordered;
 mod ordered_float;
-mod postgres_type;
+pub mod postgres_type;
 mod scalar_impl;
 mod sentinel;
 mod serial;
@@ -67,15 +74,20 @@ mod timestamptz;
 mod to_binary;
 mod to_sql;
 mod to_text;
+mod variant;
 mod with_data_type;
 
 pub use fields::Fields;
 pub use risingwave_fields_derive::Fields;
+use risingwave_pb::id::TypedId;
 
+pub use self::cow::DatumCow;
 pub use self::datetime::{Date, Time, Timestamp};
 pub use self::decimal::{Decimal, PowError as DecimalPowError};
-pub use self::interval::{test_utils, DateTimeField, Interval, IntervalDisplay};
+pub use self::interval::{DateTimeField, Interval, IntervalDisplay, test_utils};
 pub use self::jsonb::{JsonbRef, JsonbVal};
+pub use self::list_type::ListType;
+pub use self::map_type::MapType;
 pub use self::native_type::*;
 pub use self::num256::{Int256, Int256Ref};
 pub use self::ops::{CheckedAdd, IsNegative};
@@ -87,8 +99,8 @@ pub use self::serial::Serial;
 pub use self::struct_type::StructType;
 pub use self::successor::Successor;
 pub use self::timestamptz::*;
-pub use self::to_binary::ToBinary;
 pub use self::to_text::ToText;
+pub use self::variant::{VariantPath, VariantRef, VariantVal};
 pub use self::with_data_type::WithDataType;
 
 /// A 32-bit floating point type with total order.
@@ -97,12 +109,46 @@ pub type F32 = ordered_float::OrderedFloat<f32>;
 /// A 64-bit floating point type with total order.
 pub type F64 = ordered_float::OrderedFloat<f64>;
 
+pub const DEBEZIUM_UNAVAILABLE_VALUE: &str = "__debezium_unavailable_value";
+
+// Pre-built JSON value for Debezium unavailable value to avoid rebuilding it every time
+pub static DEBEZIUM_UNAVAILABLE_JSON: std::sync::LazyLock<JsonbVal> =
+    std::sync::LazyLock::new(|| {
+        let mut builder = jsonbb::Builder::default();
+        builder.add_string(DEBEZIUM_UNAVAILABLE_VALUE);
+        JsonbVal(builder.finish())
+    });
+
+/// Magic per-element value used to build the Debezium unchanged-TOAST sentinel for
+/// pgvector columns. Picked because normal embeddings sit in a normalised range and
+/// having all elements simultaneously equal to `f32::MAX` is effectively impossible.
+pub const DEBEZIUM_UNAVAILABLE_VECTOR_ELEM: f32 = f32::MAX;
+
+/// Build a sentinel `VectorVal` of the given dimension to represent Debezium's
+/// unchanged-TOAST placeholder. The dimension must match the column's declared
+/// `vector(N)` size so it passes `check_datum_type` on the way through the
+/// `SourceStreamChunkBuilder`; the materialize executor recognises this sentinel
+/// by checking that every element equals `DEBEZIUM_UNAVAILABLE_VECTOR_ELEM`.
+pub fn debezium_unavailable_vector(size: usize) -> VectorVal {
+    VectorVal::from(
+        (0..size)
+            .map(|_| {
+                crate::array::Finite32::try_from(DEBEZIUM_UNAVAILABLE_VECTOR_ELEM)
+                    .expect("f32::MAX is finite")
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// The set of datatypes that are supported in RisingWave.
-// `EnumDiscriminants` will generate a `DataTypeName` enum with the same variants,
-// but without data fields.
-#[derive(
-    Debug, Display, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumDiscriminants, FromStr,
-)]
+///
+/// # Trait implementations
+///
+/// - `EnumDiscriminants` generates [`DataTypeName`] enum with the same variants,
+///   but without data fields.
+/// - `FromStr` is only used internally for tests.
+///   The generated implementation isn't efficient, and doesn't handle whitespaces, etc.
+#[derive(Debug, Display, Clone, PartialEq, Eq, Hash, EnumDiscriminants, FromStr)]
 #[strum_discriminants(derive(Hash, Ord, PartialOrd))]
 #[strum_discriminants(name(DataTypeName))]
 #[strum_discriminants(vis(pub))]
@@ -150,9 +196,9 @@ pub enum DataType {
     #[display("{0}")]
     #[from_str(regex = "(?i)^(?P<0>.+)$")]
     Struct(StructType),
-    #[display("{0}[]")]
-    #[from_str(regex = r"(?i)^(?P<0>.+)\[\]$")]
-    List(Box<DataType>),
+    #[display("{0}")]
+    #[from_str(regex = "(?i)^(?P<0>.+)$")]
+    List(ListType),
     #[display("bytea")]
     #[from_str(regex = "(?i)^bytea$")]
     Bytea,
@@ -165,79 +211,58 @@ pub enum DataType {
     #[display("rw_int256")]
     #[from_str(regex = "(?i)^rw_int256$")]
     Int256,
+    #[display("{0}")]
+    #[from_str(regex = "(?i)^(?P<0>.+)$")]
+    Map(MapType),
+    #[display("vector({0})")]
+    #[from_str(regex = "(?i)^vector\\((?P<0>.+)\\)$")]
+    Vector(usize),
+    #[display("variant")]
+    #[from_str(regex = "(?i)^variant$")]
+    Variant,
 }
 
-impl std::str::FromStr for Box<DataType> {
-    type Err = BoxedError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Box::new(DataType::from_str(s)?))
-    }
-}
+impl !PartialOrd for DataType {}
 
 impl ZeroHeapSize for DataType {}
 
-impl DataTypeName {
-    pub fn is_scalar(&self) -> bool {
-        match self {
-            DataTypeName::Boolean
-            | DataTypeName::Int16
-            | DataTypeName::Int32
-            | DataTypeName::Int64
-            | DataTypeName::Int256
-            | DataTypeName::Serial
-            | DataTypeName::Decimal
-            | DataTypeName::Float32
-            | DataTypeName::Float64
-            | DataTypeName::Varchar
-            | DataTypeName::Date
-            | DataTypeName::Timestamp
-            | DataTypeName::Timestamptz
-            | DataTypeName::Time
-            | DataTypeName::Bytea
-            | DataTypeName::Jsonb
-            | DataTypeName::Interval => true,
+impl TryFrom<DataTypeName> for DataType {
+    type Error = &'static str;
 
-            DataTypeName::Struct | DataTypeName::List => false,
+    fn try_from(type_name: DataTypeName) -> Result<Self, Self::Error> {
+        match type_name {
+            DataTypeName::Boolean => Ok(DataType::Boolean),
+            DataTypeName::Int16 => Ok(DataType::Int16),
+            DataTypeName::Int32 => Ok(DataType::Int32),
+            DataTypeName::Int64 => Ok(DataType::Int64),
+            DataTypeName::Int256 => Ok(DataType::Int256),
+            DataTypeName::Serial => Ok(DataType::Serial),
+            DataTypeName::Decimal => Ok(DataType::Decimal),
+            DataTypeName::Float32 => Ok(DataType::Float32),
+            DataTypeName::Float64 => Ok(DataType::Float64),
+            DataTypeName::Varchar => Ok(DataType::Varchar),
+            DataTypeName::Bytea => Ok(DataType::Bytea),
+            DataTypeName::Date => Ok(DataType::Date),
+            DataTypeName::Timestamp => Ok(DataType::Timestamp),
+            DataTypeName::Timestamptz => Ok(DataType::Timestamptz),
+            DataTypeName::Time => Ok(DataType::Time),
+            DataTypeName::Interval => Ok(DataType::Interval),
+            DataTypeName::Jsonb => Ok(DataType::Jsonb),
+            DataTypeName::Variant => Ok(DataType::Variant),
+            DataTypeName::Struct
+            | DataTypeName::List
+            | DataTypeName::Map
+            | DataTypeName::Vector => Err(
+                "Functions returning parameterized types cannot be inferred. Please use `FunctionCall::new_unchecked`.",
+            ),
         }
-    }
-
-    pub fn to_type(self) -> Option<DataType> {
-        let t = match self {
-            DataTypeName::Boolean => DataType::Boolean,
-            DataTypeName::Int16 => DataType::Int16,
-            DataTypeName::Int32 => DataType::Int32,
-            DataTypeName::Int64 => DataType::Int64,
-            DataTypeName::Int256 => DataType::Int256,
-            DataTypeName::Serial => DataType::Serial,
-            DataTypeName::Decimal => DataType::Decimal,
-            DataTypeName::Float32 => DataType::Float32,
-            DataTypeName::Float64 => DataType::Float64,
-            DataTypeName::Varchar => DataType::Varchar,
-            DataTypeName::Bytea => DataType::Bytea,
-            DataTypeName::Date => DataType::Date,
-            DataTypeName::Timestamp => DataType::Timestamp,
-            DataTypeName::Timestamptz => DataType::Timestamptz,
-            DataTypeName::Time => DataType::Time,
-            DataTypeName::Interval => DataType::Interval,
-            DataTypeName::Jsonb => DataType::Jsonb,
-            DataTypeName::Struct | DataTypeName::List => {
-                return None;
-            }
-        };
-        Some(t)
-    }
-}
-
-impl From<DataTypeName> for DataType {
-    fn from(type_name: DataTypeName) -> Self {
-        type_name.to_type().unwrap_or_else(|| panic!("Functions returning struct or list can not be inferred. Please use `FunctionCall::new_unchecked`."))
     }
 }
 
 impl From<&PbDataType> for DataType {
     fn from(proto: &PbDataType) -> DataType {
         match proto.get_type_name().expect("missing type field") {
+            PbTypeName::TypeUnspecified => unreachable!(),
             PbTypeName::Int16 => DataType::Int16,
             PbTypeName::Int32 => DataType::Int32,
             PbTypeName::Int64 => DataType::Int64,
@@ -254,18 +279,50 @@ impl From<&PbDataType> for DataType {
             PbTypeName::Interval => DataType::Interval,
             PbTypeName::Bytea => DataType::Bytea,
             PbTypeName::Jsonb => DataType::Jsonb,
+            PbTypeName::Variant => DataType::Variant,
             PbTypeName::Struct => {
                 let fields: Vec<DataType> = proto.field_type.iter().map(|f| f.into()).collect_vec();
                 let field_names: Vec<String> = proto.field_names.iter().cloned().collect_vec();
-                DataType::new_struct(fields, field_names)
+                let field_ids = (proto.field_ids.iter().copied())
+                    .map(ColumnId::new)
+                    .collect_vec();
+
+                let mut struct_type = if proto.field_names.is_empty() {
+                    StructType::unnamed(fields)
+                } else {
+                    StructType::new(field_names.into_iter().zip_eq_fast(fields))
+                };
+                // `field_ids` is used for nested-schema evolution. Cases when `field_ids` is empty:
+                //
+                // 1. The data type is not associated with a table column, so we don't need to set it.
+                // 2. The column is created before nested-schema evolution is supported, thus is using
+                //    the old serialization format and does not have field ids.
+                // 3. This is an empty struct, which is always considered alterable, and setting ids
+                //    is a no-op.
+                if !field_ids.is_empty() {
+                    struct_type = struct_type.with_ids(field_ids);
+                }
+                struct_type.into()
             }
-            PbTypeName::List => DataType::List(
+            PbTypeName::List => DataType::list(
                 // The first (and only) item is the list element type.
-                Box::new((&proto.field_type[0]).into()),
+                proto.field_type[0].clone().into(),
             ),
-            PbTypeName::TypeUnspecified => unreachable!(),
+            PbTypeName::Map => {
+                // Map is physically the same as a list.
+                // So the first (and only) item is the list element type.
+                let list_entries_type: DataType = (&proto.field_type[0]).into();
+                DataType::Map(MapType::from_entries(list_entries_type))
+            }
+            PbTypeName::Vector => DataType::Vector(proto.precision as _),
             PbTypeName::Int256 => DataType::Int256,
         }
+    }
+}
+
+impl From<PbDataType> for DataType {
+    fn from(proto: PbDataType) -> DataType {
+        DataType::from(&proto)
     }
 }
 
@@ -288,18 +345,23 @@ impl From<DataTypeName> for PbTypeName {
             DataTypeName::Decimal => PbTypeName::Decimal,
             DataTypeName::Bytea => PbTypeName::Bytea,
             DataTypeName::Jsonb => PbTypeName::Jsonb,
+            DataTypeName::Variant => PbTypeName::Variant,
             DataTypeName::Struct => PbTypeName::Struct,
             DataTypeName::List => PbTypeName::List,
             DataTypeName::Int256 => PbTypeName::Int256,
+            DataTypeName::Map => PbTypeName::Map,
+            DataTypeName::Vector => PbTypeName::Vector,
         }
     }
 }
 
-/// Convenient macros to generate match arms for [`DataType`](crate::types::DataType).
+/// Convenient macros to generate match arms for [`DataType`].
 pub mod data_types {
-    /// Numeric [`DataType`](crate::types::DataType)s supported to be `offset` of `RANGE` frame.
+    use super::DataType;
+
+    /// Numeric [`DataType`]s supported to be `offset` of `RANGE` frame.
     #[macro_export]
-    macro_rules! range_frame_numeric {
+    macro_rules! _range_frame_numeric_data_types {
         () => {
             DataType::Int16
                 | DataType::Int32
@@ -309,11 +371,11 @@ pub mod data_types {
                 | DataType::Decimal
         };
     }
-    pub use range_frame_numeric;
+    pub use _range_frame_numeric_data_types as range_frame_numeric;
 
-    /// Date/time [`DataType`](crate::types::DataType)s supported to be `offset` of `RANGE` frame.
+    /// Date/time [`DataType`]s supported to be `offset` of `RANGE` frame.
     #[macro_export]
-    macro_rules! range_frame_datetime {
+    macro_rules! _range_frame_datetime_data_types {
         () => {
             DataType::Date
                 | DataType::Time
@@ -322,10 +384,58 @@ pub mod data_types {
                 | DataType::Interval
         };
     }
-    pub use range_frame_datetime;
+    pub use _range_frame_datetime_data_types as range_frame_datetime;
+
+    /// Data types that do not have inner fields.
+    #[macro_export]
+    macro_rules! _simple_data_types {
+        () => {
+            DataType::Boolean
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal
+                | DataType::Date
+                | DataType::Varchar
+                | DataType::Time
+                | DataType::Timestamp
+                | DataType::Timestamptz
+                | DataType::Interval
+                | DataType::Bytea
+                | DataType::Jsonb
+                | DataType::Variant
+                | DataType::Serial
+                | DataType::Int256
+                | DataType::Vector(_)
+        };
+    }
+    pub use _simple_data_types as simple;
+
+    /// Data types that have inner fields.
+    #[macro_export]
+    macro_rules! _composite_data_types {
+        () => {
+            DataType::Struct { .. } | DataType::List { .. } | DataType::Map { .. }
+        };
+    }
+    pub use _composite_data_types as composite;
+
+    /// Test that all data types are covered either by `simple!()` or `composite!()`.
+    fn _simple_composite_data_types_exhausted(dt: DataType) {
+        match dt {
+            simple!() => {}
+            composite!() => {}
+        }
+    }
 }
 
 impl DataType {
+    /// Same as pgvector; unsure how it was chosen there
+    /// <https://github.com/pgvector/pgvector/blob/v0.8.0/README.md#vector-type>
+    pub const VEC_MAX_SIZE: usize = 16000;
+
     pub fn create_array_builder(&self, capacity: usize) -> ArrayBuilderImpl {
         use crate::array::*;
 
@@ -334,45 +444,59 @@ impl DataType {
         })
     }
 
+    pub fn type_name(&self) -> DataTypeName {
+        DataTypeName::from(self)
+    }
+
     pub fn prost_type_name(&self) -> PbTypeName {
-        match self {
-            DataType::Int16 => PbTypeName::Int16,
-            DataType::Int32 => PbTypeName::Int32,
-            DataType::Int64 => PbTypeName::Int64,
-            DataType::Int256 => PbTypeName::Int256,
-            DataType::Serial => PbTypeName::Serial,
-            DataType::Float32 => PbTypeName::Float,
-            DataType::Float64 => PbTypeName::Double,
-            DataType::Boolean => PbTypeName::Boolean,
-            DataType::Varchar => PbTypeName::Varchar,
-            DataType::Date => PbTypeName::Date,
-            DataType::Time => PbTypeName::Time,
-            DataType::Timestamp => PbTypeName::Timestamp,
-            DataType::Timestamptz => PbTypeName::Timestamptz,
-            DataType::Decimal => PbTypeName::Decimal,
-            DataType::Interval => PbTypeName::Interval,
-            DataType::Jsonb => PbTypeName::Jsonb,
-            DataType::Struct { .. } => PbTypeName::Struct,
-            DataType::List { .. } => PbTypeName::List,
-            DataType::Bytea => PbTypeName::Bytea,
-        }
+        self.type_name().into()
     }
 
     pub fn to_protobuf(&self) -> PbDataType {
         let mut pb = PbDataType {
             type_name: self.prost_type_name() as i32,
-            is_nullable: true,
             ..Default::default()
         };
         match self {
             DataType::Struct(t) => {
+                if !t.is_unnamed() {
+                    // To be consistent with `From<&PbDataType>`,
+                    // we only set field names when it's a named struct.
+                    pb.field_names = t.names().map(|s| s.into()).collect();
+                }
                 pb.field_type = t.types().map(|f| f.to_protobuf()).collect();
-                pb.field_names = t.names().map(|s| s.into()).collect();
+                if let Some(ids) = t.ids() {
+                    pb.field_ids = ids.map(|id| id.get_id()).collect();
+                }
             }
-            DataType::List(datatype) => {
-                pb.field_type = vec![datatype.to_protobuf()];
+            DataType::List(list) => {
+                pb.field_type = vec![list.elem().to_protobuf()];
             }
-            _ => {}
+            DataType::Map(map) => {
+                // Same as List<Struct<K,V>>
+                pb.field_type = vec![map.clone().into_struct().to_protobuf()];
+            }
+            DataType::Vector(size) => {
+                pb.precision = *size as _;
+            }
+            DataType::Boolean
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal
+            | DataType::Date
+            | DataType::Varchar
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::Timestamptz
+            | DataType::Interval
+            | DataType::Bytea
+            | DataType::Jsonb
+            | DataType::Variant
+            | DataType::Serial
+            | DataType::Int256 => (),
         }
         pb
     }
@@ -390,8 +514,14 @@ impl DataType {
         )
     }
 
-    pub fn is_scalar(&self) -> bool {
-        DataTypeName::from(self).is_scalar()
+    /// Returns whether the data type does not have inner fields.
+    pub fn is_simple(&self) -> bool {
+        matches!(self, data_types::simple!())
+    }
+
+    /// Returns whether the data type has inner fields.
+    pub fn is_composite(&self) -> bool {
+        matches!(self, data_types::composite!())
     }
 
     pub fn is_array(&self) -> bool {
@@ -400,6 +530,10 @@ impl DataType {
 
     pub fn is_struct(&self) -> bool {
         matches!(self, DataType::Struct(_))
+    }
+
+    pub fn is_map(&self) -> bool {
+        matches!(self, DataType::Map(_))
     }
 
     pub fn is_int(&self) -> bool {
@@ -415,70 +549,72 @@ impl DataType {
         }
     }
 
-    pub fn new_struct(fields: Vec<DataType>, field_names: Vec<String>) -> Self {
-        Self::Struct(StructType::from_parts(field_names, fields))
-    }
-
     pub fn as_struct(&self) -> &StructType {
         match self {
             DataType::Struct(t) => t,
-            _ => panic!("expect struct type"),
+            t => panic!("expect struct type, got {t}"),
         }
     }
 
-    /// Returns the inner type of a list type.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the type is not a list type.
-    pub fn as_list(&self) -> &DataType {
+    pub fn into_struct(self) -> StructType {
+        match self {
+            DataType::Struct(t) => t,
+            t => panic!("expect struct type, got {t}"),
+        }
+    }
+
+    pub fn as_map(&self) -> &MapType {
+        match self {
+            DataType::Map(t) => t,
+            t => panic!("expect map type, got {t}"),
+        }
+    }
+
+    pub fn into_map(self) -> MapType {
+        match self {
+            DataType::Map(t) => t,
+            t => panic!("expect map type, got {t}"),
+        }
+    }
+
+    pub fn as_list(&self) -> &ListType {
         match self {
             DataType::List(t) => t,
-            _ => panic!("expect list type"),
+            t => panic!("expect list type, got {t}"),
         }
     }
 
-    /// WARNING: Currently this should only be used in `WatermarkFilterExecutor`. Please be careful
-    /// if you want to use this.
-    pub fn min_value(&self) -> ScalarImpl {
+    pub fn into_list(self) -> ListType {
         match self {
-            DataType::Int16 => ScalarImpl::Int16(i16::MIN),
-            DataType::Int32 => ScalarImpl::Int32(i32::MIN),
-            DataType::Int64 => ScalarImpl::Int64(i64::MIN),
-            DataType::Int256 => ScalarImpl::Int256(Int256::min_value()),
-            DataType::Serial => ScalarImpl::Serial(Serial::from(i64::MIN)),
-            DataType::Float32 => ScalarImpl::Float32(F32::neg_infinity()),
-            DataType::Float64 => ScalarImpl::Float64(F64::neg_infinity()),
-            DataType::Boolean => ScalarImpl::Bool(false),
-            DataType::Varchar => ScalarImpl::Utf8("".into()),
-            DataType::Bytea => ScalarImpl::Bytea("".to_string().into_bytes().into()),
-            DataType::Date => ScalarImpl::Date(Date::MIN),
-            DataType::Time => ScalarImpl::Time(Time::from_hms_uncheck(0, 0, 0)),
-            DataType::Timestamp => ScalarImpl::Timestamp(Timestamp::MIN),
-            DataType::Timestamptz => ScalarImpl::Timestamptz(Timestamptz::MIN),
-            DataType::Decimal => ScalarImpl::Decimal(Decimal::NegativeInf),
-            DataType::Interval => ScalarImpl::Interval(Interval::MIN),
-            DataType::Jsonb => ScalarImpl::Jsonb(JsonbVal::null()), // NOT `min` #7981
-            DataType::Struct(data_types) => ScalarImpl::Struct(StructValue::new(
-                data_types
-                    .types()
-                    .map(|data_type| Some(data_type.min_value()))
-                    .collect_vec(),
-            )),
-            DataType::List(data_type) => ScalarImpl::List(ListValue::empty(data_type)),
+            DataType::List(t) => t,
+            t => panic!("expect list type, got {t}"),
         }
     }
 
-    /// Return a new type that removes the outer list.
+    /// Returns the inner element's type if `self` is a list type.
+    /// Equivalent to `self.as_list().elem()`.
+    pub fn as_list_elem(&self) -> &DataType {
+        self.as_list().elem()
+    }
+
+    /// Returns the inner element's type if `self` is a list type.
+    /// Equivalent to `self.into_list().into_elem()`.
+    pub fn into_list_elem(self) -> DataType {
+        self.into_list().into_elem()
+    }
+
+    /// Return a new type that removes the outer list, and get the innermost element type.
+    ///
+    /// Use [`DataType::as_list_elem`] if you only want the element type of a list.
     ///
     /// ```
     /// use risingwave_common::types::DataType::*;
-    /// assert_eq!(List(Box::new(Int32)).unnest_list(), &Int32);
-    /// assert_eq!(List(Box::new(List(Box::new(Int32)))).unnest_list(), &Int32);
+    /// assert_eq!(Int32.list().unnest_list(), &Int32);
+    /// assert_eq!(Int32.list().list().unnest_list(), &Int32);
     /// ```
     pub fn unnest_list(&self) -> &Self {
         match self {
-            DataType::List(inner) => inner.unnest_list(),
+            DataType::List(list) => list.elem().unnest_list(),
             _ => self,
         }
     }
@@ -488,20 +624,83 @@ impl DataType {
     pub fn array_ndims(&self) -> usize {
         let mut d = 0;
         let mut t = self;
-        while let Self::List(inner) = t {
+        while let Self::List(list) = t {
             d += 1;
-            t = inner;
+            t = list.elem();
         }
         d
     }
 
-    /// Compares the datatype with another, ignoring nested field names and metadata.
+    /// Compares the datatype with another, ignoring nested field names and ids.
     pub fn equals_datatype(&self, other: &DataType) -> bool {
         match (self, other) {
             (Self::Struct(s1), Self::Struct(s2)) => s1.equals_datatype(s2),
-            (Self::List(d1), Self::List(d2)) => d1.equals_datatype(d2),
+            (Self::List(d1), Self::List(d2)) => d1.elem().equals_datatype(d2.elem()),
+            (Self::Map(m1), Self::Map(m2)) => {
+                m1.key().equals_datatype(m2.key()) && m1.value().equals_datatype(m2.value())
+            }
             _ => self == other,
         }
+    }
+
+    /// Whether a column with this data type can be altered to a new data type. This determines
+    /// the encoding of the column data.
+    ///
+    /// Returns...
+    /// - `None`, if the data type is simple or does not contain a struct type.
+    /// - `Some(true)`, if the data type contains a struct type with field ids ([`StructType::has_ids`]).
+    /// - `Some(false)`, if the data type contains a struct type without field ids.
+    pub fn can_alter(&self) -> Option<bool> {
+        match self {
+            data_types::simple!() => None,
+            DataType::Struct(struct_type) => {
+                // As long as we meet a struct type, we can check its `ids` field to determine if
+                // it can be altered.
+                let struct_can_alter = struct_type.has_ids();
+                // In debug build, we assert that once a struct type does (or does not) have ids,
+                // all its composite fields should have the same property.
+                if cfg!(debug_assertions) {
+                    for field in struct_type.types() {
+                        if let Some(field_can_alter) = field.can_alter() {
+                            assert_eq!(struct_can_alter, field_can_alter);
+                        }
+                    }
+                }
+                Some(struct_can_alter)
+            }
+
+            DataType::List(list_type) => list_type.elem().can_alter(),
+            DataType::Map(map_type) => {
+                debug_assert!(
+                    map_type.key().is_simple(),
+                    "unexpected key type of map {map_type:?}"
+                );
+                map_type.value().can_alter()
+            }
+        }
+    }
+
+    /// Whether this type is `VARIANT` or contains a nested `VARIANT`.
+    pub fn contains_variant(&self) -> bool {
+        matches!(self, DataType::Variant)
+            || match self {
+                DataType::List(list_type) => list_type.elem().contains_variant(),
+                DataType::Struct(struct_type) => {
+                    struct_type.types().any(DataType::contains_variant)
+                }
+                DataType::Map(map_type) => {
+                    map_type.key().contains_variant() || map_type.value().contains_variant()
+                }
+                // Listed rather than `_`: a new composite type answering `false` here would slip
+                // past every VARIANT-as-key gate.
+                data_types::simple!() => false,
+            }
+    }
+}
+
+impl From<StructType> for DataType {
+    fn from(value: StructType) -> Self {
+        Self::Struct(value)
     }
 }
 
@@ -511,28 +710,36 @@ impl From<DataType> for PbDataType {
     }
 }
 
-/// Common trait bounds of scalar and scalar reference types.
-///
-/// NOTE(rc): `Hash` is not in the trait bound list, it's implemented as [`ScalarRef::hash_scalar`].
-pub trait ScalarBounds<Impl> = Debug
-    + Send
-    + Sync
-    + Clone
-    + PartialEq
-    + Eq
-    // in default ascending order
-    + PartialOrd
-    + Ord
-    + TryFrom<Impl, Error = ArrayError>
-    // `ScalarImpl`/`ScalarRefImpl`
-    + Into<Impl>;
+mod private {
+    use super::*;
+
+    // Note: put pub trait inside a private mod just makes the name private,
+    // The trait methods will still be publicly available...
+    // a.k.a. ["Voldemort type"](https://rust-lang.github.io/rfcs/2145-type-privacy.html#lint-3-voldemort-types-its-reachable-but-i-cant-name-it)
+
+    /// Common trait bounds of scalar and scalar reference types.
+    ///
+    /// NOTE(rc): `Hash` is not in the trait bound list, it's implemented as [`ScalarRef::hash_scalar`].
+    pub trait ScalarBounds<Impl> = Debug
+        + Send
+        + Sync
+        + Clone
+        + PartialEq
+        + Eq
+        // in default ascending order
+        + PartialOrd
+        + Ord
+        + TryFrom<Impl, Error = ArrayError>
+        // `ScalarImpl`/`ScalarRefImpl`
+        + Into<Impl>;
+}
 
 /// `Scalar` is a trait over all possible owned types in the evaluation
 /// framework.
 ///
 /// `Scalar` is reciprocal to `ScalarRef`. Use `as_scalar_ref` to get a
 /// reference which has the same lifetime as `self`.
-pub trait Scalar: ScalarBounds<ScalarImpl> + 'static {
+pub trait Scalar: private::ScalarBounds<ScalarImpl> + 'static {
     /// Type for reference of `Scalar`
     type ScalarRefType<'a>: ScalarRef<'a, ScalarType = Self> + 'a
     where
@@ -546,17 +753,12 @@ pub trait Scalar: ScalarBounds<ScalarImpl> + 'static {
     }
 }
 
-/// Convert an `Option<Scalar>` to corresponding `Option<ScalarRef>`.
-pub fn option_as_scalar_ref<S: Scalar>(scalar: &Option<S>) -> Option<S::ScalarRefType<'_>> {
-    scalar.as_ref().map(|x| x.as_scalar_ref())
-}
-
 /// `ScalarRef` is a trait over all possible references in the evaluation
 /// framework.
 ///
 /// `ScalarRef` is reciprocal to `Scalar`. Use `to_owned_scalar` to get an
 /// owned scalar.
-pub trait ScalarRef<'a>: ScalarBounds<ScalarRefImpl<'a>> + 'a + Copy {
+pub trait ScalarRef<'a>: private::ScalarBounds<ScalarRefImpl<'a>> + 'a + Copy {
     /// `ScalarType` is the owned type of current `ScalarRef`.
     type ScalarType: Scalar<ScalarRefType<'a> = Self>;
 
@@ -569,8 +771,14 @@ pub trait ScalarRef<'a>: ScalarBounds<ScalarRefImpl<'a>> + 'a + Copy {
 
 /// Define `ScalarImpl` and `ScalarRefImpl` with macro.
 macro_rules! scalar_impl_enum {
-    ($( { $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty } ),*) => {
+    ($( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty } ),*) => {
         /// `ScalarImpl` embeds all possible scalars in the evaluation framework.
+        ///
+        /// Note: `ScalarImpl` doesn't contain all information of its `DataType`,
+        /// so sometimes they need to be used together.
+        /// e.g., for `Struct`, we don't have the field names in the value.
+        ///
+        /// See `for_all_variants` for the definition.
         #[derive(Debug, Clone, PartialEq, Eq, EstimateSize)]
         pub enum ScalarImpl {
             $( $variant_name($scalar) ),*
@@ -578,6 +786,12 @@ macro_rules! scalar_impl_enum {
 
         /// `ScalarRefImpl` embeds all possible scalar references in the evaluation
         /// framework.
+        ///
+        /// Note: `ScalarRefImpl` doesn't contain all information of its `DataType`,
+        /// so sometimes they need to be used together.
+        /// e.g., for `Struct`, we don't have the field names in the value.
+        ///
+        /// See `for_all_variants` for the definition.
         #[derive(Debug, Copy, Clone, PartialEq, Eq)]
         pub enum ScalarRefImpl<'scalar> {
             $( $variant_name($scalar_ref) ),*
@@ -585,7 +799,7 @@ macro_rules! scalar_impl_enum {
     };
 }
 
-for_all_scalar_variants! { scalar_impl_enum }
+for_all_variants! { scalar_impl_enum }
 
 // We MUST NOT implement `Ord` for `ScalarImpl` because that will make `Datum` derive an incorrect
 // default `Ord`. To get a default-ordered `ScalarImpl`/`ScalarRefImpl`/`Datum`/`DatumRef`, you can
@@ -623,8 +837,20 @@ impl<T: Into<ScalarImpl>> ToOwnedDatum for Option<T> {
     }
 }
 
+impl<const N: usize> From<TypedId<N, u32>> for ScalarImpl {
+    fn from(value: TypedId<N, u32>) -> Self {
+        value.as_i32_id().into()
+    }
+}
+
+impl<const N: usize> From<TypedId<N, u64>> for ScalarImpl {
+    fn from(value: TypedId<N, u64>) -> Self {
+        value.as_i64_id().into()
+    }
+}
+
 #[auto_impl::auto_impl(&)]
-pub trait ToDatumRef: PartialEq + Eq + Debug {
+pub trait ToDatumRef: PartialEq + Eq + Debug + Send + Sync {
     /// Convert the datum to [`DatumRef`].
     fn to_datum_ref(&self) -> DatumRef<'_>;
 }
@@ -649,6 +875,9 @@ impl ToDatumRef for DatumRef<'_> {
 }
 
 /// To make sure there is `as_scalar_ref` for all scalar ref types.
+/// See <https://github.com/risingwavelabs/risingwave/pull/9977/files#r1208972881>
+///
+/// This is used by the expr macro.
 pub trait SelfAsScalarRef {
     fn as_scalar_ref(&self) -> Self;
 }
@@ -663,7 +892,7 @@ macro_rules! impl_self_as_scalar_ref {
         )*
     };
 }
-impl_self_as_scalar_ref! { &str, &[u8], Int256Ref<'_>, JsonbRef<'_>, ListRef<'_>, StructRef<'_>, ScalarRefImpl<'_> }
+impl_self_as_scalar_ref! { &str, &[u8], Int256Ref<'_>, JsonbRef<'_>, VariantRef<'_>, ListRef<'_>, StructRef<'_>, ScalarRefImpl<'_>, MapRef<'_> }
 
 /// `for_all_native_types` includes all native variants of our scalar types.
 ///
@@ -672,12 +901,12 @@ impl_self_as_scalar_ref! { &str, &[u8], Int256Ref<'_>, JsonbRef<'_>, ListRef<'_>
 macro_rules! for_all_native_types {
     ($macro:ident) => {
         $macro! {
-            { i16, Int16 },
-            { i32, Int32 },
-            { i64, Int64 },
-            { Serial, Serial },
-            { $crate::types::F32, Float32 },
-            { $crate::types::F64, Float64 }
+            { i16, Int16, read_i16 },
+            { i32, Int32, read_i32 },
+            { i64, Int64, read_i64 },
+            { Serial, Serial, read_i64 },
+            { $crate::types::F32, Float32, read_f32 },
+            { $crate::types::F64, Float64, read_f64 }
         }
     };
 }
@@ -688,7 +917,7 @@ macro_rules! for_all_native_types {
 /// * `&ScalarImpl -> &Scalar` with `impl.as_int16()`.
 /// * `ScalarImpl -> Scalar` with `impl.into_int16()`.
 macro_rules! impl_convert {
-    ($( { $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty } ),*) => {
+    ($( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty } ),*) => {
         $(
             impl From<$scalar> for ScalarImpl {
                 fn from(val: $scalar) -> Self {
@@ -730,7 +959,7 @@ macro_rules! impl_convert {
                     /// If the scalar is not of the expected type.
                     pub fn [<as_ $suffix_name>](&self) -> &$scalar {
                         match self {
-                            Self::$variant_name(ref scalar) => scalar,
+                            Self::$variant_name(scalar) => scalar,
                             other_scalar => panic!("cannot convert ScalarImpl::{} to concrete type {}", other_scalar.get_ident(), stringify!($variant_name))
                         }
                     }
@@ -760,7 +989,7 @@ macro_rules! impl_convert {
     };
 }
 
-for_all_scalar_variants! { impl_convert }
+for_all_variants! { impl_convert }
 
 // Implement `From<raw float>` for `ScalarImpl::Float` as a sugar.
 impl From<f32> for ScalarImpl {
@@ -822,6 +1051,12 @@ impl From<JsonbRef<'_>> for ScalarImpl {
     }
 }
 
+impl From<VariantRef<'_>> for ScalarImpl {
+    fn from(variant: VariantRef<'_>) -> Self {
+        Self::Variant(variant.to_owned_scalar())
+    }
+}
+
 impl<T: PrimitiveArrayItemType> From<Vec<T>> for ScalarImpl {
     fn from(v: Vec<T>) -> Self {
         Self::List(v.into_iter().collect())
@@ -852,8 +1087,16 @@ impl From<Bytes> for ScalarImpl {
     }
 }
 
+impl From<ListRef<'_>> for ScalarImpl {
+    fn from(list: ListRef<'_>) -> Self {
+        Self::List(list.to_owned_scalar())
+    }
+}
+
 impl ScalarImpl {
-    /// Creates a scalar from binary.
+    /// Creates a scalar from pgwire "BINARY" format.
+    ///
+    /// The counterpart of [`to_binary::ToBinary`].
     pub fn from_binary(bytes: &Bytes, data_type: &DataType) -> Result<Self, BoxedError> {
         let res = match data_type {
             DataType::Varchar => Self::Utf8(String::from_sql(&Type::VARCHAR, bytes)?.into()),
@@ -879,17 +1122,21 @@ impl ScalarImpl {
             DataType::Interval => Self::Interval(Interval::from_sql(&Type::INTERVAL, bytes)?),
             DataType::Jsonb => Self::Jsonb(
                 JsonbVal::value_deserialize(bytes)
-                    .ok_or_else(|| "invalid value of Jsonb".to_string())?,
+                    .ok_or_else(|| "invalid value of Jsonb".to_owned())?,
             ),
+            // pgwire binary parameters are untrusted and must be re-canonicalized.
+            DataType::Variant => Self::Variant(VariantVal::from_serialized_untrusted(bytes)?),
             DataType::Int256 => Self::Int256(Int256::from_binary(bytes)?),
-            DataType::Struct(_) | DataType::List(_) => {
+            DataType::Vector(_) | DataType::Struct(_) | DataType::List(_) | DataType::Map(_) => {
                 return Err(format!("unsupported data type: {}", data_type).into());
             }
         };
         Ok(res)
     }
 
-    /// Creates a scalar from text.
+    /// Creates a scalar from pgwire "TEXT" format.
+    ///
+    /// The counterpart of [`ToText`].
     pub fn from_text(s: &str, data_type: &DataType) -> Result<Self, BoxedError> {
         Ok(match data_type {
             DataType::Boolean => str_to_bool(s)?.into(),
@@ -910,9 +1157,23 @@ impl ScalarImpl {
             DataType::Time => Time::from_str(s)?.into(),
             DataType::Interval => Interval::from_str(s)?.into(),
             DataType::List(_) => ListValue::from_str(s, data_type)?.into(),
-            DataType::Struct(_) => StructValue::from_str(s, data_type)?.into(),
+            DataType::Struct(st) => StructValue::from_str(s, st)?.into(),
             DataType::Jsonb => JsonbVal::from_str(s)?.into(),
-            DataType::Bytea => str_to_bytea(s)?.into(),
+            DataType::Variant => VariantVal::from_str(s)?.into(),
+            DataType::Bytea => {
+                let mut buf = Vec::new();
+                str_to_bytea(s, &mut buf)?;
+                buf.into()
+            }
+            DataType::Vector(size) => VectorVal::from_text(s, *size)?.into(),
+            DataType::Map(_m) => return Err("map from text is not supported".into()),
+        })
+    }
+
+    pub fn from_text_for_test(s: &str, data_type: &DataType) -> Result<Self, BoxedError> {
+        Ok(match data_type {
+            DataType::Map(map_type) => MapValue::from_str_for_test(s, map_type)?.into(),
+            _ => ScalarImpl::from_text(s, data_type)?,
         })
     }
 }
@@ -936,7 +1197,7 @@ impl ScalarImpl {
     }
 }
 
-impl<'a> ScalarRefImpl<'a> {
+impl ScalarRefImpl<'_> {
     /// Converts [`ScalarRefImpl`] to [`ScalarImpl`]
     pub fn into_scalar_impl(self) -> ScalarImpl {
         dispatch_scalar_ref_variants!(self, inner, { inner.to_owned_scalar().into() })
@@ -970,17 +1231,16 @@ pub fn hash_datum(datum: impl ToDatumRef, state: &mut impl std::hash::Hasher) {
 }
 
 impl ScalarRefImpl<'_> {
-    /// Encode the scalar to postgresql binary format.
-    /// The encoder implements encoding using <https://docs.rs/postgres-types/0.2.3/postgres_types/trait.ToSql.html>
     pub fn binary_format(&self, data_type: &DataType) -> to_binary::Result<Bytes> {
-        self.to_binary_with_type(data_type).transpose().unwrap()
+        use self::to_binary::ToBinary;
+        self.to_binary_with_type(data_type)
     }
 
     pub fn text_format(&self, data_type: &DataType) -> String {
         self.to_text_with_type(data_type)
     }
 
-    /// Serialize the scalar.
+    /// Serialize the scalar into the `memcomparable` format.
     pub fn serialize(
         &self,
         ser: &mut memcomparable::Serializer<impl BufMut>,
@@ -999,8 +1259,8 @@ impl ScalarRefImpl<'_> {
             Self::Interval(v) => v.serialize(ser)?,
             Self::Date(v) => v.0.num_days_from_ce().serialize(ser)?,
             Self::Timestamp(v) => {
-                v.0.timestamp().serialize(&mut *ser)?;
-                v.0.timestamp_subsec_nanos().serialize(ser)?;
+                v.0.and_utc().timestamp().serialize(&mut *ser)?;
+                v.0.and_utc().timestamp_subsec_nanos().serialize(ser)?;
             }
             Self::Timestamptz(v) => v.serialize(ser)?,
             Self::Time(v) => {
@@ -1009,15 +1269,18 @@ impl ScalarRefImpl<'_> {
             }
             Self::Int256(v) => v.memcmp_serialize(ser)?,
             Self::Jsonb(v) => v.memcmp_serialize(ser)?,
+            Self::Variant(v) => v.memcmp_serialize(ser)?,
             Self::Struct(v) => v.memcmp_serialize(ser)?,
             Self::List(v) => v.memcmp_serialize(ser)?,
+            Self::Map(v) => v.memcmp_serialize(ser)?,
+            Self::Vector(v) => v.memcmp_serialize(ser)?,
         };
         Ok(())
     }
 }
 
 impl ScalarImpl {
-    /// Serialize the scalar.
+    /// Serialize the scalar into the `memcomparable` format.
     pub fn serialize(
         &self,
         ser: &mut memcomparable::Serializer<impl BufMut>,
@@ -1025,7 +1288,7 @@ impl ScalarImpl {
         self.as_scalar_ref_impl().serialize(ser)
     }
 
-    /// Deserialize the scalar.
+    /// Deserialize the scalar from the `memcomparable` format.
     pub fn deserialize(
         ty: &DataType,
         de: &mut memcomparable::Deserializer<impl Buf>,
@@ -1059,12 +1322,17 @@ impl ScalarImpl {
             Ty::Timestamptz => Self::Timestamptz(Timestamptz::deserialize(de)?),
             Ty::Date => Self::Date({
                 let days = i32::deserialize(de)?;
-                Date::with_days(days)
+                Date::with_days_since_ce(days)
                     .map_err(|e| memcomparable::Error::Message(e.to_report_string()))?
             }),
             Ty::Jsonb => Self::Jsonb(JsonbVal::memcmp_deserialize(de)?),
+            Ty::Variant => Self::Variant(VariantVal::memcmp_deserialize(de)?),
             Ty::Struct(t) => StructValue::memcmp_deserialize(t.types(), de)?.to_scalar_value(),
             Ty::List(t) => ListValue::memcmp_deserialize(t, de)?.to_scalar_value(),
+            Ty::Map(t) => MapValue::memcmp_deserialize(t, de)?.to_scalar_value(),
+            Ty::Vector(dimension) => {
+                VectorVal::memcmp_deserialize(*dimension, de)?.to_scalar_value()
+            }
         })
     }
 
@@ -1084,20 +1352,70 @@ impl ScalarImpl {
 /// Returns whether the `literal` matches the `data_type`.
 pub fn literal_type_match(data_type: &DataType, literal: Option<&ScalarImpl>) -> bool {
     match literal {
-        Some(scalar) => {
+        None => true,
+        Some(scalar) => scalar_ref_type_match(data_type, scalar.as_scalar_ref_impl()),
+    }
+}
+
+/// Returns whether the scalar ref matches the `data_type`.
+///
+/// This is a lightweight "shape check" intended for callers that need to avoid panics on
+/// malformed input. For nested types, it checks element/field types recursively.
+pub fn scalar_ref_type_match(data_type: &DataType, scalar: ScalarRefImpl<'_>) -> bool {
+    match (data_type, scalar) {
+        (DataType::List(list_type), ScalarRefImpl::List(v)) => {
+            v.elem_type().equals_datatype(list_type.elem())
+        }
+        (DataType::Map(map_type), ScalarRefImpl::Map(v)) => v
+            .inner()
+            .elem_type()
+            .equals_datatype(&map_type.clone().into_struct()),
+        (DataType::Vector(size), ScalarRefImpl::Vector(v)) => v.dimension() == *size,
+        (DataType::Struct(struct_type), ScalarRefImpl::Struct(v)) => {
+            struct_ref_type_match(struct_type, v)
+        }
+
+        _ => {
             macro_rules! matches {
-                ($( { $DataType:ident, $PhysicalType:ident }),*) => {
+                ($( { $data_type:ident, $variant_name:ident, $suffix_name:ident, $scalar:ty, $scalar_ref:ty, $array:ty, $builder:ty }),*) => {
                     match (data_type, scalar) {
                         $(
-                            (DataType::$DataType { .. }, ScalarImpl::$PhysicalType(_)) => true,
-                            (DataType::$DataType { .. }, _) => false, // so that we won't forget to match a new logical type
+                            (DataType::$data_type { .. }, ScalarRefImpl::$variant_name(_)) => true,
+                            (DataType::$data_type { .. }, _) => false, // keep exhaustive over DataType variants
                         )*
                     }
                 }
             }
-            for_all_type_pairs! { matches }
+            for_all_variants! { matches }
         }
+    }
+}
+
+/// Returns whether the `datum` matches the `data_type`.
+#[inline(always)]
+pub fn datum_ref_type_match(data_type: &DataType, datum: DatumRef<'_>) -> bool {
+    match datum {
         None => true,
+        Some(scalar) => scalar_ref_type_match(data_type, scalar),
+    }
+}
+
+fn struct_ref_type_match(expected: &StructType, value: StructRef<'_>) -> bool {
+    match value {
+        StructRef::Indexed { arr, .. } => {
+            // `StructRef::Indexed` comes with a `StructArray`, whose type can be compared directly.
+            crate::array::Array::data_type(arr).equals_datatype(&DataType::Struct(expected.clone()))
+        }
+        StructRef::ValueRef { val } => {
+            let fields = val.fields();
+            if fields.len() != expected.len() {
+                return false;
+            }
+            expected
+                .types()
+                .zip_eq_fast(fields.iter())
+                .all(|(ty, datum)| datum_ref_type_match(ty, datum.to_datum_ref()))
+        }
     }
 }
 
@@ -1140,13 +1458,11 @@ mod tests {
 
     #[test]
     fn test_data_type_display() {
-        let d: DataType = DataType::new_struct(
-            vec![DataType::Int32, DataType::Varchar],
-            vec!["i".to_string(), "j".to_string()],
-        );
+        let d: DataType =
+            StructType::new(vec![("i", DataType::Int32), ("j", DataType::Varchar)]).into();
         assert_eq!(
             format!("{}", d),
-            "struct<i integer, j character varying>".to_string()
+            "struct<i integer, j character varying>".to_owned()
         );
     }
 
@@ -1222,7 +1538,7 @@ mod tests {
                     DataType::Timestamp,
                 ),
                 DataTypeName::Timestamptz => (
-                    ScalarImpl::Timestamptz(Timestamptz::from_micros(233333333)),
+                    ScalarImpl::Timestamptz(Timestamptz::from_micros(233333333).unwrap()),
                     DataType::Timestamptz,
                 ),
                 DataTypeName::Interval => (
@@ -1230,6 +1546,9 @@ mod tests {
                     DataType::Interval,
                 ),
                 DataTypeName::Jsonb => (ScalarImpl::Jsonb(JsonbVal::null()), DataType::Jsonb),
+                DataTypeName::Variant => {
+                    (ScalarImpl::Variant(VariantVal::null()), DataType::Variant)
+                }
                 DataTypeName::Struct => (
                     ScalarImpl::Struct(StructValue::new(vec![
                         ScalarImpl::Int64(233).into(),
@@ -1242,8 +1561,19 @@ mod tests {
                 ),
                 DataTypeName::List => (
                     ScalarImpl::List(ListValue::from_iter([233i64, 2333])),
-                    DataType::List(Box::new(DataType::Int64)),
+                    DataType::Int64.list(),
                 ),
+                DataTypeName::Vector => (
+                    ScalarImpl::Vector(VectorVal::from_iter(
+                        (0..VectorVal::TEST_VECTOR_DIMENSION)
+                            .map(|i| ((i + 1) as f32).try_into().unwrap()),
+                    )),
+                    DataType::Vector(VectorVal::TEST_VECTOR_DIMENSION),
+                ),
+                DataTypeName::Map => {
+                    // map is not hashable
+                    continue;
+                }
             };
 
             test(Some(scalar), data_type.clone());
@@ -1355,51 +1685,49 @@ mod tests {
 
         assert_eq!(
             DataType::from_str("int2[]").unwrap(),
-            DataType::List(Box::new(DataType::Int16))
+            DataType::Int16.list()
         );
-        assert_eq!(
-            DataType::from_str("int[]").unwrap(),
-            DataType::List(Box::new(DataType::Int32))
-        );
+        assert_eq!(DataType::from_str("int[]").unwrap(), DataType::Int32.list());
         assert_eq!(
             DataType::from_str("int8[]").unwrap(),
-            DataType::List(Box::new(DataType::Int64))
+            DataType::Int64.list()
         );
         assert_eq!(
             DataType::from_str("float4[]").unwrap(),
-            DataType::List(Box::new(DataType::Float32))
+            DataType::Float32.list()
         );
         assert_eq!(
             DataType::from_str("float8[]").unwrap(),
-            DataType::List(Box::new(DataType::Float64))
+            DataType::Float64.list()
         );
         assert_eq!(
             DataType::from_str("decimal[]").unwrap(),
-            DataType::List(Box::new(DataType::Decimal))
+            DataType::Decimal.list()
         );
         assert_eq!(
             DataType::from_str("varchar[]").unwrap(),
-            DataType::List(Box::new(DataType::Varchar))
+            DataType::Varchar.list()
         );
+        assert_eq!(DataType::from_str("variant").unwrap(), DataType::Variant);
+        assert_eq!(DataType::from_str("VARIANT").unwrap(), DataType::Variant);
         assert_eq!(
-            DataType::from_str("date[]").unwrap(),
-            DataType::List(Box::new(DataType::Date))
+            DataType::from_str("variant[]").unwrap(),
+            DataType::Variant.list()
         );
-        assert_eq!(
-            DataType::from_str("time[]").unwrap(),
-            DataType::List(Box::new(DataType::Time))
-        );
+
+        assert_eq!(DataType::from_str("date[]").unwrap(), DataType::Date.list());
+        assert_eq!(DataType::from_str("time[]").unwrap(), DataType::Time.list());
         assert_eq!(
             DataType::from_str("timestamp[]").unwrap(),
-            DataType::List(Box::new(DataType::Timestamp))
+            DataType::Timestamp.list()
         );
         assert_eq!(
             DataType::from_str("timestamptz[]").unwrap(),
-            DataType::List(Box::new(DataType::Timestamptz))
+            DataType::Timestamptz.list()
         );
         assert_eq!(
             DataType::from_str("interval[]").unwrap(),
-            DataType::List(Box::new(DataType::Interval))
+            DataType::Interval.list()
         );
 
         assert_eq!(
@@ -1413,5 +1741,51 @@ mod tests {
                 ("b", DataType::Varchar)
             ]))
         );
+    }
+
+    #[test]
+    fn test_can_alter() {
+        let cannots = [
+            (DataType::Int32, None),
+            (DataType::Int32.list(), None),
+            (
+                MapType::from_kv(DataType::Varchar, DataType::Int32.list()).into(),
+                None,
+            ),
+            (
+                StructType::new([("a", DataType::Int32)]).into(),
+                Some(false),
+            ),
+            (
+                MapType::from_kv(
+                    DataType::Varchar,
+                    StructType::new([("a", DataType::Int32)]).into(),
+                )
+                .into(),
+                Some(false),
+            ),
+        ];
+        for (cannot, why) in cannots {
+            assert_eq!(cannot.can_alter(), why, "{cannot:?}");
+        }
+
+        let cans = [
+            StructType::new([("a", DataType::Int32), ("b", DataType::Int32.list())])
+                .with_ids([ColumnId::new(1), ColumnId::new(2)])
+                .into(),
+            DataType::list(DataType::Struct(
+                StructType::new([("a", DataType::Int32)]).with_ids([ColumnId::new(1)]),
+            )),
+            MapType::from_kv(
+                DataType::Varchar,
+                StructType::new([("a", DataType::Int32)])
+                    .with_ids([ColumnId::new(1)])
+                    .into(),
+            )
+            .into(),
+        ];
+        for can in cans {
+            assert_eq!(can.can_alter(), Some(true), "{can:?}");
+        }
     }
 }

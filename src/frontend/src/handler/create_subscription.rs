@@ -16,12 +16,14 @@ use std::rc::Rc;
 
 use either::Either;
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::catalog::UserId;
 use risingwave_sqlparser::ast::CreateSubscriptionStatement;
 
 use super::{HandlerArgs, RwPgResponse};
-use crate::catalog::subscription_catalog::{SubscriptionCatalog, SubscriptionId};
+use crate::catalog::subscription_catalog::{
+    SubscriptionCatalog, SubscriptionId, SubscriptionState,
+};
 use crate::error::Result;
+use crate::handler::util::reject_internal_table_dependency;
 use crate::scheduler::streaming_manager::CreatingStreamingJobInfo;
 use crate::session::SessionImpl;
 use crate::{Binder, OptimizerContext, OptimizerContextRef};
@@ -31,23 +33,23 @@ pub fn create_subscription_catalog(
     context: OptimizerContextRef,
     stmt: CreateSubscriptionStatement,
 ) -> Result<SubscriptionCatalog> {
-    let db_name = session.database();
+    let db_name = &session.database();
     let (subscription_schema_name, subscription_name) =
-        Binder::resolve_schema_qualified_name(db_name, stmt.subscription_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &stmt.subscription_name)?;
     let (table_schema_name, subscription_from_table_name) =
-        Binder::resolve_schema_qualified_name(db_name, stmt.subscription_from.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &stmt.subscription_from)?;
     let (table_database_id, table_schema_id) =
-        session.get_database_and_schema_id_for_create(table_schema_name.clone())?;
+        session.get_database_and_schema_id_for_create(table_schema_name)?;
     let (subscription_database_id, subscription_schema_id) =
-        session.get_database_and_schema_id_for_create(subscription_schema_name.clone())?;
+        session.get_database_and_schema_id_for_create(subscription_schema_name)?;
     let definition = context.normalized_sql().to_owned();
-    let dependent_table_id = session
-        .get_table_by_name(
-            &subscription_from_table_name,
-            table_database_id,
-            table_schema_id,
-        )?
-        .id;
+    let dependent_table = session.get_table_by_name(
+        &subscription_from_table_name,
+        table_database_id,
+        table_schema_id,
+    )?;
+    reject_internal_table_dependency(dependent_table.as_ref(), "CREATE SUBSCRIPTION")?;
+    let dependent_table_id = dependent_table.id;
 
     let mut subscription_catalog = SubscriptionCatalog {
         id: SubscriptionId::placeholder(),
@@ -57,14 +59,15 @@ pub fn create_subscription_catalog(
         database_id: subscription_database_id,
         schema_id: subscription_schema_id,
         dependent_table_id,
-        owner: UserId::new(session.user_id()),
+        owner: session.user_id(),
         initialized_at_epoch: None,
         created_at_epoch: None,
         created_at_cluster_version: None,
         initialized_at_cluster_version: None,
+        subscription_state: SubscriptionState::Init,
     };
 
-    subscription_catalog.set_retention_seconds(context.with_options().clone().into_inner())?;
+    subscription_catalog.set_retention_seconds(context.with_options())?;
 
     Ok(subscription_catalog)
 }
@@ -83,8 +86,8 @@ pub async fn handle_create_subscription(
         return Ok(resp);
     };
     let subscription_catalog = {
-        let context = Rc::new(OptimizerContext::from_handler_args(handle_args));
-        create_subscription_catalog(&session, context.clone(), stmt)?
+        let context = Rc::new(OptimizerContext::from_handler_args(handle_args)?);
+        create_subscription_catalog(&session, context, stmt)?
     };
 
     let _job_guard =

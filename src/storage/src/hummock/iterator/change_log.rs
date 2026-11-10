@@ -18,15 +18,18 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use risingwave_common::catalog::TableId;
 use risingwave_common::must_match;
 use risingwave_common::util::epoch::MAX_SPILL_TIMES;
-use risingwave_hummock_sdk::key::{FullKey, SetSlice, TableKeyRange, UserKey, UserKeyRange};
 use risingwave_hummock_sdk::EpochWithGap;
+use risingwave_hummock_sdk::key::{
+    FullKey, SetSlice, TableKeyRange, UserKey, UserKeyRange, bound_table_key_range,
+};
 
+use crate::StateStoreIter;
 use crate::error::StorageResult;
 use crate::hummock::iterator::{Forward, HummockIterator, MergeIterator};
 use crate::hummock::value::HummockValue;
 use crate::hummock::{HummockResult, SstableIterator};
+use crate::monitor::IterLocalMetricsGuard;
 use crate::store::{ChangeLogValue, StateStoreReadLogItem, StateStoreReadLogItemRef};
-use crate::StateStoreIter;
 
 struct ChangeLogIteratorInner<
     NI: HummockIterator<Direction = Forward>,
@@ -289,11 +292,14 @@ impl<NI: HummockIterator<Direction = Forward>, OI: HummockIterator<Direction = F
                         // epoch in the `new_value_iter`. If the assertion is broken, it means we must have a new value of the same epoch
                         // that are valid but older than the `oldest_epoch`, which breaks the definition of `oldest_epoch`.
                         assert!(
-                                old_value_iter_key.epoch_with_gap.pure_epoch() < self.min_epoch,
-                                "there should not be old value between oldest new_value and min_epoch. \
+                            old_value_iter_key.epoch_with_gap.pure_epoch() < self.min_epoch,
+                            "there should not be old value between oldest new_value and min_epoch. \
                                 new value key: {:?}, oldest epoch: {:?}, min epoch: {:?}, old value epoch: {:?}",
-                                self.curr_key, oldest_epoch, self.min_epoch, old_value_iter_key.epoch_with_gap
-                            );
+                            self.curr_key,
+                            oldest_epoch,
+                            self.min_epoch,
+                            old_value_iter_key.epoch_with_gap
+                        );
                         break;
                     }
                     Ordering::Equal => {
@@ -339,25 +345,37 @@ impl<NI: HummockIterator<Direction = Forward>, OI: HummockIterator<Direction = F
     }
 }
 
+impl Drop for ChangeLogIterator {
+    fn drop(&mut self) {
+        self.inner
+            .new_value_iter
+            .collect_local_statistic(&mut self.stats_guard.local_stats);
+        self.inner
+            .old_value_iter
+            .collect_local_statistic(&mut self.stats_guard.local_stats);
+    }
+}
+
 pub struct ChangeLogIterator {
     inner: ChangeLogIteratorInner<MergeIterator<SstableIterator>, MergeIterator<SstableIterator>>,
     initial_read: bool,
+    stats_guard: IterLocalMetricsGuard,
 }
 
 impl ChangeLogIterator {
     pub async fn new(
         epoch_range: (u64, u64),
-        (start_bound, end_bound): TableKeyRange,
+        table_key_range: TableKeyRange,
         new_value_iter: MergeIterator<SstableIterator>,
         old_value_iter: MergeIterator<SstableIterator>,
         table_id: TableId,
+        stats_guard: IterLocalMetricsGuard,
     ) -> HummockResult<Self> {
-        let make_user_key = |table_key| UserKey {
-            table_id,
-            table_key,
-        };
-        let start_bound = start_bound.map(make_user_key);
-        let end_bound = end_bound.map(make_user_key);
+        let user_key_range_ref = bound_table_key_range(table_id, &table_key_range);
+        let (start_bound, end_bound) = (
+            user_key_range_ref.0.map(|key| key.cloned()),
+            user_key_range_ref.1.map(|key| key.cloned()),
+        );
         let mut inner = ChangeLogIteratorInner::new(
             epoch_range,
             (start_bound, end_bound),
@@ -368,6 +386,7 @@ impl ChangeLogIterator {
         Ok(Self {
             inner,
             initial_read: false,
+            stats_guard,
         })
     }
 }
@@ -392,8 +411,8 @@ pub mod test_utils {
     use std::collections::HashMap;
 
     use bytes::Bytes;
-    use rand::{thread_rng, Rng, RngCore};
-    use risingwave_common::util::epoch::{test_epoch, EpochPair, MAX_EPOCH};
+    use rand::{Rng, RngCore, rng as thread_rng};
+    use risingwave_common::util::epoch::{EpochPair, MAX_EPOCH, test_epoch};
     use risingwave_hummock_sdk::key::TableKey;
 
     use crate::hummock::iterator::test_utils::iterator_test_table_key_of;
@@ -415,11 +434,11 @@ pub mod test_utils {
             let mut epoch_logs = Vec::new();
             let epoch = test_epoch(epoch_idx as _);
             for key_idx in 0..key_count {
-                if rng.gen_bool(skip_ratio) {
+                if rng.random_bool(skip_ratio) {
                     continue;
                 }
                 let key = TableKey(Bytes::from(iterator_test_table_key_of(key_idx)));
-                if rng.gen_bool(delete_ratio) {
+                if rng.random_bool(delete_ratio) {
                     if let Some(prev_value) = store.remove(&key) {
                         epoch_logs.push((key, KeyOp::Delete(prev_value)));
                     }
@@ -488,7 +507,7 @@ pub mod test_utils {
                         state_store.insert(key, value, Some(old_value)).unwrap();
                     }
                 }
-                if rng.gen_bool(try_flush_ratio) {
+                if rng.random_bool(try_flush_ratio) {
                     state_store.try_flush().await.unwrap();
                 }
             }
@@ -511,27 +530,29 @@ mod tests {
 
     use bytes::Bytes;
     use itertools::Itertools;
+    use risingwave_common::bitmap::Bitmap;
     use risingwave_common::catalog::TableId;
-    use risingwave_common::hash::table_distribution::TableDistribution;
+    use risingwave_common::hash::VirtualNode;
+    use risingwave_common::id::FragmentId;
     use risingwave_common::util::epoch::test_epoch;
-    use risingwave_hummock_sdk::key::{TableKey, UserKey};
     use risingwave_hummock_sdk::EpochWithGap;
+    use risingwave_hummock_sdk::key::{TableKey, UserKey};
 
-    use crate::hummock::iterator::change_log::test_utils::{
-        apply_test_log_data, gen_test_data, TestLogDataType,
-    };
+    use crate::hummock::iterator::MergeIterator;
     use crate::hummock::iterator::change_log::ChangeLogIteratorInner;
+    use crate::hummock::iterator::change_log::test_utils::{
+        TestLogDataType, apply_test_log_data, gen_test_data,
+    };
     use crate::hummock::iterator::test_utils::{
         iterator_test_table_key_of, iterator_test_value_of,
     };
-    use crate::hummock::iterator::MergeIterator;
     use crate::mem_table::{KeyOp, MemTable, MemTableHummockIterator, MemTableStore};
     use crate::memory::MemoryStateStore;
     use crate::store::{
-        ChangeLogValue, NewLocalOptions, OpConsistencyLevel, ReadLogOptions, StateStoreIter,
-        StateStoreRead, CHECK_BYTES_EQUAL,
+        CHECK_BYTES_EQUAL, ChangeLogValue, NewLocalOptions, OpConsistencyLevel, ReadLogOptions,
+        StateStoreReadLog,
     };
-    use crate::StateStore;
+    use crate::{StateStore, StateStoreIter};
 
     #[tokio::test]
     async fn test_empty() {
@@ -566,7 +587,7 @@ mod tests {
         let mem_tables = kvs
             .iter()
             .map(|(key, value)| {
-                let mut t = MemTable::new(OpConsistencyLevel::Inconsistent);
+                let mut t = MemTable::new(233.into(), OpConsistencyLevel::Inconsistent);
                 t.insert(key.clone(), value.clone()).unwrap();
                 t
             })
@@ -614,8 +635,8 @@ mod tests {
                 )
             })
             .collect_vec();
-        let mut new_value_memtable = MemTable::new(OpConsistencyLevel::Inconsistent);
-        let mut old_value_memtable = MemTable::new(OpConsistencyLevel::Inconsistent);
+        let mut new_value_memtable = MemTable::new(233.into(), OpConsistencyLevel::Inconsistent);
+        let mut old_value_memtable = MemTable::new(233.into(), OpConsistencyLevel::Inconsistent);
         for (key, value) in &kvs {
             new_value_memtable
                 .delete(key.clone(), Bytes::new())
@@ -677,13 +698,15 @@ mod tests {
         let mut local = state_store
             .new_local(NewLocalOptions {
                 table_id,
+                fragment_id: FragmentId::default(),
                 op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
                     check_old_value: CHECK_BYTES_EQUAL.clone(),
                     is_log_store: true,
                 },
                 table_option: Default::default(),
                 is_replicated: false,
-                vnodes: TableDistribution::all_vnodes(),
+                vnodes: Bitmap::ones(VirtualNode::COUNT_FOR_TEST).into(),
+                upload_on_flush: true,
             })
             .await;
         let logs = gen_test_data(epoch_count, 10000, 0.05, 0.2);

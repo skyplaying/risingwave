@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,31 +18,42 @@ use risingwave_common::bail_no_function;
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::types::{DataType, StructType};
 use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_expr::aggregate::AggKind;
 pub use risingwave_expr::sig::*;
+use risingwave_pb::expr::agg_call::PbKind as PbAggKind;
+use risingwave_pb::expr::table_function::PbType as PbTableFuncType;
 
-use super::{align_types, cast_ok_base, CastContext};
+use super::{CastContext, align_types, cast_ok_base};
 use crate::error::{ErrorCode, Result};
 use crate::expr::type_inference::cast::align_array_and_element;
-use crate::expr::{cast_ok, is_row_function, Expr as _, ExprImpl, ExprType, FunctionCall};
+use crate::expr::{Expr as _, ExprImpl, ExprType, FunctionCall, cast_ok, is_row_function};
 
 /// Infers the return type of a function. Returns `Err` if the function with specified data types
 /// is not supported on backend.
 ///
 /// It also mutates the `inputs` by adding necessary casts.
+#[tracing::instrument(level = "trace", skip(sig_map))]
 pub fn infer_type_with_sigmap(
     func_name: FuncName,
     inputs: &mut [ExprImpl],
     sig_map: &FunctionRegistry,
 ) -> Result<DataType> {
     // special cases
-    if let FuncName::Scalar(func_type) = func_name
-        && let Some(res) = infer_type_for_special(func_type, inputs).transpose()
-    {
-        return res;
-    }
-    if let FuncName::Aggregate(AggKind::Grouping) = func_name {
-        return Ok(DataType::Int32);
+    match &func_name {
+        FuncName::Scalar(func_type) => {
+            if let Some(res) = infer_type_for_special(*func_type, inputs).transpose() {
+                return res;
+            }
+        }
+        FuncName::Table(func_type) => {
+            if let Some(res) = infer_type_for_special_table_function(*func_type, inputs).transpose()
+            {
+                return res;
+            }
+        }
+        FuncName::Aggregate(agg_kind) if *agg_kind == PbAggKind::Grouping => {
+            return Ok(DataType::Int32);
+        }
+        _ => {}
     }
 
     let actuals = inputs
@@ -53,12 +64,13 @@ pub fn infer_type_with_sigmap(
         })
         .collect_vec();
     let sig = infer_type_name(sig_map, func_name, &actuals)?;
+    tracing::trace!(?actuals, ?sig, "infer_type_name");
 
     // add implicit casts to inputs
     for (expr, t) in inputs.iter_mut().zip_eq_fast(&sig.inputs_type) {
         if expr.is_untyped() || !t.matches(&expr.return_type()) {
             if let SigDataType::Exact(t) = t {
-                expr.cast_implicit_mut(t.clone())?;
+                expr.cast_implicit_mut(t)?;
             } else {
                 return Err(ErrorCode::BindError(format!(
                     "Cannot implicitly cast '{expr:?}' to polymorphic type {t:?}",
@@ -70,6 +82,7 @@ pub fn infer_type_with_sigmap(
 
     let input_types = inputs.iter().map(|expr| expr.return_type()).collect_vec();
     let return_type = (sig.type_infer)(&input_types)?;
+    tracing::trace!(?input_types, ?return_type, "finished type inference");
     Ok(return_type)
 }
 
@@ -83,11 +96,11 @@ pub fn infer_some_all(
 ) -> Result<DataType> {
     let element_type = if inputs[1].is_untyped() {
         None
-    } else if let DataType::List(datatype) = inputs[1].return_type() {
-        Some(*datatype)
+    } else if let DataType::List(list) = inputs[1].return_type() {
+        Some(list.into_elem())
     } else {
         return Err(ErrorCode::BindError(
-            "op SOME/ANY/ALL (array) requires array on right side".to_string(),
+            "op SOME/ANY/ALL (array) requires array on right side".to_owned(),
         )
         .into());
     };
@@ -112,7 +125,7 @@ pub fn infer_some_all(
             )
             .into());
         };
-        inputs[0].cast_implicit_mut(t.clone())?;
+        inputs[0].cast_implicit_mut(t)?;
     }
     if !matches!(&element_type, Some(e) if sig.inputs_type[1].matches(e)) {
         let SigDataType::Exact(t) = &sig.inputs_type[1] else {
@@ -120,7 +133,7 @@ pub fn infer_some_all(
                 ErrorCode::BindError("array/struct on left are not supported yet".into()).into(),
             );
         };
-        inputs[1].cast_implicit_mut(DataType::List(Box::new(t.clone())))?;
+        inputs[1].cast_implicit_mut(&DataType::list(t.clone()))?;
     }
 
     let inputs_owned = std::mem::take(inputs);
@@ -135,7 +148,7 @@ pub fn infer_some_all(
 }
 
 macro_rules! ensure_arity {
-    ($func:literal, $lower:literal <= | $inputs:ident | <= $upper:literal) => {
+    ($func:expr, $lower:literal <= | $inputs:ident | <= $upper:literal) => {
         if !($lower <= $inputs.len() && $inputs.len() <= $upper) {
             return Err(ErrorCode::BindError(format!(
                 "Function `{}` takes {} to {} arguments ({} given)",
@@ -147,7 +160,7 @@ macro_rules! ensure_arity {
             .into());
         }
     };
-    ($func:literal, $lower:literal <= | $inputs:ident |) => {
+    ($func:expr, $lower:literal <= | $inputs:ident |) => {
         if !($lower <= $inputs.len()) {
             return Err(ErrorCode::BindError(format!(
                 "Function `{}` takes at least {} arguments ({} given)",
@@ -158,7 +171,7 @@ macro_rules! ensure_arity {
             .into());
         }
     };
-    ($func:literal, | $inputs:ident | == $num:literal) => {
+    ($func:expr, | $inputs:ident | == $num:literal) => {
         if !($inputs.len() == $num) {
             return Err(ErrorCode::BindError(format!(
                 "Function `{}` takes {} arguments ({} given)",
@@ -169,7 +182,7 @@ macro_rules! ensure_arity {
             .into());
         }
     };
-    ($func:literal, | $inputs:ident | <= $upper:literal) => {
+    ($func:expr, | $inputs:ident | <= $upper:literal) => {
         if !($inputs.len() <= $upper) {
             return Err(ErrorCode::BindError(format!(
                 "Function `{}` takes at most {} arguments ({} given)",
@@ -250,7 +263,7 @@ fn infer_struct_cast_target_type(
                 let (lcast, rcast, ty) = infer_struct_cast_target_type(func_type, lf, rf)?;
                 lcasts |= lcast;
                 rcasts |= rcast;
-                tys.push(("".to_string(), ty)); // TODO(chi): generate field name
+                tys.push(("".to_owned(), ty)); // TODO(chi): generate field name
             }
             Ok((lcasts, rcasts, DataType::Struct(StructType::new(tys))))
         }
@@ -271,11 +284,10 @@ fn infer_struct_cast_target_type(
             } else if cast_ok(&r, &l, CastContext::Implicit) {
                 Ok((false, true, l))
             } else {
-                return Err(ErrorCode::BindError(format!(
-                    "cannot cast {} to {} or {} to {}",
-                    l, r, r, l
-                ))
-                .into());
+                Err(
+                    ErrorCode::BindError(format!("cannot cast {} to {} or {} to {}", l, r, r, l))
+                        .into(),
+                )
             }
         }
         (NestedType::Type(ty), NestedType::Infer(ity)) => {
@@ -357,7 +369,7 @@ fn infer_type_for_special(
         ExprType::ConcatWs => {
             ensure_arity!("concat_ws", 2 <= | inputs |);
             // 0-th arg must be string
-            inputs[0].cast_implicit_mut(DataType::Varchar)?;
+            inputs[0].cast_implicit_mut(&DataType::Varchar)?;
             for input in inputs.iter_mut().skip(1) {
                 // subsequent can be any type, using the output format
                 let owned = input.take();
@@ -367,14 +379,14 @@ fn infer_type_for_special(
         }
         ExprType::ConcatOp => {
             for input in inputs {
-                input.cast_explicit_mut(DataType::Varchar)?;
+                input.cast_explicit_mut(&DataType::Varchar)?;
             }
             Ok(Some(DataType::Varchar))
         }
         ExprType::Format => {
             ensure_arity!("format", 1 <= | inputs |);
             // 0-th arg must be string
-            inputs[0].cast_implicit_mut(DataType::Varchar)?;
+            inputs[0].cast_implicit_mut(&DataType::Varchar)?;
             for input in inputs.iter_mut().skip(1) {
                 // subsequent can be any type, using the output format
                 let owned = input.take();
@@ -398,12 +410,12 @@ fn infer_type_for_special(
                 // `null = 1` can use the general rule, but return `Ok(None)` here is less readable
                 (true, false) => {
                     let t = inputs[1].return_type();
-                    inputs[0].cast_implicit_mut(t)?;
+                    inputs[0].cast_implicit_mut(&t)?;
                     return Ok(Some(DataType::Boolean));
                 }
                 (false, true) => {
                     let t = inputs[0].return_type();
-                    inputs[1].cast_implicit_mut(t)?;
+                    inputs[1].cast_implicit_mut(&t)?;
                     return Ok(Some(DataType::Boolean));
                 }
                 // Types of both sides are known. Continue.
@@ -418,10 +430,10 @@ fn infer_type_for_special(
                         extract_expr_nested_type(&inputs[1])?,
                     )?;
                     if lcast {
-                        inputs[0].cast_implicit_mut(ret.clone())?;
+                        inputs[0].cast_implicit_mut(&ret)?;
                     }
                     if rcast {
-                        inputs[1].cast_implicit_mut(ret)?;
+                        inputs[1].cast_implicit_mut(&ret)?;
                     }
                     true
                 }
@@ -452,9 +464,9 @@ fn infer_type_for_special(
                 | (t @ Some(DataType::List(_)), None) => {
                     // when neither type is available, default to `varchar[]`
                     // when one side is unknown and other side is list, use that list type
-                    let t = t.unwrap_or_else(|| DataType::List(DataType::Varchar.into()));
+                    let t = t.unwrap_or_else(|| DataType::Varchar.list());
                     for input in &mut *inputs {
-                        input.cast_implicit_mut(t.clone())?;
+                        input.cast_implicit_mut(&t)?;
                     }
                     Some(t)
                 }
@@ -531,7 +543,7 @@ fn infer_type_for_special(
         ExprType::ArrayPosition => {
             ensure_arity!("array_position", 2 <= | inputs | <= 3);
             if let Some(start) = inputs.get_mut(2) {
-                start.cast_implicit_mut(DataType::Int32)?;
+                start.cast_implicit_mut(&DataType::Int32)?;
             }
             let common_type = align_array_and_element(0, &[1], inputs);
             match common_type {
@@ -548,7 +560,7 @@ fn infer_type_for_special(
             ensure_arity!("array_positions", | inputs | == 2);
             let common_type = align_array_and_element(0, &[1], inputs);
             match common_type {
-                Ok(_) => Ok(Some(DataType::List(Box::new(DataType::Int32)))),
+                Ok(_) => Ok(Some(DataType::Int32.list())),
                 Err(_) => Err(ErrorCode::BindError(format!(
                     "Cannot get position of {} in {}",
                     inputs[1].return_type(),
@@ -561,7 +573,9 @@ fn infer_type_for_special(
             ensure_arity!("array_dims", | inputs | == 1);
             inputs[0].ensure_array_type()?;
 
-            if let DataType::List(box DataType::List(_)) = inputs[0].return_type() {
+            if let DataType::List(list) = inputs[0].return_type()
+                && let DataType::List(_) = list.elem()
+            {
                 return Err(ErrorCode::BindError(
                     "array_dims for dimensions greater than 1 not supported".into(),
                 )
@@ -569,8 +583,8 @@ fn infer_type_for_special(
             }
             Ok(Some(DataType::Varchar))
         }
-        ExprType::ArrayContains | ExprType::ArrayContained => {
-            ensure_arity!("array_contains/array_contained", | inputs | == 2);
+        ExprType::ArrayContains | ExprType::ArrayContained | ExprType::ArrayOverlaps => {
+            ensure_arity!("array_contains/array_contained/array_overlaps", | inputs | == 2);
             let left_type = (!inputs[0].is_untyped()).then(|| inputs[0].return_type());
             let right_type = (!inputs[1].is_untyped()).then(|| inputs[1].return_type());
             match (left_type, right_type) {
@@ -580,13 +594,13 @@ fn infer_type_for_special(
                 }
                 (Some(DataType::List(left)), Some(DataType::List(right))) => {
                     // cannot directly cast, find unnest type and judge if they are same type
-                    let left = left.unnest_list();
-                    let right = right.unnest_list();
+                    let left = left.elem().unnest_list();
+                    let right = right.elem().unnest_list();
                     if left.equals_datatype(right) {
                         Ok(Some(DataType::Boolean))
                     } else {
                         Err(ErrorCode::BindError(format!(
-                            "Cannot array_contains unnested type {} to unnested type {}",
+                            "Cannot compare array predicate unnested type {} to unnested type {}",
                             left, right
                         ))
                         .into())
@@ -596,8 +610,169 @@ fn infer_type_for_special(
                 _ => Ok(None),
             }
         }
-        ExprType::Vnode => {
-            ensure_arity!("vnode", 1 <= | inputs |);
+        ExprType::ArraySort => {
+            ensure_arity!("array_sort", 1 <= | inputs | <= 3);
+            inputs[0].ensure_array_type()?;
+
+            for (index, param) in &[(1, "descending"), (2, "nulls_first")] {
+                if let Some(input) = inputs.get_mut(*index) {
+                    input.cast_implicit_mut(&DataType::Boolean).map_err(|_| {
+                        ErrorCode::BindError(format!(
+                            "Cannot cast {} to boolean for parameter {}",
+                            input.return_type(),
+                            param
+                        ))
+                    })?;
+                }
+            }
+
+            Ok(Some(inputs[0].return_type()))
+        }
+        ExprType::MapAccess => {
+            ensure_arity!("map_access", | inputs | == 2);
+            let map_type = inputs[0].try_into_map_type()?;
+            // We do not align the map's key type with the input type here, but cast the latter to the former instead.
+            // e.g., for {1:'a'}[1.0], if we align them, we will get "numeric" as the key type, which violates the map type's restriction.
+            match inputs[1].cast_implicit_mut(map_type.key()) {
+                Ok(()) => Ok(Some(map_type.value().clone())),
+                Err(_) => Err(ErrorCode::BindError(format!(
+                    "Cannot access {} in {}",
+                    inputs[1].return_type(),
+                    inputs[0].return_type(),
+                ))
+                .into()),
+            }
+        }
+        ExprType::MapContains => {
+            ensure_arity!("map_contains", | inputs | == 2);
+            let map_type = inputs[0].try_into_map_type()?;
+            match inputs[1].cast_implicit_mut(map_type.key()) {
+                Ok(()) => Ok(Some(DataType::Boolean)),
+                Err(_) => Err(ErrorCode::BindError(format!(
+                    "Cannot check if {} exists in {}",
+                    inputs[1].return_type(),
+                    inputs[0].return_type(),
+                ))
+                .into()),
+            }
+        }
+        ExprType::MapCat => {
+            ensure_arity!("map_cat", | inputs | == 2);
+            Ok(Some(align_types(inputs.iter_mut())?))
+        }
+        ExprType::MapInsert => {
+            ensure_arity!("map_insert", | inputs | == 3);
+            let map_type = inputs[0].try_into_map_type()?;
+            let rk = inputs[1].cast_implicit_mut(map_type.key());
+            let rv = inputs[2].cast_implicit_mut(map_type.value());
+            match (rk, rv) {
+                (Ok(()), Ok(())) => Ok(Some(map_type.into())),
+                _ => Err(ErrorCode::BindError(format!(
+                    "Cannot insert ({},{}) to {}",
+                    inputs[1].return_type(),
+                    inputs[2].return_type(),
+                    inputs[0].return_type(),
+                ))
+                .into()),
+            }
+        }
+        ExprType::MapDelete => {
+            ensure_arity!("map_delete", | inputs | == 2);
+            let map_type = inputs[0].try_into_map_type()?;
+            let rk = inputs[1].cast_implicit_mut(map_type.key());
+            match rk {
+                Ok(()) => Ok(Some(map_type.into())),
+                _ => Err(ErrorCode::BindError(format!(
+                    "Cannot delete {} from {}",
+                    inputs[1].return_type(),
+                    inputs[0].return_type(),
+                ))
+                .into()),
+            }
+        }
+        ExprType::L2Distance
+        | ExprType::CosineDistance
+        | ExprType::L1Distance
+        | ExprType::InnerProduct
+        | ExprType::Add
+        | ExprType::Subtract
+        | ExprType::Multiply => {
+            let Some(vec_arg_first) = inputs
+                .iter()
+                .find(|e| !e.is_untyped() && matches!(e.return_type(), DataType::Vector(_)))
+            else {
+                // no vector type, use general rules later
+                return Ok(None);
+            };
+            ensure_arity!(func_type.as_str_name().to_ascii_lowercase(), | inputs | == 2);
+            let vec_type = vec_arg_first.return_type();
+            if inputs[0].is_untyped() {
+                inputs[0].cast_implicit_mut(&vec_type)?;
+            }
+            if inputs[1].is_untyped() {
+                inputs[1].cast_implicit_mut(&vec_type)?;
+            }
+            let ret = match func_type {
+                ExprType::L2Distance
+                | ExprType::CosineDistance
+                | ExprType::L1Distance
+                | ExprType::InnerProduct => DataType::Float64,
+                ExprType::Add | ExprType::Subtract | ExprType::Multiply => vec_type,
+                _ => unreachable!(),
+            };
+            match (inputs[0].return_type(), inputs[1].return_type()) {
+                (DataType::Vector(l), DataType::Vector(r)) => match l == r {
+                    true => Ok(Some(ret)),
+                    false => Err(ErrorCode::BindError(format!(
+                        "different vector dimensions {l} and {r}"
+                    ))
+                    .into()),
+                },
+                _ => Ok(None), // would be rejected by general rules later
+            }
+        }
+        ExprType::VecConcat => {
+            use risingwave_common::types::ScalarImpl;
+            ensure_arity!("vec_concat", | inputs | == 2);
+            for input in inputs.iter_mut() {
+                if !input.is_untyped() {
+                    continue;
+                }
+                let ExprImpl::Literal(lit) = input else {
+                    // use general rules, which would reject with proper error message
+                    return Ok(None);
+                };
+                let Some(ScalarImpl::Utf8(lit)) = lit.get_data() else {
+                    // use general rules, which would reject with proper error message
+                    return Ok(None);
+                };
+                let guessed = lit.matches(',').count() + 1;
+                input.cast_explicit_mut(&DataType::Vector(guessed))?;
+            }
+            if let (DataType::Vector(l), DataType::Vector(r)) =
+                (inputs[0].return_type(), inputs[1].return_type())
+            {
+                let s = l
+                    .checked_add(r)
+                    .and_then(|s| (s <= DataType::VEC_MAX_SIZE).then_some(s))
+                    .ok_or_else(|| {
+                        ErrorCode::BindError(format!(
+                            "vector cannot have more than {} dimensions: {l} + {r}",
+                            DataType::VEC_MAX_SIZE
+                        ))
+                    })?;
+                Ok(Some(DataType::Vector(s)))
+            } else {
+                // use general rules, which would reject with proper error message
+                Ok(None)
+            }
+        }
+        // internal use only
+        ExprType::Vnode => Ok(Some(VirtualNode::RW_TYPE)),
+        // user-facing `rw_vnode`
+        ExprType::VnodeUser => {
+            ensure_arity!("rw_vnode", 2 <= | inputs |);
+            inputs[0].cast_explicit_mut(&DataType::Int32)?; // vnode count
             Ok(Some(VirtualNode::RW_TYPE))
         }
         ExprType::Greatest | ExprType::Least => {
@@ -606,7 +781,7 @@ fn infer_type_for_special(
         }
         ExprType::JsonbBuildArray => Ok(Some(DataType::Jsonb)),
         ExprType::JsonbBuildObject => {
-            if inputs.len() % 2 != 0 {
+            if !inputs.len().is_multiple_of(2) {
                 return Err(ErrorCode::BindError(
                     "argument list must have even number of elements".into(),
                 )
@@ -616,19 +791,55 @@ fn infer_type_for_special(
         }
         ExprType::JsonbExtractPath => {
             ensure_arity!("jsonb_extract_path", 2 <= | inputs |);
-            inputs[0].cast_implicit_mut(DataType::Jsonb)?;
+            inputs[0].cast_implicit_mut(&DataType::Jsonb)?;
             for input in inputs.iter_mut().skip(1) {
-                input.cast_implicit_mut(DataType::Varchar)?;
+                input.cast_implicit_mut(&DataType::Varchar)?;
             }
             Ok(Some(DataType::Jsonb))
         }
         ExprType::JsonbExtractPathText => {
             ensure_arity!("jsonb_extract_path_text", 2 <= | inputs |);
-            inputs[0].cast_implicit_mut(DataType::Jsonb)?;
+            inputs[0].cast_implicit_mut(&DataType::Jsonb)?;
             for input in inputs.iter_mut().skip(1) {
-                input.cast_implicit_mut(DataType::Varchar)?;
+                input.cast_implicit_mut(&DataType::Varchar)?;
             }
             Ok(Some(DataType::Varchar))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn infer_type_for_special_table_function(
+    func_type: PbTableFuncType,
+    inputs: &mut [ExprImpl],
+) -> Result<Option<DataType>> {
+    match func_type {
+        PbTableFuncType::GenerateSeries => {
+            if inputs.len() < 3 || !inputs[1].is_now() {
+                // let signature map handle this
+                return Ok(None);
+            }
+            // Now we are inferring type for `generate_series(start, now(), step)`, which will
+            // be further handled by `GenerateSeriesWithNowRule`.
+            if inputs[0].is_untyped() {
+                inputs[0].cast_implicit_mut(&DataType::Timestamptz)?;
+            }
+            if inputs[2].is_untyped() {
+                inputs[2].cast_implicit_mut(&DataType::Interval)?;
+            }
+            match (
+                inputs[0].return_type(),
+                inputs[1].return_type(),
+                inputs[2].return_type(),
+            ) {
+                (DataType::Timestamptz, DataType::Timestamptz, DataType::Interval) => {
+                    // This is to allow `generate_series('2024-06-20 00:00:00'::timestamptz, now(), interval '1 day')`,
+                    // which in streaming mode will be further converted to `StreamNow`.
+                    Ok(Some(DataType::Timestamptz))
+                }
+                // let signature map handle the rest
+                _ => Ok(None),
+            }
         }
         _ => Ok(None),
     }
@@ -690,6 +901,8 @@ pub fn infer_type_name<'a>(
     };
 
     if candidates.is_empty() {
+        // TODO: when type mismatches, show what are supported signatures for the
+        // function with the given name.
         bail_no_function!("{}", sig());
     }
 
@@ -735,7 +948,7 @@ fn implicit_ok(source: &DataType, target: &SigDataType, eq_ok: bool) -> bool {
 /// Find the top `candidates` that match `inputs` on most non-null positions. This covers Rule 2,
 /// 4a, 4c and 4d in [`PostgreSQL`](https://www.postgresql.org/docs/current/typeconv-func.html).
 ///
-/// * Rule 2 & 4c: Keep candidates that have most exact type matches. Exact match on all posistions
+/// * Rule 2 & 4c: Keep candidates that have most exact type matches. Exact match on all positions
 ///   is just a special case.
 /// * Rule 4d: Break ties by selecting those that accept preferred types at most positions.
 /// * Rule 4a: If the input cannot implicit cast to expected type at any position, this candidate is
@@ -936,7 +1149,7 @@ fn narrow_same_type<'a>(
 }
 
 struct TypeDisplay<'a>(&'a Option<DataType>);
-impl<'a> std::fmt::Display for TypeDisplay<'a> {
+impl std::fmt::Display for TypeDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             Some(t) => t.fmt(f),

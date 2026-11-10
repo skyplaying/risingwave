@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cell::RefCell;
-
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::bail_not_implemented;
 
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    generic, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PlanTreeNodeUnary,
-    PredicatePushdown, ToBatch, ToStream,
+    ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef, PlanBase, PlanTreeNodeUnary,
+    PredicatePushdown, ShareNode, StreamPlanRef, ToBatch, ToStream, generic,
 };
 use crate::error::Result;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::generic::GenericPlanRef;
+use crate::optimizer::plan_node::generic::{GenericPlanRef, Share};
 use crate::optimizer::plan_node::{
     ColumnPruningContext, PredicatePushdownContext, RewriteStreamContext, StreamShare,
     ToStreamContext,
 };
+use crate::optimizer::{OptimizerContextRef, ShareId};
 use crate::utils::{ColIndexMapping, Condition};
 
 /// `LogicalShare` operator is used to represent reusing of existing operators.
@@ -56,13 +55,18 @@ pub struct LogicalShare {
 
 impl LogicalShare {
     pub fn new(input: PlanRef) -> Self {
-        let _ctx = input.ctx();
-        let _functional_dependency = input.functional_dependency().clone();
-        let core = generic::Share {
-            input: RefCell::new(input),
-        };
-        let base = PlanBase::new_logical_with_core(&core);
+        let ctx = input.ctx();
+        let core = ctx.register_logical_share(input);
+        Self::with_core(core)
+    }
+
+    fn with_core(core: generic::Share<PlanRef>) -> Self {
+        let base = PlanBase::new_logical_share(&core);
         LogicalShare { base, core }
+    }
+
+    pub(in crate::optimizer) fn from_share_id(ctx: OptimizerContextRef, share_id: ShareId) -> Self {
+        Self::with_core(ctx.logical_share(share_id))
     }
 
     pub fn create(input: PlanRef) -> PlanRef {
@@ -74,16 +78,15 @@ impl LogicalShare {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalShare {
+impl PlanTreeNodeUnary<Logical> for LogicalShare {
     fn input(&self) -> PlanRef {
-        self.core.input.borrow().clone()
+        self.core.input()
     }
 
-    fn clone_with_input(&self, input: PlanRef) -> Self {
-        Self::new(input)
+    fn clone_with_input(&self, _input: PlanRef) -> Self {
+        unreachable!("shared node should be handled specially in PlanRef::clone_with_input")
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -93,11 +96,29 @@ impl PlanTreeNodeUnary for LogicalShare {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalShare}
+impl_plan_tree_node_for_unary! { Logical, LogicalShare}
 
-impl LogicalShare {
-    pub fn replace_input(&self, plan: PlanRef) {
-        *self.core.input.borrow_mut() = plan;
+impl ShareNode<Logical> for LogicalShare {
+    fn share_id(&self) -> ShareId {
+        self.core.share_id()
+    }
+
+    fn new_share(core: Share<PlanRef>) -> PlanRef {
+        Self::with_core(core).into()
+    }
+
+    fn replace_input(&self, plan: PlanRef) -> PlanRef {
+        debug_assert!(
+            self.schema().type_eq(plan.schema()),
+            "replacing a logical share input must preserve its schema"
+        );
+        self.ctx()
+            .update_logical_share(self.share_id(), plan.clone());
+        Self::with_core(self.core.with_input(plan)).into()
+    }
+
+    fn fork_with_input(&self, plan: PlanRef) -> PlanRef {
+        Self::new(plan).into()
     }
 }
 
@@ -113,7 +134,7 @@ impl ColPrunable for LogicalShare {
     }
 }
 
-impl ExprRewritable for LogicalShare {}
+impl ExprRewritable<Logical> for LogicalShare {}
 
 impl ExprVisitable for LogicalShare {}
 
@@ -130,20 +151,21 @@ impl PredicatePushdown for LogicalShare {
 }
 
 impl ToBatch for LogicalShare {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         bail_not_implemented!("batch query doesn't support share operator for now");
     }
 }
 
 impl ToStream for LogicalShare {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
-        match ctx.get_to_stream_result(self.id()) {
+    fn to_stream(
+        &self,
+        ctx: &mut ToStreamContext,
+    ) -> Result<crate::optimizer::plan_node::StreamPlanRef> {
+        match ctx.get_to_stream_result(self.share_id()) {
             None => {
                 let new_input = self.input().to_stream(ctx)?;
-                let new_logical = self.core.clone();
-                new_logical.replace_input(new_input);
-                let stream_share_ref: PlanRef = StreamShare::new(new_logical).into();
-                ctx.add_to_stream_result(self.id(), stream_share_ref.clone());
+                let stream_share_ref: StreamPlanRef = StreamShare::new_from_input(new_input).into();
+                ctx.add_to_stream_result(self.share_id(), stream_share_ref.clone());
                 Ok(stream_share_ref)
             }
             Some(cache) => Ok(cache.clone()),
@@ -154,11 +176,11 @@ impl ToStream for LogicalShare {
         &self,
         ctx: &mut RewriteStreamContext,
     ) -> Result<(PlanRef, ColIndexMapping)> {
-        match ctx.get_rewrite_result(self.id()) {
+        match ctx.get_rewrite_result(self.share_id()) {
             None => {
                 let (new_input, col_change) = self.input().logical_rewrite_for_stream(ctx)?;
-                let new_share: PlanRef = self.clone_with_input(new_input).into();
-                ctx.add_rewrite_result(self.id(), new_share.clone(), col_change.clone());
+                let new_share: PlanRef = Self::new(new_input).into();
+                ctx.add_rewrite_result(self.share_id(), new_share.clone(), col_change.clone());
                 Ok((new_share, col_change))
             }
             Some(cache) => Ok(cache.clone()),
@@ -184,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn test_share_predicate_pushdown() {
         let ty = DataType::Int32;
-        let ctx = OptimizerContext::mock().await;
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = vec![
             Field::with_name(ty.clone(), "v1"),
             Field::with_name(ty.clone(), "v2"),
@@ -199,7 +221,7 @@ mod tests {
                 Type::Equal,
                 vec![
                     ExprImpl::InputRef(Box::new(InputRef::new(1, ty.clone()))),
-                    ExprImpl::InputRef(Box::new(InputRef::new(3, ty.clone()))),
+                    ExprImpl::InputRef(Box::new(InputRef::new(3, ty))),
                 ],
             )
             .unwrap(),

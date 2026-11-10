@@ -1,10 +1,10 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,41 +19,14 @@ use std::sync::LazyLock;
 
 use itertools::Itertools;
 use risingwave_common::types::{DataType, DataTypeName};
-use risingwave_expr::aggregate::AggKind;
-use risingwave_expr::sig::{FuncSign, FUNCTION_REGISTRY};
-use risingwave_frontend::expr::{cast_sigs, CastContext, CastSig as RwCastSig, ExprType};
-use risingwave_sqlparser::ast::{BinaryOperator, DataType as AstDataType, StructField};
+use risingwave_expr::aggregate::PbAggKind;
+use risingwave_expr::sig::{FUNCTION_REGISTRY, FuncSign};
+use risingwave_frontend::expr::{CastContext, CastSig as RwCastSig, ExprType, cast_sigs};
+use risingwave_sqlparser::ast::{BinaryOperator, DataType as AstDataType};
 
 pub(super) fn data_type_to_ast_data_type(data_type: &DataType) -> AstDataType {
-    match data_type {
-        DataType::Boolean => AstDataType::Boolean,
-        DataType::Int16 => AstDataType::SmallInt,
-        DataType::Int32 => AstDataType::Int,
-        DataType::Int64 => AstDataType::BigInt,
-        DataType::Int256 => AstDataType::Custom(vec!["rw_int256".into()].into()),
-        DataType::Serial => unreachable!("serial should not be generated"),
-        DataType::Decimal => AstDataType::Decimal(None, None),
-        DataType::Float32 => AstDataType::Real,
-        DataType::Float64 => AstDataType::Double,
-        DataType::Varchar => AstDataType::Varchar,
-        DataType::Bytea => AstDataType::Bytea,
-        DataType::Date => AstDataType::Date,
-        DataType::Timestamp => AstDataType::Timestamp(false),
-        DataType::Timestamptz => AstDataType::Timestamp(true),
-        DataType::Time => AstDataType::Time(false),
-        DataType::Interval => AstDataType::Interval,
-        DataType::Jsonb => AstDataType::Custom(vec!["JSONB".into()].into()),
-        DataType::Struct(inner) => AstDataType::Struct(
-            inner
-                .iter()
-                .map(|(name, typ)| StructField {
-                    name: name.into(),
-                    data_type: data_type_to_ast_data_type(typ),
-                })
-                .collect(),
-        ),
-        DataType::List(ref typ) => AstDataType::Array(Box::new(data_type_to_ast_data_type(typ))),
-    }
+    use risingwave_frontend::DataTypeToAst as _;
+    data_type.to_ast()
 }
 
 fn data_type_name_to_ast_data_type(data_type_name: &DataTypeName) -> Option<DataType> {
@@ -116,6 +89,11 @@ static FUNC_BAN_LIST: LazyLock<HashSet<ExprType>> = LazyLock::new(|| {
         ExprType::Sqrt,
         // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
         ExprType::Pow,
+        // ENABLE: https://github.com/risingwavelabs/risingwave/issues/7328
+        ExprType::Position,
+        // ENABLE: https://github.com/risingwavelabs/risingwave/issues/7328
+        #[expect(deprecated)]
+        ExprType::Strpos,
     ]
     .into_iter()
     .collect()
@@ -176,18 +154,20 @@ pub(crate) static AGG_FUNC_TABLE: LazyLock<HashMap<DataType, Vec<&'static FuncSi
                     && func.ret_type.is_exact()
                     // Ignored functions
                     && ![
-                        AggKind::InternalLastSeenValue, // Use internally
-                        AggKind::Sum0, // Used internally
-                        AggKind::BitAnd,
-                        AggKind::BitOr,
-                        AggKind::BoolAnd,
-                        AggKind::BoolOr,
-                        AggKind::PercentileCont,
-                        AggKind::PercentileDisc,
-                        AggKind::Mode,
-                        AggKind::JsonbObjectAgg, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
-                        AggKind::StddevSamp, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
-                        AggKind::VarSamp, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
+                        PbAggKind::InternalLastSeenValue, // Use internally
+                        PbAggKind::Sum0, // Used internally
+                        PbAggKind::ApproxCountDistinct,
+                        PbAggKind::BitAnd,
+                        PbAggKind::BitOr,
+                        PbAggKind::BoolAnd,
+                        PbAggKind::BoolOr,
+                        PbAggKind::PercentileCont,
+                        PbAggKind::PercentileDisc,
+                        PbAggKind::Mode,
+                        PbAggKind::ApproxPercentile, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
+                        PbAggKind::JsonbObjectAgg, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
+                        PbAggKind::StddevSamp, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
+                        PbAggKind::VarSamp, // ENABLE: https://github.com/risingwavelabs/risingwave/issues/16293
                     ]
                     .contains(&func.name.as_aggregate())
                     // Exclude 2 phase agg global sum.
@@ -195,7 +175,7 @@ pub(crate) static AGG_FUNC_TABLE: LazyLock<HashMap<DataType, Vec<&'static FuncSi
                     // Otherwise it conflicts with normal aggregation:
                     // Sum(Int64) -> Decimal.
                     // And sqlsmith will generate expressions with wrong types.
-                    && if func.name.as_aggregate() == AggKind::Sum {
+                    && if func.name.as_aggregate() == PbAggKind::Sum {
                        !(func.inputs_type[0].as_exact() == &DataType::Int64 && func.ret_type.as_exact() == &DataType::Int64)
                     } else {
                        true

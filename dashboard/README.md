@@ -29,19 +29,22 @@ TODO: Find a suitable testing framework
 ## Development
 
 Start a RisingWave cluster, create some tables and materialized views for testing purposes.
-For example:
 
 ```bash
-./risedev d
-sqllogictest -p 4566 -d dev './e2e_test/nexmark/create_tables.slt.part'
-sqllogictest -p 4566 -d dev './e2e_test/streaming/nexmark/create_views.slt.part'
+# Start full cluster so prometheus is available.
+./risedev down
+./risedev d dashboard
+# We maintain our own separate test data for testing the dashboard's rendering
+# It provides nested MV-on-MV structures (nexmark and tpch only have 1-deep MV-on-MV).
+# It also provides backpressure and lag scenarios.
+./risedev slt e2e_test/dashboard/create_graph.slt.part --label dashboard
 ```
 
 Install dependencies and start the development server.
 
 ```bash
-npm i
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
 The dashboard is now served at port 3000.
@@ -64,7 +67,7 @@ The dashboard built with the latest sources will be served by meta node at port 
 
 ### Generate the protos
 
-Running `npm i` will generate the proto files under `proto/gen` automatically. In case there are modifications to the protos, you can regenerate them using the command npm run gen-proto.
+Running `pnpm install` will generate the proto files under `proto/gen` automatically. In case there are modifications to the protos, you can regenerate them using the command `pnpm run gen-proto`.
 
 ### Static HTML files
 
@@ -72,7 +75,7 @@ Build static files for standalone deployment without node.js. The built files ar
 Check more details at [Static HTML Export](https://nextjs.org/docs/advanced-features/static-html-export).
 
 ```bash
-npm run build
+pnpm run build
 ```
 
 The built files are generated at `./out`.

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -23,25 +23,29 @@ use risingwave_common::memory::MemoryContext;
 use risingwave_common::util::runtime::BackgroundShutdownRuntime;
 use risingwave_common::util::tracing::TracingContext;
 use risingwave_pb::batch_plan::{PbTaskId, PbTaskOutputId, PlanFragment};
-use risingwave_pb::common::BatchQueryEpoch;
 use risingwave_pb::plan_common::ExprContext;
 use risingwave_pb::task_service::task_info_response::TaskStatus;
 use risingwave_pb::task_service::{GetDataResponse, TaskInfoResponse};
 use tokio::sync::mpsc::Sender;
 use tonic::Status;
 
+use super::BatchTaskContext;
 use crate::error::Result;
 use crate::monitor::BatchManagerMetrics;
 use crate::rpc::service::exchange::GrpcExchangeWriter;
-use crate::task::{
-    BatchTaskExecution, ComputeNodeContext, StateReporter, TaskId, TaskOutput, TaskOutputId,
-};
+use crate::task::{BatchTaskExecution, StateReporter, TaskId, TaskOutput, TaskOutputId};
+
+pub mod await_tree_key {
+    /// Await-tree key type for batch tasks.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct BatchTask(pub crate::task::TaskId);
+}
 
 /// `BatchManager` is responsible for managing all batch tasks.
 #[derive(Clone)]
 pub struct BatchManager {
     /// Every task id has a corresponding task execution.
-    tasks: Arc<Mutex<HashMap<TaskId, Arc<BatchTaskExecution<ComputeNodeContext>>>>>,
+    tasks: Arc<Mutex<HashMap<TaskId, Arc<BatchTaskExecution>>>>,
 
     /// Runtime for the batch manager.
     runtime: Arc<BackgroundShutdownRuntime>,
@@ -54,10 +58,18 @@ pub struct BatchManager {
 
     /// Metrics for batch manager.
     metrics: Arc<BatchManagerMetrics>,
+
+    /// Registry for await-tree.
+    await_tree_reg: Option<await_tree::Registry>,
 }
 
 impl BatchManager {
-    pub fn new(config: BatchConfig, metrics: Arc<BatchManagerMetrics>, mem_limit: u64) -> Self {
+    pub fn new(
+        config: BatchConfig,
+        metrics: Arc<BatchManagerMetrics>,
+        mem_limit: u64,
+        await_tree_config: Option<await_tree::Config>,
+    ) -> Self {
         let runtime = {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             if let Some(worker_threads_num) = config.worker_threads_num {
@@ -77,7 +89,13 @@ impl BatchManager {
             config,
             metrics,
             mem_context,
+            await_tree_reg: await_tree_config.map(await_tree::Registry::new),
         }
+    }
+
+    /// Get the registry of await-trees.
+    pub fn await_tree_reg(&self) -> Option<&await_tree::Registry> {
+        self.await_tree_reg.as_ref()
     }
 
     pub(crate) fn metrics(&self) -> Arc<BatchManagerMetrics> {
@@ -92,14 +110,19 @@ impl BatchManager {
         self: &Arc<Self>,
         tid: &PbTaskId,
         plan: PlanFragment,
-        epoch: BatchQueryEpoch,
-        context: ComputeNodeContext,
+        context: Arc<dyn BatchTaskContext>, // ComputeNodeContext
         state_reporter: StateReporter,
         tracing_context: TracingContext,
         expr_context: ExprContext,
     ) -> Result<()> {
         trace!("Received task id: {:?}, plan: {:?}", tid, plan);
-        let task = BatchTaskExecution::new(tid, plan, context, epoch, self.runtime())?;
+        let task = BatchTaskExecution::new(
+            tid,
+            plan,
+            context,
+            self.runtime(),
+            self.await_tree_reg.clone(),
+        )?;
         let task_id = task.get_task_id().clone();
         let task = Arc::new(task);
         // Here the task id insert into self.tasks is put in front of `.async_execute`, cuz when
@@ -119,7 +142,7 @@ impl BatchManager {
             Ok(())
         } else {
             bail!(
-                "can not create duplicate task with the same id: {:?}",
+                "cannot create a duplicate task with the same ID: {:?}",
                 task_id,
             );
         };
@@ -137,17 +160,17 @@ impl BatchManager {
         tid: &PbTaskId,
         plan: PlanFragment,
     ) -> Result<()> {
-        use risingwave_hummock_sdk::to_committed_batch_query_epoch;
+        use crate::task::ComputeNodeContext;
 
         self.fire_task(
             tid,
             plan,
-            to_committed_batch_query_epoch(0),
             ComputeNodeContext::for_test(),
             StateReporter::new_with_test(),
             TracingContext::none(),
             ExprContext {
-                time_zone: "UTC".to_string(),
+                time_zone: "UTC".to_owned(),
+                strict_mode: false,
             },
         )
         .await
@@ -174,7 +197,7 @@ impl BatchManager {
                 .send(TaskInfoResponse {
                     task_id: Some(task_id.to_prost()),
                     task_status: TaskStatus::Ping.into(),
-                    error_message: "".to_string(),
+                    error_message: "".to_owned(),
                 })
                 .await
                 .is_err()
@@ -198,16 +221,19 @@ impl BatchManager {
         let mut task_output = self.take_output(pb_task_output_id)?;
         self.runtime.spawn(async move {
             let mut writer = GrpcExchangeWriter::new(tx.clone());
-            match task_output.take_data(&mut writer).await {
-                Ok(_) => {
-                    tracing::trace!(
-                        from = ?task_id,
-                        "exchanged {} chunks",
-                        writer.written_chunks(),
-                    );
-                    Ok(())
-                }
-                Err(e) => tx.send(Err(e.into())).await,
+            tokio::select! {
+                result = task_output.take_data(&mut writer) => match result {
+                    Ok(_) => {
+                        tracing::trace!(
+                            from = ?task_id,
+                            "exchanged {} chunks",
+                            writer.written_chunks(),
+                        );
+                        Ok(())
+                    }
+                    Err(e) => tx.send(Err(e.into())).await,
+                },
+                _ = tx.closed() => Ok(()),
             }
         });
         Ok(())
@@ -291,7 +317,7 @@ mod tests {
     use risingwave_pb::batch_plan::exchange_info::DistributionMode;
     use risingwave_pb::batch_plan::plan_node::NodeBody;
     use risingwave_pb::batch_plan::{
-        ExchangeInfo, PbTaskId, PbTaskOutputId, PlanFragment, PlanNode, ValuesNode,
+        ExchangeInfo, PbTaskId, PbTaskOutputId, PlanFragment, PlanNode,
     };
 
     use crate::monitor::BatchManagerMetrics;
@@ -303,11 +329,12 @@ mod tests {
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
             u64::MAX,
+            None,
         ));
         let task_id = TaskId {
             task_id: 0,
             stage_id: 0,
-            query_id: "abc".to_string(),
+            query_id: "abc".to_owned(),
         };
 
         let error = manager.check_if_task_running(&task_id).unwrap_err();
@@ -326,45 +353,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_id_conflict() {
-        let manager = Arc::new(BatchManager::new(
-            BatchConfig::default(),
-            BatchManagerMetrics::for_test(),
-            u64::MAX,
-        ));
-        let plan = PlanFragment {
-            root: Some(PlanNode {
-                children: vec![],
-                identity: "".to_string(),
-                node_body: Some(NodeBody::Values(ValuesNode {
-                    tuples: vec![],
-                    fields: vec![],
-                })),
-            }),
-            exchange_info: Some(ExchangeInfo {
-                mode: DistributionMode::Single as i32,
-                distribution: None,
-            }),
-        };
-        let task_id = PbTaskId {
-            query_id: "".to_string(),
-            stage_id: 0,
-            task_id: 0,
-        };
-        manager
-            .fire_task_for_test(&task_id, plan.clone())
-            .await
-            .unwrap();
-        let err = manager
-            .fire_task_for_test(&task_id, plan)
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("can not create duplicate task with the same id"));
-    }
-
-    #[tokio::test]
     // see https://github.com/risingwavelabs/risingwave/issues/11979
     #[ignore]
     async fn test_task_cancel_for_busy_loop() {
@@ -372,11 +360,12 @@ mod tests {
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
             u64::MAX,
+            None,
         ));
         let plan = PlanFragment {
             root: Some(PlanNode {
                 children: vec![],
-                identity: "".to_string(),
+                identity: "".to_owned(),
                 node_body: Some(NodeBody::BusyLoopExecutor(true)),
             }),
             exchange_info: Some(ExchangeInfo {
@@ -385,7 +374,7 @@ mod tests {
             }),
         };
         let task_id = PbTaskId {
-            query_id: "".to_string(),
+            query_id: "".to_owned(),
             stage_id: 0,
             task_id: 0,
         };
@@ -403,11 +392,12 @@ mod tests {
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
             u64::MAX,
+            None,
         ));
         let plan = PlanFragment {
             root: Some(PlanNode {
                 children: vec![],
-                identity: "".to_string(),
+                identity: "".to_owned(),
                 node_body: Some(NodeBody::BusyLoopExecutor(true)),
             }),
             exchange_info: Some(ExchangeInfo {
@@ -416,7 +406,7 @@ mod tests {
             }),
         };
         let task_id = PbTaskId {
-            query_id: "".to_string(),
+            query_id: "".to_owned(),
             stage_id: 0,
             task_id: 0,
         };

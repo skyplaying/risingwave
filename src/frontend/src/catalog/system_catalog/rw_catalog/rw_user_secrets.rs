@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::id::UserId;
 use risingwave_common::types::Fields;
 use risingwave_frontend_macro::system_catalog;
 
@@ -24,7 +25,7 @@ use crate::user::user_authentication::encrypted_raw_password;
 #[derive(Fields)]
 struct RwUserSecret {
     #[primary_key]
-    id: i32,
+    id: UserId,
     password: Option<String>,
 }
 
@@ -42,7 +43,7 @@ fn read_rw_user_secrets_info(reader: &SysCatalogReaderImpl) -> Result<Vec<RwUser
         Some(user) => {
             if !user.is_super {
                 return Err(ErrorCode::PermissionDenied(
-                    "permission denied for table rw_user_secrets".to_string(),
+                    "permission denied for table \"rw_catalog.rw_user_secrets\"".to_owned(),
                 )
                 .into());
             }
@@ -53,7 +54,7 @@ fn read_rw_user_secrets_info(reader: &SysCatalogReaderImpl) -> Result<Vec<RwUser
     Ok(users
         .into_iter()
         .map(|user| RwUserSecret {
-            id: user.id as i32,
+            id: user.id,
             password: user.auth_info.as_ref().map(encrypted_raw_password),
         })
         .collect())

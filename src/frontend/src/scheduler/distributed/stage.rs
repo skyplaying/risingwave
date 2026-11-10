@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::assert_matches::assert_matches;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::mem;
 use std::pin::pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{assert_matches, mem};
 
+use StageEvent::Failed;
 use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use futures::stream::Fuse;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use futures_async_stream::for_await;
 use itertools::Itertools;
 use risingwave_batch::error::BatchError;
@@ -40,31 +38,30 @@ use risingwave_expr::expr_context::expr_context_scope;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::{
     DistributedLookupJoinNode, ExchangeNode, ExchangeSource, MergeSortExchangeNode, PlanFragment,
-    PlanNode as PlanNodePb, PlanNode, TaskId as TaskIdPb, TaskOutputId,
+    PlanNode as PbPlanNode, PlanNode, TaskId as PbTaskId, TaskOutputId,
 };
-use risingwave_pb::common::{BatchQueryEpoch, HostAddress, WorkerNode};
+use risingwave_pb::common::{HostAddress, WorkerNode};
 use risingwave_pb::plan_common::ExprContext;
 use risingwave_pb::task_service::{CancelTaskRequest, TaskInfoResponse};
-use risingwave_rpc_client::error::RpcError;
 use risingwave_rpc_client::ComputeClientPoolRef;
+use risingwave_rpc_client::error::RpcError;
 use rw_futures_util::select_all;
 use thiserror_ext::AsReport;
 use tokio::spawn;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tonic::Streaming;
-use tracing::{debug, error, warn, Instrument};
-use StageEvent::Failed;
+use tracing::{Instrument, debug, error, warn};
 
 use crate::catalog::catalog_service::CatalogReader;
 use crate::catalog::{FragmentId, TableId};
-use crate::optimizer::plan_node::PlanNodeType;
-use crate::scheduler::distributed::stage::StageState::Pending;
-use crate::scheduler::distributed::QueryMessage;
-use crate::scheduler::plan_fragmenter::{
-    ExecutionPlanNode, PartitionInfo, QueryStageRef, StageId, TaskId, ROOT_TASK_ID,
-};
+use crate::optimizer::plan_node::BatchPlanNodeType;
 use crate::scheduler::SchedulerError::{TaskExecutionError, TaskRunningOutOfMemory};
+use crate::scheduler::distributed::QueryMessage;
+use crate::scheduler::distributed::stage::StageState::Pending;
+use crate::scheduler::plan_fragmenter::{
+    ExecutionPlanNode, PartitionInfo, Query, ROOT_TASK_ID, StageId, TaskId,
+};
 use crate::scheduler::{ExecutionContextRef, SchedulerError, SchedulerResult};
 
 const TASK_SCHEDULING_PARALLELISM: usize = 10;
@@ -94,7 +91,7 @@ pub enum StageEvent {
         reason: SchedulerError,
     },
     /// All tasks in stage finished.
-    Completed(StageId),
+    Completed(#[expect(dead_code)] StageId),
 }
 
 #[derive(Clone)]
@@ -110,8 +107,8 @@ struct TaskStatusHolder {
 }
 
 pub struct StageExecution {
-    epoch: BatchQueryEpoch,
-    stage: QueryStageRef,
+    stage_id: StageId,
+    query: Arc<Query>,
     worker_node_manager: WorkerNodeSelector,
     tasks: Arc<HashMap<TaskId, TaskStatusHolder>>,
     state: Arc<RwLock<StageState>>,
@@ -128,9 +125,9 @@ pub struct StageExecution {
 }
 
 struct StageRunner {
-    epoch: BatchQueryEpoch,
     state: Arc<RwLock<StageState>>,
-    stage: QueryStageRef,
+    stage_id: StageId,
+    query: Arc<Query>,
     worker_node_manager: WorkerNodeSelector,
     tasks: Arc<HashMap<TaskId, TaskStatusHolder>>,
     // Send message to `QueryRunner` to notify stage state change.
@@ -160,10 +157,9 @@ impl TaskStatusHolder {
 }
 
 impl StageExecution {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        epoch: BatchQueryEpoch,
-        stage: QueryStageRef,
+        stage_id: StageId,
+        query: Arc<Query>,
         worker_node_manager: WorkerNodeSelector,
         msg_sender: Sender<QueryMessage>,
         children: Vec<Arc<StageExecution>>,
@@ -171,13 +167,13 @@ impl StageExecution {
         catalog_reader: CatalogReader,
         ctx: ExecutionContextRef,
     ) -> Self {
-        let tasks = (0..stage.parallelism.unwrap())
+        let tasks = (0..query.stage(stage_id).parallelism.unwrap())
             .map(|task_id| (task_id as u64, TaskStatusHolder::new(task_id as u64)))
             .collect();
 
         Self {
-            epoch,
-            stage,
+            stage_id,
+            query,
             worker_node_manager,
             tasks: Arc::new(tasks),
             state: Arc::new(RwLock::new(Pending { msg_sender })),
@@ -196,8 +192,8 @@ impl StageExecution {
         match cur_state {
             Pending { msg_sender } => {
                 let runner = StageRunner {
-                    epoch: self.epoch.clone(),
-                    stage: self.stage.clone(),
+                    stage_id: self.stage_id,
+                    query: self.query.clone(),
                     worker_node_manager: self.worker_node_manager.clone(),
                     tasks: self.tasks.clone(),
                     msg_sender,
@@ -219,9 +215,9 @@ impl StageExecution {
 
                 let span = tracing::info_span!(
                     "stage",
-                    "otel.name" = format!("Stage {}-{}", self.stage.query_id.id, self.stage.id),
-                    query_id = self.stage.query_id.id,
-                    stage_id = self.stage.id,
+                    "otel.name" = format!("Stage {}-{}", self.query.query_id.id, self.stage_id),
+                    query_id = self.query.query_id.id,
+                    stage_id = %self.stage_id,
                 );
                 self.ctx
                     .session()
@@ -231,8 +227,8 @@ impl StageExecution {
 
                 tracing::trace!(
                     "Stage {:?}-{:?} started.",
-                    self.stage.query_id.id,
-                    self.stage.id
+                    self.query.query_id.id,
+                    self.stage_id
                 )
             }
             _ => {
@@ -255,8 +251,8 @@ impl StageExecution {
                 // The stage runner handle has already closed. so do no-op.
                 tracing::trace!(
                     "Failed to send stop message stage: {:?}-{:?}",
-                    self.stage.query_id,
-                    self.stage.id
+                    self.query.query_id,
+                    self.stage_id
                 );
             }
         }
@@ -264,7 +260,7 @@ impl StageExecution {
 
     pub async fn is_scheduled(&self) -> bool {
         let s = self.state.read().await;
-        matches!(*s, StageState::Running { .. } | StageState::Completed)
+        matches!(*s, StageState::Running | StageState::Completed)
     }
 
     pub async fn is_pending(&self) -> bool {
@@ -294,9 +290,9 @@ impl StageExecution {
             .iter()
             .map(|(task_id, status_holder)| {
                 let task_output_id = TaskOutputId {
-                    task_id: Some(TaskIdPb {
-                        query_id: self.stage.query_id.id.clone(),
-                        stage_id: self.stage.id,
+                    task_id: Some(PbTaskId {
+                        query_id: self.query.query_id.id.clone(),
+                        stage_id: self.stage_id.into(),
                         task_id: *task_id,
                     }),
                     output_id,
@@ -317,12 +313,12 @@ impl StageRunner {
         if let Err(e) = self.schedule_tasks_for_all(shutdown_rx).await {
             error!(
                 error = %e.as_report(),
-                query_id = ?self.stage.query_id,
-                stage_id = ?self.stage.id,
+                query_id = ?self.query.query_id,
+                stage_id = ?self.stage_id,
                 "Failed to schedule tasks"
             );
             self.send_event(QueryMessage::Stage(Failed {
-                id: self.stage.id,
+                id: self.stage_id,
                 reason: e,
             }))
             .await;
@@ -344,8 +340,9 @@ impl StageRunner {
         expr_context: ExprContext,
     ) -> SchedulerResult<()> {
         let mut futures = vec![];
+        let stage = &self.query.stage(self.stage_id);
 
-        if let Some(table_scan_info) = self.stage.table_scan_info.as_ref()
+        if let Some(table_scan_info) = stage.table_scan_info.as_ref()
             && let Some(vnode_bitmaps) = table_scan_info.partitions()
         {
             // If the stage has table scan nodes, we create tasks according to the data distribution
@@ -364,9 +361,9 @@ impl StageRunner {
                 .zip_eq_fast(workers.into_iter())
                 .enumerate()
             {
-                let task_id = TaskIdPb {
-                    query_id: self.stage.query_id.id.clone(),
-                    stage_id: self.stage.id,
+                let task_id = PbTaskId {
+                    query_id: self.query.query_id.id.clone(),
+                    stage_id: self.stage_id.into(),
                     task_id: i as u64,
                 };
                 let vnode_ranges = vnode_bitmaps[&worker_slot_id].clone();
@@ -379,25 +376,69 @@ impl StageRunner {
                     expr_context.clone(),
                 ));
             }
-        } else if let Some(source_info) = self.stage.source_info.as_ref() {
-            let chunk_size = (source_info.split_info().unwrap().len() as f32
-                / self.stage.parallelism.unwrap() as f32)
+        } else if let Some(source_info) = stage.source_info.as_ref() {
+            // If there is no file in source, the `chunk_size` is set to 1.
+            let chunk_size = ((source_info.split_info().unwrap().len() as f32
+                / stage.parallelism.unwrap() as f32)
+                .ceil() as usize)
+                .max(1);
+            if source_info.split_info().unwrap().is_empty() {
+                // No file in source, schedule an empty task.
+                const EMPTY_TASK_ID: u64 = 0;
+                let task_id = PbTaskId {
+                    query_id: self.query.query_id.id.clone(),
+                    stage_id: self.stage_id.into(),
+                    task_id: EMPTY_TASK_ID,
+                };
+                let plan_fragment =
+                    self.create_plan_fragment(EMPTY_TASK_ID, Some(PartitionInfo::Source(vec![])));
+                let worker =
+                    self.choose_worker(&plan_fragment, EMPTY_TASK_ID as u32, stage.dml_table_id)?;
+                futures.push(self.schedule_task(
+                    task_id,
+                    plan_fragment,
+                    worker,
+                    expr_context.clone(),
+                ));
+            } else {
+                for (id, split) in source_info
+                    .split_info()
+                    .unwrap()
+                    .chunks(chunk_size)
+                    .enumerate()
+                {
+                    let task_id = PbTaskId {
+                        query_id: self.query.query_id.id.clone(),
+                        stage_id: self.stage_id.into(),
+                        task_id: id as u64,
+                    };
+                    let plan_fragment = self.create_plan_fragment(
+                        id as u64,
+                        Some(PartitionInfo::Source(split.to_vec())),
+                    );
+                    let worker =
+                        self.choose_worker(&plan_fragment, id as u32, stage.dml_table_id)?;
+                    futures.push(self.schedule_task(
+                        task_id,
+                        plan_fragment,
+                        worker,
+                        expr_context.clone(),
+                    ));
+                }
+            }
+        } else if let Some(file_scan_info) = stage.file_scan_info.as_ref() {
+            let chunk_size = (file_scan_info.file_location.len() as f32
+                / stage.parallelism.unwrap() as f32)
                 .ceil() as usize;
-            for (id, split) in source_info
-                .split_info()
-                .unwrap()
-                .chunks(chunk_size)
-                .enumerate()
-            {
-                let task_id = TaskIdPb {
-                    query_id: self.stage.query_id.id.clone(),
-                    stage_id: self.stage.id,
+            for (id, files) in file_scan_info.file_location.chunks(chunk_size).enumerate() {
+                let task_id = PbTaskId {
+                    query_id: self.query.query_id.id.clone(),
+                    stage_id: self.stage_id.into(),
                     task_id: id as u64,
                 };
-                let plan_fragment = self
-                    .create_plan_fragment(id as u64, Some(PartitionInfo::Source(split.to_vec())));
-                let worker =
-                    self.choose_worker(&plan_fragment, id as u32, self.stage.dml_table_id)?;
+                let plan_fragment =
+                    self.create_plan_fragment(id as u64, Some(PartitionInfo::File(files.to_vec())));
+                let worker = self.choose_worker(&plan_fragment, id as u32, stage.dml_table_id)?;
                 futures.push(self.schedule_task(
                     task_id,
                     plan_fragment,
@@ -406,14 +447,14 @@ impl StageRunner {
                 ));
             }
         } else {
-            for id in 0..self.stage.parallelism.unwrap() {
-                let task_id = TaskIdPb {
-                    query_id: self.stage.query_id.id.clone(),
-                    stage_id: self.stage.id,
+            for id in 0..stage.parallelism.unwrap() {
+                let task_id = PbTaskId {
+                    query_id: self.query.query_id.id.clone(),
+                    stage_id: self.stage_id.into(),
                     task_id: id as u64,
                 };
                 let plan_fragment = self.create_plan_fragment(id as u64, None);
-                let worker = self.choose_worker(&plan_fragment, id, self.stage.dml_table_id)?;
+                let worker = self.choose_worker(&plan_fragment, id, stage.dml_table_id)?;
                 futures.push(self.schedule_task(
                     task_id,
                     plan_fragment,
@@ -439,9 +480,9 @@ impl StageRunner {
         while let Some(status_res_inner) = all_streams.next().await {
             match status_res_inner {
                 Ok(status) => {
-                    use risingwave_pb::task_service::task_info_response::TaskStatus as TaskStatusPb;
-                    match TaskStatusPb::try_from(status.task_status).unwrap() {
-                        TaskStatusPb::Running => {
+                    use risingwave_pb::task_service::task_info_response::TaskStatus as PbTaskStatus;
+                    match PbTaskStatus::try_from(status.task_status).unwrap() {
+                        PbTaskStatus::Running => {
                             running_task_cnt += 1;
                             // The task running count should always less or equal than the
                             // registered tasks number.
@@ -450,14 +491,14 @@ impl StageRunner {
                             // schedule next stage.
                             if running_task_cnt == self.tasks.keys().len() {
                                 self.notify_stage_scheduled(QueryMessage::Stage(
-                                    StageEvent::Scheduled(self.stage.id),
+                                    StageEvent::Scheduled(self.stage_id),
                                 ))
                                 .await;
                                 sent_signal_to_next = true;
                             }
                         }
 
-                        TaskStatusPb::Finished => {
+                        PbTaskStatus::Finished => {
                             finished_task_cnt += 1;
                             assert!(finished_task_cnt <= self.tasks.keys().len());
                             assert!(running_task_cnt >= finished_task_cnt);
@@ -469,7 +510,7 @@ impl StageRunner {
                                 break;
                             }
                         }
-                        TaskStatusPb::Aborted => {
+                        PbTaskStatus::Aborted => {
                             // Currently, the only reason that we receive an abort status is that
                             // the task's memory usage is too high so
                             // it's aborted.
@@ -480,7 +521,7 @@ impl StageRunner {
                             self.notify_stage_state_changed(
                                 |_| StageState::Failed,
                                 QueryMessage::Stage(Failed {
-                                    id: self.stage.id,
+                                    id: self.stage_id,
                                     reason: TaskRunningOutOfMemory,
                                 }),
                             )
@@ -488,7 +529,7 @@ impl StageRunner {
                             sent_signal_to_next = true;
                             break;
                         }
-                        TaskStatusPb::Failed => {
+                        PbTaskStatus::Failed => {
                             // Task failed, we should fail whole query
                             error!(
                                 "Task {:?} failed, reason: {:?}",
@@ -498,7 +539,7 @@ impl StageRunner {
                             self.notify_stage_state_changed(
                                 |_| StageState::Failed,
                                 QueryMessage::Stage(Failed {
-                                    id: self.stage.id,
+                                    id: self.stage_id,
                                     reason: TaskExecutionError(status.error_message),
                                 }),
                             )
@@ -506,7 +547,7 @@ impl StageRunner {
                             sent_signal_to_next = true;
                             break;
                         }
-                        TaskStatusPb::Ping => {
+                        PbTaskStatus::Ping => {
                             debug!("Receive ping from task {:?}", status.task_id.unwrap());
                         }
                         status => {
@@ -520,13 +561,13 @@ impl StageRunner {
                     // rpc error here, we should also notify stage failure
                     error!(
                         "Fetching task status in stage {:?} failed, reason: {:?}",
-                        self.stage.id,
+                        self.stage_id,
                         e.message()
                     );
                     self.notify_stage_state_changed(
                         |_| StageState::Failed,
                         QueryMessage::Stage(Failed {
-                            id: self.stage.id,
+                            id: self.stage_id,
                             reason: RpcError::from_batch_status(e).into(),
                         }),
                     )
@@ -539,8 +580,8 @@ impl StageRunner {
 
         tracing::trace!(
             "Stage [{:?}-{:?}], running task count: {}, finished task count: {}, sent signal to next: {}",
-            self.stage.query_id,
-            self.stage.id,
+            self.query.query_id,
+            self.stage_id,
             running_task_cnt,
             finished_task_cnt,
             sent_signal_to_next,
@@ -549,8 +590,8 @@ impl StageRunner {
         if let Some(shutdown) = all_streams.take_future() {
             tracing::trace!(
                 "Stage [{:?}-{:?}] waiting for stopping signal.",
-                self.stage.query_id,
-                self.stage.id
+                self.query.query_id,
+                self.stage_id
             );
             // Waiting for shutdown signal.
             shutdown.await;
@@ -562,16 +603,16 @@ impl StageRunner {
         // How to stop before schedule tasks.
         tracing::trace!(
             "Stopping stage: {:?}-{:?}, task_num: {}",
-            self.stage.query_id,
-            self.stage.id,
+            self.query.query_id,
+            self.stage_id,
             self.tasks.len()
         );
         self.cancel_all_scheducancled_tasks().await?;
 
         tracing::trace!(
             "Stage runner [{:?}-{:?}] exited.",
-            self.stage.query_id,
-            self.stage.id
+            self.query.query_id,
+            self.stage_id
         );
         Ok(())
     }
@@ -581,19 +622,26 @@ impl StageRunner {
         mut shutdown_rx: ShutdownToken,
         expr_context: ExprContext,
     ) -> SchedulerResult<()> {
-        let root_stage_id = self.stage.id;
+        let root_stage_id = self.stage_id;
         // Currently, the dml or table scan should never be root fragment, so the partition is None.
         // And root fragment only contain one task.
         let plan_fragment = self.create_plan_fragment(ROOT_TASK_ID, None);
         let plan_node = plan_fragment.root.unwrap();
         let task_id = TaskIdBatch {
-            query_id: self.stage.query_id.id.clone(),
-            stage_id: root_stage_id,
+            query_id: self.query.query_id.id.clone(),
+            stage_id: root_stage_id.into(),
             task_id: 0,
         };
 
         // Notify QueryRunner to poll chunk from result_rx.
-        let (result_tx, result_rx) = tokio::sync::mpsc::channel(100);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(
+            self.ctx
+                .session
+                .env()
+                .batch_config()
+                .developer
+                .root_stage_channel_size,
+        );
         self.notify_stage_scheduled(QueryMessage::Stage(StageEvent::ScheduledRoot(result_rx)))
             .await;
 
@@ -601,13 +649,12 @@ impl StageRunner {
             &plan_node,
             &task_id,
             self.ctx.to_batch_task_context(),
-            self.epoch.clone(),
             shutdown_rx.clone(),
         );
 
         let shutdown_rx0 = shutdown_rx.clone();
 
-        expr_context_scope(expr_context, async {
+        let result = expr_context_scope(expr_context, async {
             let executor = executor.build().await?;
             let chunk_stream = executor.execute();
             let cancelled = pin!(shutdown_rx.cancelled());
@@ -634,7 +681,19 @@ impl StageRunner {
                 }
             }
             Ok(())
-        }).await?;
+        }).await;
+
+        if let Err(err) = &result {
+            // If we encountered error when executing root stage locally, we have to notify the result fetcher, which is
+            // returned by `distribute_execute` and being listened by the FE handler task. Otherwise the FE handler cannot
+            // properly throw the error to the PG client.
+            if let Err(_e) = result_tx
+                .send(Err(TaskExecutionError(err.to_report_string())))
+                .await
+            {
+                warn!("Send task execution failed");
+            }
+        }
 
         // Terminated by other tasks execution error, so no need to return error here.
         match shutdown_rx0.message() {
@@ -649,16 +708,19 @@ impl StageRunner {
 
         tracing::trace!(
             "Stage runner [{:?}-{:?}] existed. ",
-            self.stage.query_id,
-            self.stage.id
+            self.query.query_id,
+            self.stage_id
         );
 
-        Ok(())
+        // We still have to throw the error in this current task, so that `StageRunner::run` can further
+        // send `Failed` event to stop other stages.
+        result.map(|_| ())
     }
 
     async fn schedule_tasks_for_all(&mut self, shutdown_rx: ShutdownToken) -> SchedulerResult<()> {
         let expr_context = ExprContext {
-            time_zone: self.ctx.session().config().timezone().to_owned(),
+            time_zone: self.ctx.session().config().timezone(),
+            strict_mode: self.ctx.session().config().batch_expr_strict_mode(),
         };
         // If root, we execute it locally.
         if !self.is_root_stage() {
@@ -671,23 +733,20 @@ impl StageRunner {
     }
 
     #[inline(always)]
-    fn get_fragment_id(&self, table_id: &TableId) -> SchedulerResult<FragmentId> {
+    fn get_fragment_id(&self, table_id: TableId) -> SchedulerResult<FragmentId> {
         self.catalog_reader
             .read_guard()
-            .get_table_by_id(table_id)
+            .get_any_table_by_id(table_id)
             .map(|table| table.fragment_id)
             .map_err(|e| SchedulerError::Internal(anyhow!(e)))
     }
 
     #[inline(always)]
-    fn get_table_dml_vnode_mapping(
-        &self,
-        table_id: &TableId,
-    ) -> SchedulerResult<WorkerSlotMapping> {
+    fn get_table_dml_vnode_mapping(&self, table_id: TableId) -> SchedulerResult<WorkerSlotMapping> {
         let guard = self.catalog_reader.read_guard();
 
         let table = guard
-            .get_table_by_id(table_id)
+            .get_any_table_by_id(table_id)
             .map_err(|e| SchedulerError::Internal(anyhow!(e)))?;
 
         let fragment_id = match table.dml_fragment_id.as_ref() {
@@ -711,22 +770,23 @@ impl StageRunner {
         let plan_node = plan_fragment.root.as_ref().expect("fail to get plan node");
 
         if let Some(table_id) = dml_table_id {
-            let vnode_mapping = self.get_table_dml_vnode_mapping(&table_id)?;
-            let worker_ids = vnode_mapping.iter_unique().collect_vec();
+            let vnode_mapping = self.get_table_dml_vnode_mapping(table_id)?;
+            let worker_slot_ids = vnode_mapping.iter_unique().collect_vec();
             let candidates = self
                 .worker_node_manager
                 .manager
-                .get_workers_by_worker_slot_ids(&worker_ids)?;
+                .get_workers_by_worker_slot_ids(&worker_slot_ids)?;
             if candidates.is_empty() {
                 return Err(BatchError::EmptyWorkerNodes.into());
             }
-            let candidate = if self.stage.batch_enable_distributed_dml {
+            let stage = &self.query.stage(self.stage_id);
+            let candidate = if stage.batch_enable_distributed_dml {
                 // If distributed dml is enabled, we need to try our best to distribute dml tasks evenly to each worker.
                 // Using a `task_id` could be helpful in this case.
                 candidates[task_id as usize % candidates.len()].clone()
             } else {
                 // If distributed dml is disabled, we need to guarantee that dml from the same session would be sent to a fixed worker/channel to provide a order guarantee.
-                candidates[self.stage.session_id.0 as usize % candidates.len()].clone()
+                candidates[stage.session_id.0 as usize % candidates.len()].clone()
             };
             return Ok(Some(candidate));
         };
@@ -735,16 +795,15 @@ impl StageRunner {
             Self::find_distributed_lookup_join_node(plan_node)
         {
             let fragment_id = self.get_fragment_id(
-                &distributed_lookup_join_node
+                distributed_lookup_join_node
                     .inner_side_table_desc
                     .as_ref()
                     .unwrap()
-                    .table_id
-                    .into(),
+                    .table_id,
             )?;
             let id_to_worker_slots = self
                 .worker_node_manager
-                .fragment_mapping(fragment_id)?
+                .fragment_mapping(fragment_id, self.query.batch_parallelism())?
                 .iter_unique()
                 .collect_vec();
 
@@ -797,7 +856,7 @@ impl StageRunner {
                 assert_matches!(old_state, StageState::Running);
                 StageState::Completed
             },
-            QueryMessage::Stage(StageEvent::Completed(self.stage.id)),
+            QueryMessage::Stage(StageEvent::Completed(self.stage_id)),
         )
         .await
     }
@@ -841,15 +900,15 @@ impl StageRunner {
                 .map_err(|e| anyhow!(e))?;
 
             // 2. Send RPC to each compute node for each task asynchronously.
-            let query_id = self.stage.query_id.id.clone();
-            let stage_id = self.stage.id;
+            let query_id = self.query.query_id.id.clone();
+            let stage_id = self.stage_id;
             let task_id = *task;
             spawn(async move {
                 if let Err(e) = client
                     .cancel(CancelTaskRequest {
                         task_id: Some(risingwave_pb::batch_plan::TaskId {
                             query_id: query_id.clone(),
-                            stage_id,
+                            stage_id: stage_id.into(),
                             task_id,
                         }),
                     })
@@ -870,7 +929,7 @@ impl StageRunner {
 
     async fn schedule_task(
         &self,
-        task_id: TaskIdPb,
+        task_id: PbTaskId,
         plan_fragment: PlanFragment,
         worker: Option<WorkerNode>,
         expr_context: ExprContext,
@@ -887,7 +946,7 @@ impl StageRunner {
         let t_id = task_id.task_id;
 
         let stream_status: Fuse<Streaming<TaskInfoResponse>> = compute_client
-            .create_task(task_id, plan_fragment, self.epoch.clone(), expr_context)
+            .create_task(task_id, plan_fragment, expr_context)
             .await
             .inspect_err(|_| self.mask_failed_serving_worker(&worker))
             .map_err(|e| anyhow!(e))?
@@ -901,17 +960,19 @@ impl StageRunner {
         Ok(stream_status)
     }
 
-    pub fn create_plan_fragment(
+    fn create_plan_fragment(
         &self,
         task_id: TaskId,
         partition: Option<PartitionInfo>,
     ) -> PlanFragment {
         // Used to maintain auto-increment identity_id of a task.
-        let identity_id: Rc<RefCell<u64>> = Rc::new(RefCell::new(0));
+        let mut identity_id = 0;
+
+        let stage = &self.query.stage(self.stage_id);
 
         let plan_node_prost =
-            self.convert_plan_node(&self.stage.root, task_id, partition, identity_id);
-        let exchange_info = self.stage.exchange_info.clone().unwrap();
+            self.convert_plan_node(&stage.root, task_id, partition, &mut identity_id);
+        let exchange_info = stage.exchange_info.clone().unwrap();
 
         PlanFragment {
             root: Some(plan_node_prost),
@@ -924,30 +985,30 @@ impl StageRunner {
         execution_plan_node: &ExecutionPlanNode,
         task_id: TaskId,
         partition: Option<PartitionInfo>,
-        identity_id: Rc<RefCell<u64>>,
-    ) -> PlanNodePb {
+        identity_id: &mut u64,
+    ) -> PbPlanNode {
         // Generate identity
         let identity = {
             let identity_type = execution_plan_node.plan_node_type;
-            let id = *identity_id.borrow();
-            identity_id.replace(id + 1);
+            let id = *identity_id;
+            *identity_id += 1;
             format!("{:?}-{}", identity_type, id)
         };
 
         match execution_plan_node.plan_node_type {
-            PlanNodeType::BatchExchange => {
+            BatchPlanNodeType::BatchExchange => {
                 // Find the stage this exchange node should fetch from and get all exchange sources.
                 let child_stage = self
                     .children
                     .iter()
                     .find(|child_stage| {
-                        child_stage.stage.id == execution_plan_node.source_stage_id.unwrap()
+                        child_stage.stage_id == execution_plan_node.source_stage_id.unwrap()
                     })
                     .unwrap();
                 let exchange_sources = child_stage.all_exchange_sources_for(task_id);
 
                 match &execution_plan_node.node {
-                    NodeBody::Exchange(exchange_node) => PlanNodePb {
+                    NodeBody::Exchange(exchange_node) => PbPlanNode {
                         children: vec![],
                         identity,
                         node_body: Some(NodeBody::Exchange(ExchangeNode {
@@ -956,7 +1017,7 @@ impl StageRunner {
                             input_schema: execution_plan_node.schema.clone(),
                         })),
                     },
-                    NodeBody::MergeSortExchange(sort_merge_exchange_node) => PlanNodePb {
+                    NodeBody::MergeSortExchange(sort_merge_exchange_node) => PbPlanNode {
                         children: vec![],
                         identity,
                         node_body: Some(NodeBody::MergeSortExchange(MergeSortExchangeNode {
@@ -971,7 +1032,7 @@ impl StageRunner {
                     _ => unreachable!(),
                 }
             }
-            PlanNodeType::BatchSeqScan => {
+            BatchPlanNodeType::BatchSeqScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::RowSeqScan(mut scan_node) = node_body else {
                     unreachable!();
@@ -980,15 +1041,15 @@ impl StageRunner {
                     .expect("no partition info for seq scan")
                     .into_table()
                     .expect("PartitionInfo should be TablePartitionInfo");
-                scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
+                scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
                 scan_node.scan_ranges = partition.scan_ranges;
-                PlanNodePb {
+                PbPlanNode {
                     children: vec![],
                     identity,
                     node_body: Some(NodeBody::RowSeqScan(scan_node)),
                 }
             }
-            PlanNodeType::BatchLogSeqScan => {
+            BatchPlanNodeType::BatchLogSeqScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::LogRowSeqScan(mut scan_node) = node_body else {
                     unreachable!();
@@ -997,16 +1058,14 @@ impl StageRunner {
                     .expect("no partition info for seq scan")
                     .into_table()
                     .expect("PartitionInfo should be TablePartitionInfo");
-                scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
-                PlanNodePb {
+                scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
+                PbPlanNode {
                     children: vec![],
                     identity,
                     node_body: Some(NodeBody::LogRowSeqScan(scan_node)),
                 }
             }
-            PlanNodeType::BatchSource
-            | PlanNodeType::BatchKafkaScan
-            | PlanNodeType::BatchIcebergScan => {
+            BatchPlanNodeType::BatchSource | BatchPlanNodeType::BatchKafkaScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::Source(mut source_node) = node_body else {
                     unreachable!();
@@ -1020,22 +1079,40 @@ impl StageRunner {
                     .into_iter()
                     .map(|split| split.encode_to_bytes().into())
                     .collect_vec();
-                PlanNodePb {
+                PbPlanNode {
                     children: vec![],
                     identity,
                     node_body: Some(NodeBody::Source(source_node)),
+                }
+            }
+            BatchPlanNodeType::BatchIcebergScan => {
+                let node_body = execution_plan_node.node.clone();
+                let NodeBody::IcebergScan(mut iceberg_scan_node) = node_body else {
+                    unreachable!();
+                };
+
+                let partition = partition
+                    .expect("no partition info for seq scan")
+                    .into_source()
+                    .expect("PartitionInfo should be SourcePartitionInfo");
+                iceberg_scan_node.split = partition
+                    .into_iter()
+                    .map(|split| split.encode_to_bytes().into())
+                    .collect_vec();
+                PbPlanNode {
+                    children: vec![],
+                    identity,
+                    node_body: Some(NodeBody::IcebergScan(iceberg_scan_node)),
                 }
             }
             _ => {
                 let children = execution_plan_node
                     .children
                     .iter()
-                    .map(|e| {
-                        self.convert_plan_node(e, task_id, partition.clone(), identity_id.clone())
-                    })
+                    .map(|e| self.convert_plan_node(e, task_id, partition.clone(), identity_id))
                     .collect();
 
-                PlanNodePb {
+                PbPlanNode {
                     children,
                     identity,
                     node_body: Some(execution_plan_node.node.clone()),
@@ -1045,11 +1122,11 @@ impl StageRunner {
     }
 
     fn is_root_stage(&self) -> bool {
-        self.stage.id == 0
+        self.stage_id == 0.into()
     }
 
     fn mask_failed_serving_worker(&self, worker: &WorkerNode) {
-        if !worker.property.as_ref().map_or(false, |p| p.is_serving) {
+        if !worker.property.as_ref().is_some_and(|p| p.is_serving) {
             return;
         }
         let duration = Duration::from_secs(std::cmp::max(

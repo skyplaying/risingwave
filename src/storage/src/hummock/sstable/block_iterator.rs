@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -130,9 +130,11 @@ impl BlockIterator {
         }
         self.prev_until_key(key);
     }
-}
 
-impl BlockIterator {
+    pub(crate) fn finish_block(&mut self) {
+        self.invalidate();
+    }
+
     /// Invalidates current state after reaching a invalid state.
     fn invalidate(&mut self) {
         self.offset = self.block.len();
@@ -258,8 +260,8 @@ impl BlockIterator {
     /// Searches the restart point index that the given `key` belongs to.
     fn search_restart_point_index_by_key(&mut self, key: FullKey<&[u8]>) -> usize {
         // Find the largest restart point that restart key equals or less than the given key.
-        let res = self
-            .block
+
+        self.block
             .search_restart_partition_point(
                 |&RestartPoint {
                      offset: probe,
@@ -288,9 +290,7 @@ impl BlockIterator {
                 },
             )
             // Prevent from underflowing when given is smaller than the first.
-            .saturating_sub(1);
-
-        res
+            .saturating_sub(1)
     }
 
     /// Seeks to the restart point that the given `key` belongs to.

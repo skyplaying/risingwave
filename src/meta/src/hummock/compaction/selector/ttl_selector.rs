@@ -1,60 +1,63 @@
-//  Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//  http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
 // This source code is licensed under both the GPLv2 (found in the
 // COPYING file in the root directory) and Apache 2.0 License
 // (found in the LICENSE.Apache file in the root directory).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use risingwave_common::catalog::TableOption;
-use risingwave_hummock_sdk::HummockCompactionTaskId;
+use risingwave_hummock_sdk::{CompactionGroupId, HummockCompactionTaskId};
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
 use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{TtlPickerState, TtlReclaimCompactionPicker};
-use crate::hummock::compaction::{
-    create_compaction_task, CompactionDeveloperConfig, CompactionTask, LocalSelectorStatistic,
-};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task};
 
 #[derive(Default)]
 pub struct TtlCompactionSelector {
-    state: HashMap<u64, TtlPickerState>,
+    state: HashMap<CompactionGroupId, TtlPickerState>,
 }
 
 impl CompactionSelector for TtlCompactionSelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        _selector_stats: &mut LocalSelectorStatistic,
-        table_id_to_options: HashMap<u32, TableOption>,
-        developer_config: Arc<CompactionDeveloperConfig>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            table_id_to_options,
+            developer_config,
+            in_progress_compactions,
+            ..
+        } = context;
         let dynamic_level_core =
             DynamicLevelSelectorCore::new(group.compaction_config.clone(), developer_config);
         let ctx = dynamic_level_core.calculate_level_base_size(levels);
         let picker = TtlReclaimCompactionPicker::new(table_id_to_options);
         let state = self.state.entry(group.group_id).or_default();
         let compaction_input = picker.pick_compaction(levels, level_handlers, state)?;
+        if !compaction_input.skip_target_range_conflict_check
+            && in_progress_compactions.has_conflict_with_input(&compaction_input)
+        {
+            return None;
+        }
         compaction_input.add_pending_task(task_id, level_handlers);
 
         Some(create_compaction_task(

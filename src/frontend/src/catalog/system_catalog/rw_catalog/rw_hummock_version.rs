@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use itertools::Itertools;
+use risingwave_common::id::TableId;
 use risingwave_common::types::{Fields, JsonbVal};
 use risingwave_frontend_macro::system_catalog;
 use risingwave_hummock_sdk::version::HummockVersion;
+use risingwave_pb::hummock::{PbBloomFilterType, PbSstableFilterLayout};
+use risingwave_pb::id::{
+    CompactionGroupId, HummockSstableId, HummockSstableObjectId, HummockVersionId,
+};
 use serde_json::json;
 
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
@@ -27,18 +32,16 @@ use crate::error::Result;
 #[derive(Fields)]
 struct RwHummockVersion {
     #[primary_key]
-    version_id: i64,
-    max_committed_epoch: i64,
-    safe_epoch: i64,
+    version_id: HummockVersionId,
     compaction_group: JsonbVal,
 }
 
 #[derive(Fields)]
 struct RwHummockSstable {
     #[primary_key]
-    sstable_id: i64,
-    object_id: i64,
-    compaction_group_id: i64,
+    sstable_id: HummockSstableId,
+    object_id: HummockSstableObjectId,
+    compaction_group_id: CompactionGroupId,
     level_id: i32,
     sub_level_id: Option<i64>,
     level_type: i32,
@@ -54,7 +57,10 @@ struct RwHummockSstable {
     uncompressed_file_size: i64,
     range_tombstone_count: i64,
     bloom_filter_kind: i32,
+    filter_type: i32,
+    filter_layout: i32,
     table_ids: JsonbVal,
+    sst_size: i64,
 }
 
 #[system_catalog(table, "rw_catalog.rw_hummock_current_version")]
@@ -86,13 +92,9 @@ async fn read_hummock_sstables(reader: &SysCatalogReaderImpl) -> Result<Vec<RwHu
 fn remove_key_range_from_version(mut version: HummockVersion) -> HummockVersion {
     // Because key range is too verbose for manual analysis, just don't expose it.
     for cg in version.levels.values_mut() {
-        for level in cg
-            .levels
-            .iter_mut()
-            .chain(cg.l0.as_mut().unwrap().sub_levels.iter_mut())
-        {
+        for level in cg.levels.iter_mut().chain(cg.l0.sub_levels.iter_mut()) {
             for sst in &mut level.table_infos {
-                sst.key_range.take();
+                sst.remove_key_range();
             }
         }
     }
@@ -104,10 +106,8 @@ fn version_to_compaction_group_rows(version: &HummockVersion) -> Vec<RwHummockVe
         .levels
         .values()
         .map(|cg| RwHummockVersion {
-            version_id: version.id as _,
-            max_committed_epoch: version.max_committed_epoch as _,
-            safe_epoch: version.safe_epoch as _,
-            compaction_group: json!(cg).into(),
+            version_id: version.id,
+            compaction_group: json!(cg.to_protobuf()).into(),
         })
         .collect()
 }
@@ -115,18 +115,18 @@ fn version_to_compaction_group_rows(version: &HummockVersion) -> Vec<RwHummockVe
 fn version_to_sstable_rows(version: HummockVersion) -> Vec<RwHummockSstable> {
     let mut sstables = vec![];
     for cg in version.levels.into_values() {
-        for level in cg.levels.into_iter().chain(cg.l0.unwrap().sub_levels) {
+        for level in cg.levels.into_iter().chain(cg.l0.sub_levels) {
             for sst in level.table_infos {
-                let key_range = sst.key_range.unwrap();
+                let key_range = sst.key_range.clone();
                 sstables.push(RwHummockSstable {
-                    sstable_id: sst.sst_id as _,
-                    object_id: sst.object_id as _,
-                    compaction_group_id: cg.group_id as _,
+                    sstable_id: sst.sst_id,
+                    object_id: sst.object_id,
+                    compaction_group_id: cg.group_id,
                     level_id: level.level_idx as _,
                     sub_level_id: (level.level_idx == 0).then_some(level.sub_level_id as _),
                     level_type: level.level_type as _,
-                    key_range_left: key_range.left,
-                    key_range_right: key_range.right,
+                    key_range_left: key_range.left.to_vec(),
+                    key_range_right: key_range.right.to_vec(),
                     right_exclusive: key_range.right_exclusive,
                     file_size: sst.file_size as _,
                     meta_offset: sst.meta_offset as _,
@@ -136,8 +136,23 @@ fn version_to_sstable_rows(version: HummockVersion) -> Vec<RwHummockSstable> {
                     max_epoch: sst.max_epoch as _,
                     uncompressed_file_size: sst.uncompressed_file_size as _,
                     range_tombstone_count: sst.range_tombstone_count as _,
-                    bloom_filter_kind: sst.bloom_filter_kind as _,
-                    table_ids: json!(sst.table_ids).into(),
+                    bloom_filter_kind: match sst.filter_layout {
+                        PbSstableFilterLayout::Unspecified | PbSstableFilterLayout::Auto => {
+                            PbBloomFilterType::BloomFilterUnspecified
+                        }
+                        PbSstableFilterLayout::Plain => PbBloomFilterType::Sstable,
+                        PbSstableFilterLayout::Blocked => PbBloomFilterType::Blocked,
+                    } as _,
+                    filter_type: sst.filter_type as _,
+                    filter_layout: sst.filter_layout as _,
+                    table_ids: json!(
+                        sst.table_ids
+                            .iter()
+                            .map(|table_id| table_id.as_raw_id())
+                            .collect_vec()
+                    )
+                    .into(),
+                    sst_size: sst.sst_size as _,
                 });
             }
         }
@@ -148,7 +163,7 @@ fn version_to_sstable_rows(version: HummockVersion) -> Vec<RwHummockSstable> {
 #[derive(Fields)]
 struct RwHummockTableWatermark {
     #[primary_key]
-    table_id: i32,
+    table_id: TableId,
     #[primary_key]
     vnode_id: i16,
     epoch: i64,
@@ -195,7 +210,7 @@ async fn read_hummock_table_watermarks(
             vnode_watermark_map
                 .into_iter()
                 .map(move |(vnode, (epoch, watermark))| RwHummockTableWatermark {
-                    table_id: table_id.table_id as _,
+                    table_id,
                     vnode_id: vnode as _,
                     epoch: epoch as _,
                     watermark,
@@ -208,8 +223,7 @@ async fn read_hummock_table_watermarks(
 #[derive(Fields)]
 struct RwHummockSnapshot {
     #[primary_key]
-    table_id: i32,
-    safe_epoch: i64,
+    table_id: TableId,
     committed_epoch: i64,
 }
 
@@ -223,9 +237,34 @@ async fn read_hummock_snapshot_groups(
         .info()
         .iter()
         .map(|(table_id, info)| RwHummockSnapshot {
-            table_id: table_id.table_id as _,
+            table_id: *table_id,
             committed_epoch: info.committed_epoch as _,
-            safe_epoch: info.safe_epoch as _,
+        })
+        .collect())
+}
+
+#[derive(Fields)]
+struct RwHummockTableChangeLog {
+    #[primary_key]
+    table_id: TableId,
+    change_log: JsonbVal,
+}
+
+#[system_catalog(table, "rw_catalog.rw_hummock_table_change_log")]
+async fn read_hummock_table_change_log(
+    reader: &SysCatalogReaderImpl,
+) -> Result<
+    Vec<crate::catalog::system_catalog::rw_catalog::rw_hummock_version::RwHummockTableChangeLog>,
+> {
+    let table_change_logs = reader
+        .meta_client
+        .get_hummock_table_change_log(None, None, None, false, None)
+        .await?;
+    Ok(table_change_logs
+        .iter()
+        .map(|(table_id, change_log)| RwHummockTableChangeLog {
+            table_id: *table_id,
+            change_log: json!(change_log.to_protobuf()).into(),
         })
         .collect())
 }

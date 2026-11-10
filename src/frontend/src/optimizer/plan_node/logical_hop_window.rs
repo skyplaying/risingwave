@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ use risingwave_common::types::Interval;
 use super::generic::{GenericPlanNode, GenericPlanRef};
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchHopWindow, ColPrunable, ExprRewritable, Logical,
-    LogicalFilter, PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamHopWindow,
-    ToBatch, ToStream,
+    BatchHopWindow, BatchPlanRef, ColPrunable, ExprRewritable, Logical, LogicalFilter,
+    LogicalPlanRef as PlanRef, PlanBase, PlanTreeNodeUnary, PredicatePushdown, StreamHopWindow,
+    StreamPlanRef, ToBatch, ToStream, gen_filter_and_pushdown, generic,
 };
 use crate::error::Result;
 use crate::expr::{ExprType, FunctionCall, InputRef};
@@ -39,7 +39,7 @@ pub struct LogicalHopWindow {
 }
 
 impl LogicalHopWindow {
-    /// Hop windows will add `windows_start` and `windows_end` columns at the end.
+    /// Hop windows will add `window_start` and `window_end` columns at the end.
     /// Take care to modify the code referring it if above rule changes.
     pub const ADDITION_COLUMN_LEN: usize = 2;
 
@@ -144,7 +144,7 @@ impl LogicalHopWindow {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalHopWindow {
+impl PlanTreeNodeUnary<Logical> for LogicalHopWindow {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -160,7 +160,6 @@ impl PlanTreeNodeUnary for LogicalHopWindow {
         )
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -210,7 +209,7 @@ impl PlanTreeNodeUnary for LogicalHopWindow {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalHopWindow}
+impl_plan_tree_node_for_unary! { Logical, LogicalHopWindow}
 impl_distill_by_unit!(LogicalHopWindow, core, "LogicalHopWindow");
 
 impl ColPrunable for LogicalHopWindow {
@@ -274,13 +273,13 @@ impl ColPrunable for LogicalHopWindow {
     }
 }
 
-impl ExprRewritable for LogicalHopWindow {}
+impl ExprRewritable<Logical> for LogicalHopWindow {}
 
 impl ExprVisitable for LogicalHopWindow {}
 
 impl PredicatePushdown for LogicalHopWindow {
     /// Keep predicate on time window parameters (`window_start`, `window_end`),
-    /// the rest may be pushed-down.
+    /// the rest may be pushed-down according to [`Condition::split_pushable`].
     fn predicate_pushdown(
         &self,
         predicate: Condition,
@@ -295,7 +294,7 @@ impl PredicatePushdown for LogicalHopWindow {
                 window_columns.insert(i);
             }
         }
-        let (time_window_pred, pushed_predicate) = predicate.split_disjoint(&window_columns);
+        let (time_window_pred, pushed_predicate) = predicate.split_pushable(&window_columns);
         let mut mapping = self.o2i_col_mapping();
         let pushed_predicate = pushed_predicate.rewrite_expr(&mut mapping);
         gen_filter_and_pushdown(self, time_window_pred, pushed_predicate, ctx)
@@ -303,24 +302,35 @@ impl PredicatePushdown for LogicalHopWindow {
 }
 
 impl ToBatch for LogicalHopWindow {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<BatchPlanRef> {
         let new_input = self.input().to_batch()?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        let (window_start_exprs, window_end_exprs) =
-            new_logical.derive_window_start_and_end_exprs()?;
-        Ok(BatchHopWindow::new(new_logical, window_start_exprs, window_end_exprs).into())
+        let window = self.core.clone_with_input(new_input);
+        let (window_start_exprs, window_end_exprs) = window.derive_window_start_and_end_exprs()?;
+        Ok(BatchHopWindow::new(window, window_start_exprs, window_end_exprs).into())
     }
 }
 
 impl ToStream for LogicalHopWindow {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         let new_input = self.input().to_stream(ctx)?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        let (window_start_exprs, window_end_exprs) =
-            new_logical.derive_window_start_and_end_exprs()?;
-        Ok(StreamHopWindow::new(new_logical, window_start_exprs, window_end_exprs).into())
+        let window = self.core.clone_with_input(new_input);
+        let (window_start_exprs, window_end_exprs) = window.derive_window_start_and_end_exprs()?;
+        Ok(StreamHopWindow::new(window, window_start_exprs, window_end_exprs).into())
+    }
+
+    fn try_better_locality(&self, columns: &[usize]) -> Option<PlanRef> {
+        if columns.is_empty() {
+            return None;
+        }
+
+        // Map output columns to input columns using the o2i mapping
+        let input_columns = columns
+            .iter()
+            .map(|&col| self.o2i_col_mapping().try_map(col))
+            .collect::<Option<Vec<usize>>>()?;
+
+        let new_input = self.input().try_better_locality(&input_columns)?;
+        Some(self.clone_with_input(new_input).into())
     }
 
     fn logical_rewrite_for_stream(
@@ -366,10 +376,10 @@ mod test {
     use risingwave_common::types::DataType;
 
     use super::*;
+    use crate::Explain;
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::LogicalValues;
     use crate::optimizer::property::FunctionalDependency;
-    use crate::Explain;
     #[tokio::test]
     /// Pruning
     /// ```text
@@ -382,7 +392,7 @@ mod test {
     ///     TableScan(date, v3)
     /// ```
     async fn test_prune_hop_window_with_order_required() {
-        let ctx = OptimizerContext::mock().await;
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = vec![
             Field::with_name(DataType::Date, "date"),
             Field::with_name(DataType::Int32, "v1"),
@@ -439,7 +449,7 @@ mod test {
         // FD: { date, v1 } --> { v2 }
         //     window_start --> window_end
         //     window_end --> window_start
-        let ctx = OptimizerContext::mock().await;
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = vec![
             Field::with_name(DataType::Date, "date"),
             Field::with_name(DataType::Int32, "v1"),

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use enum_as_inner::EnumAsInner;
+use tokio::sync::oneshot;
 
 use crate::array::StreamChunk;
 use crate::transaction::transaction_id::TxnId;
@@ -22,7 +23,8 @@ use crate::transaction::transaction_message::TxnMsg::{Begin, Data, End, Rollback
 pub enum TxnMsg {
     Begin(TxnId),
     Data(TxnId, StreamChunk),
-    End(TxnId),
+    /// The optional sender is fired after the data has been durably persisted.
+    End(TxnId, Option<oneshot::Sender<()>>),
     Rollback(TxnId),
 }
 
@@ -31,14 +33,14 @@ impl TxnMsg {
         match self {
             Begin(txn_id) => *txn_id,
             Data(txn_id, _) => *txn_id,
-            End(txn_id) => *txn_id,
+            End(txn_id, _) => *txn_id,
             Rollback(txn_id) => *txn_id,
         }
     }
 
     pub fn as_stream_chunk(&self) -> Option<&StreamChunk> {
         match self {
-            Begin(_) | End(_) | Rollback(_) => None,
+            Begin(_) | End(..) | Rollback(_) => None,
             Data(_, chunk) => Some(chunk),
         }
     }

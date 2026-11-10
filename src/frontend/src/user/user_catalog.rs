@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use risingwave_common::acl::{AclMode, AclModeSet};
-use risingwave_pb::user::grant_privilege::{Action, Object as GrantObject, Object};
-use risingwave_pb::user::{PbAuthInfo, PbGrantPrivilege, PbUserInfo};
+use risingwave_common::catalog::{DatabaseId, ObjectId, SchemaId};
+use risingwave_pb::user::grant_privilege::Object as GrantObject;
+use risingwave_pb::user::{PbAction, PbAuthInfo, PbGrantPrivilege, PbUserInfo};
 
-use crate::catalog::{DatabaseId, SchemaId};
 use crate::user::UserId;
 
 /// `UserCatalog` is responsible for managing user's information.
@@ -31,6 +30,7 @@ pub struct UserCatalog {
     pub can_create_db: bool,
     pub can_create_user: bool,
     pub can_login: bool,
+    pub is_admin: bool,
     pub auth_info: Option<PbAuthInfo>,
     pub grant_privileges: Vec<PbGrantPrivilege>,
 
@@ -38,7 +38,7 @@ pub struct UserCatalog {
     // TODO: merge it after we fully migrate to sql-backend.
     pub database_acls: HashMap<DatabaseId, AclModeSet>,
     pub schema_acls: HashMap<SchemaId, AclModeSet>,
-    pub object_acls: HashMap<u32, AclModeSet>,
+    pub object_acls: HashMap<ObjectId, AclModeSet>,
 }
 
 impl From<PbUserInfo> for UserCatalog {
@@ -50,6 +50,7 @@ impl From<PbUserInfo> for UserCatalog {
             can_create_db: user.can_create_db,
             can_create_user: user.can_create_user,
             can_login: user.can_login,
+            is_admin: user.is_admin,
             auth_info: user.auth_info,
             grant_privileges: user.grant_privileges,
             database_acls: Default::default(),
@@ -71,38 +72,65 @@ impl UserCatalog {
             can_create_db: self.can_create_db,
             can_create_user: self.can_create_user,
             can_login: self.can_login,
+            is_admin: self.is_admin,
             auth_info: self.auth_info.clone(),
             grant_privileges: self.grant_privileges.clone(),
         }
     }
 
-    fn get_acl_entry(&mut self, object: GrantObject) -> Entry<'_, u32, AclModeSet> {
+    fn get_or_insert_acl(&mut self, object: GrantObject) -> &mut AclModeSet {
         match object {
-            Object::DatabaseId(id) => self.database_acls.entry(id),
-            Object::SchemaId(id) => self.schema_acls.entry(id),
-            Object::TableId(id) => self.object_acls.entry(id),
-            Object::SourceId(id) => self.object_acls.entry(id),
-            Object::SinkId(id) => self.object_acls.entry(id),
-            Object::ViewId(id) => self.object_acls.entry(id),
-            Object::FunctionId(_) => {
-                unreachable!("grant privilege on function is not supported yet.")
+            GrantObject::DatabaseId(id) => {
+                self.database_acls.entry(id).or_insert(AclModeSet::empty())
             }
-            _ => unreachable!(""),
+            GrantObject::SchemaId(id) => self.schema_acls.entry(id).or_insert(AclModeSet::empty()),
+            GrantObject::TableId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SourceId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SinkId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::ViewId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::FunctionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SubscriptionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::ConnectionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SecretId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
         }
     }
 
-    fn get_acl(&self, object: &GrantObject) -> Option<&AclModeSet> {
+    fn get_acl(&self, object: GrantObject) -> Option<&AclModeSet> {
         match object {
-            Object::DatabaseId(id) => self.database_acls.get(id),
-            Object::SchemaId(id) => self.schema_acls.get(id),
-            Object::TableId(id) => self.object_acls.get(id),
-            Object::SourceId(id) => self.object_acls.get(id),
-            Object::SinkId(id) => self.object_acls.get(id),
-            Object::ViewId(id) => self.object_acls.get(id),
-            Object::FunctionId(_) => {
-                unreachable!("grant privilege on function is not supported yet.")
-            }
-            _ => unreachable!("unexpected object type."),
+            GrantObject::DatabaseId(id) => self.database_acls.get(&id),
+            GrantObject::SchemaId(id) => self.schema_acls.get(&id),
+            GrantObject::TableId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SourceId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SinkId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::ViewId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::FunctionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SubscriptionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::ConnectionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SecretId(id) => self.object_acls.get(&id.as_object_id()),
         }
     }
 
@@ -112,9 +140,7 @@ impl UserCatalog {
         self.object_acls.clear();
         let privileges = self.grant_privileges.clone();
         for privilege in privileges {
-            let entry = self
-                .get_acl_entry(privilege.object.unwrap())
-                .or_insert(AclModeSet::empty());
+            let entry = self.get_or_insert_acl(privilege.object.unwrap());
             for awo in privilege.action_with_opts {
                 entry
                     .modes
@@ -164,15 +190,19 @@ impl UserCatalog {
         self.refresh_acl_modes();
     }
 
-    pub fn check_privilege(&self, object: &GrantObject, mode: AclMode) -> bool {
-        self.get_acl(object)
-            .map_or(false, |acl_set| acl_set.has_mode(mode))
+    pub fn has_privilege(&self, object: impl Into<GrantObject>, mode: AclMode) -> bool {
+        self.get_acl(object.into())
+            .is_some_and(|acl_set| acl_set.has_mode(mode))
+    }
+
+    pub fn has_schema_usage_privilege(&self, schema_id: SchemaId) -> bool {
+        self.is_super || self.has_privilege(schema_id, AclMode::Usage)
     }
 
     pub fn check_privilege_with_grant_option(
         &self,
         object: &GrantObject,
-        actions: &Vec<(Action, bool)>,
+        actions: &Vec<(PbAction, bool)>,
     ) -> bool {
         if self.is_super {
             return true;
@@ -196,5 +226,20 @@ impl UserCatalog {
             }
         }
         action_map.values().all(|&found| found)
+    }
+
+    pub fn check_object_visibility(&self, obj_id: ObjectId) -> bool {
+        if self.is_super {
+            return true;
+        }
+
+        // `Select` and `Execute` are the minimum required privileges for object visibility.
+        // `Execute` is required for functions.
+        // `Usage` is required for connections and secrets.
+        self.object_acls.get(&obj_id).is_some_and(|acl_set| {
+            acl_set.has_mode(AclMode::Select)
+                || acl_set.has_mode(AclMode::Execute)
+                || acl_set.has_mode(AclMode::Usage)
+        })
     }
 }

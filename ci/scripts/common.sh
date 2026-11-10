@@ -1,10 +1,14 @@
+# Get the repository root directory from the script's location
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 export CARGO_TERM_COLOR=always
 export PROTOC_NO_VENDOR=true
-export CARGO_HOME=/risingwave/.cargo
+export CARGO_HOME="${REPO_ROOT}/.cargo"
 export RISINGWAVE_CI=true
 export RUST_BACKTRACE=1
 export ENABLE_TELEMETRY=false
 export RUSTC_WRAPPER=sccache
+export RUSTC_WORKSPACE_WRAPPER="${REPO_ROOT}/ci/scripts/rustc-workspace-wrapper.sh"
 export SCCACHE_BUCKET=rw-ci-sccache-bucket
 export SCCACHE_REGION=us-east-2
 export SCCACHE_IDLE_TIMEOUT=0
@@ -12,10 +16,71 @@ export CARGO_INCREMENTAL=0
 export CARGO_MAKE_PRINT_TIME_SUMMARY=true
 export MINIO_DOWNLOAD_BIN=https://rw-ci-deps-dist.s3.amazonaws.com/minio
 export MCLI_DOWNLOAD_BIN=https://rw-ci-deps-dist.s3.amazonaws.com/mc
-export GCLOUD_DOWNLOAD_TGZ=https://rw-ci-deps-dist.s3.amazonaws.com/google-cloud-cli-475.0.0-linux-x86_64.tar.gz
 export NEXTEST_HIDE_PROGRESS_BAR=true
 export RW_TELEMETRY_TYPE=test
+export RW_SECRET_STORE_PRIVATE_KEY_HEX="0123456789abcdef0123456789abcdef"
+export SLT_FAIL_FAST=true
+export SLT_KEEP_DB_ON_FAILURE=true
+export SLT_SHUTDOWN_TIMEOUT=10
+export CARGO_LLVM_COV=1
+export CARGO_LLVM_COV_SHOW_ENV=1
+export CARGO_LLVM_COV_TARGET_DIR="${REPO_ROOT}/target" # used to locate object files, should be same as `CARGO_TARGET_DIR`
+export LLVM_PROFILE_FILE="${CARGO_LLVM_COV_TARGET_DIR}/risingwave-%p.profraw" # used both by executables generating profraw files and `cargo llvm-cov` to find them
+
 unset LANG
+
+function generate_and_upload_coverage_report() {
+  echo "--- Generate coverage report"
+
+  # Generate unique coverage filename with job id.
+  coverage_filename="coverage-${BUILDKITE_JOB_ID}.lcov"
+
+  # Only generate coverage if we have profraw files.
+  if [ -n "$(find target -name '*.profraw' 2>/dev/null | head -1)" ]; then
+    len=$(find target -name '*.profraw' 2>/dev/null | wc -l)
+    echo "Found ${len} profraw files. Generating coverage report."
+
+    local -a profile_args=()
+    # In most steps, we extract the executables to `target/debug` no matter what profile it is built with.
+    # Thus, it's okay to not specify profile and use `debug`.
+    # For exceptions, specify `RW_COVERAGE_CARGO_PROFILE` in the script.
+    if [[ -n "${RW_COVERAGE_CARGO_PROFILE:-}" ]]; then
+      profile_args+=(--profile "${RW_COVERAGE_CARGO_PROFILE}")
+    fi
+
+    cargo llvm-cov report "${profile_args[@]}" --lcov --output-path "$coverage_filename" || {
+      echo "Warning: Failed to generate coverage report"
+    }
+
+    if [ -f "$coverage_filename" ]; then
+      buildkite-agent artifact upload "$coverage_filename" || {
+        echo "Warning: Failed to upload coverage report"
+      }
+    fi
+  else
+    echo "No profraw files found. Skipping coverage generation."
+  fi
+}
+
+
+function exit_hook() {
+  ret=$?
+
+  # Generate and upload coverage report on successful completion
+  if [ $ret -eq 0 ]; then
+    generate_and_upload_coverage_report
+    exit 0
+  fi
+
+  # Otherwise, print diagnose info
+  if [ -f .risingwave/config/risedev-env ]; then
+    echo "^^^ +++"
+    echo "--- Failed to run command! Dumping diagnose info..."
+    ./risedev diagnose || true
+  fi
+}
+trap exit_hook EXIT
+
 if [ -n "${BUILDKITE_COMMIT:-}" ]; then
   export GIT_SHA=$BUILDKITE_COMMIT
 fi
@@ -54,8 +119,8 @@ function download_and_prepare_rw() {
     echo "download_and_prepare_rw: missing argument env"
     exit 1
   fi
-  # env is either common or source
-  if [ "$2" != "common" ] && [ "$2" != "source" ]; then
+  # env is either common, source, iceberg, or monitoring
+  if [ "$2" != "common" ] && [ "$2" != "source" ] && [ "$2" != "iceberg" ] && [ "$2" != "monitoring" ]; then
     echo "download_and_prepare_rw: invalid argument env"
     exit 1
   fi
@@ -81,12 +146,87 @@ function download_and_prepare_rw() {
     cp ci/risedev-components.ci.env risedev-components.user.env
   elif [ "$env" = "source" ]; then
     cp ci/risedev-components.ci.source.env risedev-components.user.env
+  elif [ "$env" = "iceberg" ]; then
+    cp ci/risedev-components.ci.iceberg.env risedev-components.user.env
+  elif [ "$env" = "monitoring" ]; then
+    cp ci/risedev-components.ci.monitoring.env risedev-components.user.env
   fi
 
   echo -e "\033[33mPrepare RiseDev dev cluster\033[0m"
 
   risedev pre-start-dev
-  risedev --allow-private link-all-in-one-binaries
+  risedev link-all-in-one-binaries
+}
+
+download_connector_node_artifact() {
+  echo "--- Download connector node package"
+  export CONNECTOR_LIBS_PATH="./connector-node/libs"
+  buildkite-agent artifact download risingwave-connector.tar.gz ./
+  mkdir -p ./connector-node
+  tar xf ./risingwave-connector.tar.gz -C ./connector-node
+}
+
+install_e2e_test_requirements() {
+  echo "--- Install Python test dependencies"
+  python3 -m pip install --break-system-packages -r ./e2e_test/requirements.txt
+}
+
+install_sqlserver_client() {
+  echo "--- Install sqlserver client"
+  curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+  curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+  apt-get update -y
+  ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y mssql-tools unixodbc-dev
+  export PATH="/opt/mssql-tools/bin/:$PATH"
+}
+
+source_test_env_setup() {
+    local profile="$1"
+    local risedev_profile=""
+    local need_connector="false"
+    local need_python="false"
+
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --risedev-profile)
+                risedev_profile="$2"
+                shift 2
+                ;;
+            --need-connector)
+                need_connector="true"
+                shift
+                ;;
+            --need-python)
+                need_python="true"
+                shift
+                ;;
+            *)
+                echo "source_test_env_setup: unknown argument $1" 1>&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$risedev_profile" ]]; then
+        echo "source_test_env_setup: --risedev-profile is required" 1>&2
+        exit 1
+    fi
+
+    download_and_prepare_rw "$profile" source
+
+    if [[ "$need_connector" == "true" ]]; then
+        download_connector_node_artifact
+    fi
+
+    if [[ "$need_python" == "true" ]]; then
+        install_e2e_test_requirements
+    fi
+
+    echo "--- starting risingwave cluster: ${risedev_profile}"
+    RUST_LOG="debug,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info,risingwave_meta=info,risingwave_connector::source::kafka::source::reader=warn" \
+    risedev ci-start "$risedev_profile"
 }
 
 function filter_stack_trace() {
@@ -95,7 +235,6 @@ function filter_stack_trace() {
   touch tmp
   cat "$1" \
   | sed -E '/  [1-9][0-9]+:/d' \
-  | sed -E '/  [3-9]+:/d' \
   | sed -E '/  at .rustc/d' \
   | sed -E '/  at ...cargo/d' > tmp
   cp tmp "$1"
@@ -114,3 +253,91 @@ get_latest_kafka_download_url() {
     local download_url="https://downloads.apache.org/kafka/${latest_version}/kafka_2.13-${latest_version}.tgz"
     echo "$download_url"
 }
+
+get_latest_cassandra_version() {
+    local versions=$(curl -s https://downloads.apache.org/cassandra/ | grep -Eo 'href="[0-9]+\.[0-9]+\.[0-9]+/"' | grep -Eo "[0-9]+\.[0-9]+\.[0-9]+")
+    # Sort the version numbers and get the latest one
+    local latest_version=$(echo "$versions" | sort -V | tail -n1)
+    echo "$latest_version"
+}
+
+get_latest_cassandra_download_url() {
+    local latest_version=$(get_latest_cassandra_version)
+    local download_url="https://downloads.apache.org/cassandra/${latest_version}/apache-cassandra-${latest_version}-bin.tar.gz"
+    echo "$download_url"
+}
+
+configure_static_openssl() {
+    export OPENSSL_STATIC=1
+    export OPENSSL_LIB_DIR="$(dpkg -L libssl-dev | grep libssl.a | xargs dirname)"
+    export OPENSSL_INCLUDE_DIR="$(dpkg -L libssl-dev | grep openssl/ssl.h | xargs dirname)"
+    echo "OPENSSL_STATIC: $OPENSSL_STATIC"
+    echo "OPENSSL_LIB_DIR: $OPENSSL_LIB_DIR"
+    echo "OPENSSL_INCLUDE_DIR: $OPENSSL_INCLUDE_DIR"
+}
+
+check_link_info() {
+  profile=$1
+  ldd_output=$(ldd target/"$profile"/risingwave)
+  echo "$ldd_output"
+  # enforce that libssl is not present if we are building with static openssl
+  if [[ "$profile" == "ci-release" || "$profile" == "production" ]] && [[ "$ldd_output" == *"libssl"* ]]; then
+      echo "libssl should not be dynamically linked"
+      exit 1
+  fi
+}
+
+# Set up the environment for E2E sink tests.
+# Arguments:
+#   $1: cargo build profile
+#   --risedev-profile <profile>: risedev profile to start (default: "ci-sink-test")
+#   --need-connector: download connector node package
+#   --sleep-duration <seconds>: seconds to sleep after cluster start (default: 1)
+sink_test_env_setup() {
+    local profile="$1"
+    local risedev_profile="ci-sink-test"
+    local need_connector="false"
+    local sleep_duration="1"
+
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --risedev-profile)
+                risedev_profile="$2"
+                shift 2
+                ;;
+            --need-connector)
+                need_connector="true"
+                shift
+                ;;
+            --sleep-duration)
+                sleep_duration="$2"
+                shift 2
+                ;;
+            *)
+                echo "sink_test_env_setup: unknown argument $1" 1>&2
+                exit 1
+                ;;
+        esac
+    done
+
+    download_and_prepare_rw "$profile" source
+
+    if [[ "$need_connector" == "true" ]]; then
+        download_connector_node_artifact
+    fi
+
+    echo "--- starting risingwave cluster: ${risedev_profile}"
+    risedev ci-start "${risedev_profile}"
+    sleep "$sleep_duration"
+}
+
+# Set nextest partition argument based on BuildKite parallel job configuration
+if [ -n "${BUILDKITE_PARALLEL_JOB:-}" ] && [ -n "${BUILDKITE_PARALLEL_JOB_COUNT:-}" ]; then
+  # Add 1 to BUILDKITE_PARALLEL_JOB to get 1-based index
+  NEXTEST_PARTITION_ARG="--partition hash:$((BUILDKITE_PARALLEL_JOB + 1))/${BUILDKITE_PARALLEL_JOB_COUNT}"
+  echo "NEXTEST_PARTITION_ARG is set to \"$NEXTEST_PARTITION_ARG\" based on Buildkite parallel job configuration."
+else
+  NEXTEST_PARTITION_ARG=""
+fi

@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,122 @@
  *
  */
 
-import {
-  Box,
-  Grid,
-  GridItem,
-  HStack,
-  SimpleGrid,
-  Text,
-  theme,
-  VStack,
-} from "@chakra-ui/react"
 import { clone, reverse, sortBy } from "lodash"
 import Head from "next/head"
-import { Fragment, useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Area, AreaChart, ResponsiveContainer, XAxis, YAxis } from "recharts"
+import styled from "styled-components"
 import { Metrics, MetricsSample } from "../components/metrics"
-import Title from "../components/Title"
 import useErrorToast from "../hook/useErrorToast"
 import {
   getClusterInfoComputeNode,
   getClusterInfoFrontend,
   getClusterMetrics,
+  getClusterVersion,
 } from "../lib/api/cluster"
+import {
+  canvasTexture,
+  colors,
+  fonts,
+  radii,
+  shadows,
+} from "../lib/design-tokens"
 import { WorkerNode } from "../proto/gen/common"
+
+const Page = styled.main`
+  min-height: 100vh;
+  padding: 32px 24px;
+  color: ${colors.foreground};
+  background-color: ${colors.background};
+  background-image: ${canvasTexture.backgroundImage};
+  background-size: ${canvasTexture.backgroundSize};
+  font-family: ${fonts.body};
+
+  @media (min-width: 62rem) {
+    padding: 48px 40px;
+  }
+`
+
+const Heading = styled.h1`
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+`
+
+const VersionText = styled.p`
+  margin: 8px 0 0;
+  color: ${colors.mutedForeground};
+  font-size: 14px;
+  line-height: 1.5;
+`
+
+const Section = styled.section`
+  margin-top: 32px;
+`
+
+const SectionTitle = styled.h2`
+  margin: 0 0 12px;
+  color: ${colors.foregroundSecondary};
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+`
+
+const CardsGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+`
+
+const Card = styled.div`
+  padding: 16px;
+  border: 1px solid rgba(227, 224, 216, 0.65);
+  border-radius: ${radii.lg};
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: ${shadows.surfaceCard};
+`
+
+const NodeHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+`
+
+const StatusDot = styled.span`
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: ${colors.success};
+`
+
+const NodeTitle = styled.h3`
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+`
+
+const NodeMeta = styled.p`
+  margin: 4px 0 0;
+  color: ${colors.mutedForeground};
+  font-size: 12px;
+  line-height: 1.45;
+`
+
+const MetricsLabel = styled.p`
+  margin: 0 0 8px;
+  color: ${colors.mutedForeground};
+  font-size: 12px;
+  line-height: 1.45;
+
+  strong {
+    color: ${colors.foregroundSecondary};
+    font-weight: 600;
+  }
+`
 
 function WorkerNodeComponent({
   workerNodeType,
@@ -47,22 +140,18 @@ function WorkerNodeComponent({
   workerNode: WorkerNode
 }) {
   return (
-    <Fragment>
-      <VStack alignItems="start" spacing={1}>
-        <HStack>
-          <Box w={3} h={3} flex="none" bgColor="green.600" rounded="full"></Box>
-          <Text fontWeight="medium" fontSize="xl" textColor="black">
-            {workerNodeType} #{workerNode.id}
-          </Text>
-        </HStack>
-        <Text textColor="gray.500" m={0}>
-          Running
-        </Text>
-        <Text textColor="gray.500" m={0}>
-          {workerNode.host?.host}:{workerNode.host?.port}
-        </Text>
-      </VStack>
-    </Fragment>
+    <div>
+      <NodeHeader>
+        <StatusDot />
+        <NodeTitle>
+          {workerNodeType} #{workerNode.id}
+        </NodeTitle>
+      </NodeHeader>
+      <NodeMeta>Running</NodeMeta>
+      <NodeMeta>
+        {workerNode.host?.host}:{workerNode.host?.port}
+      </NodeMeta>
+    </div>
   )
 }
 
@@ -101,35 +190,30 @@ function WorkerNodeMetricsComponent({
     return reverse(filledMetrics)
   }, [metrics])
   return (
-    <Fragment>
-      <VStack alignItems="start" spacing={1}>
-        <Text textColor="gray.500" mx={3}>
-          <b>{job}</b> {instance}
-        </Text>
-
-        <ResponsiveContainer width="100%" height={100}>
-          <AreaChart data={metricsCallback()}>
-            <XAxis
-              dataKey="timestamp"
-              type="number"
-              domain={["dataMin", "dataMax"]}
-              hide={true}
-            />
-            {isCpuMetrics && (
-              <YAxis type="number" domain={[0, 1]} hide={true} />
-            )}
-            <Area
-              isAnimationActive={false}
-              type="linear"
-              dataKey="value"
-              strokeWidth={1}
-              stroke={theme.colors.blue["500"]}
-              fill={theme.colors.blue["100"]}
-            />
-          </AreaChart>
-        </ResponsiveContainer>
-      </VStack>
-    </Fragment>
+    <div>
+      <MetricsLabel>
+        <strong>{job}</strong> {instance}
+      </MetricsLabel>
+      <ResponsiveContainer width="100%" height={100}>
+        <AreaChart data={metricsCallback()}>
+          <XAxis
+            dataKey="timestamp"
+            type="number"
+            domain={["dataMin", "dataMax"]}
+            hide={true}
+          />
+          {isCpuMetrics && <YAxis type="number" domain={[0, 1]} hide={true} />}
+          <Area
+            isAnimationActive={false}
+            type="linear"
+            dataKey="value"
+            strokeWidth={1.5}
+            stroke={colors.accent}
+            fill="rgba(42, 157, 244, 0.12)"
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
   )
 }
 
@@ -142,6 +226,7 @@ export default function Cluster() {
   const [frontendList, setFrontendList] = useState<WorkerNode[]>([])
   const [computeNodeList, setComputeNodeList] = useState<WorkerNode[]>([])
   const [metrics, setMetrics] = useState<ClusterNodeMetrics>()
+  const [version, setVersion] = useState<string>()
   const toast = useErrorToast()
 
   useEffect(() => {
@@ -149,6 +234,7 @@ export default function Cluster() {
       try {
         setFrontendList(await getClusterInfoFrontend())
         setComputeNodeList(await getClusterInfoComputeNode())
+        setVersion(await getClusterVersion())
       } catch (e: any) {
         toast(e)
       }
@@ -179,93 +265,70 @@ export default function Cluster() {
     return () => {}
   }, [toast])
 
-  const retVal = (
-    <Box p={3}>
-      <Title>Cluster Overview</Title>
-      <Grid my={3} templateColumns="repeat(3, 1fr)" gap={6} width="full">
-        {frontendList.map((frontend) => (
-          <GridItem
-            w="full"
-            rounded="xl"
-            bg="white"
-            shadow="md"
-            borderWidth={1}
-            p={6}
-            key={frontend.id}
-          >
-            <WorkerNodeComponent
-              workerNodeType="Frontend"
-              workerNode={frontend}
-            />
-          </GridItem>
-        ))}
-        {computeNodeList.map((computeNode) => (
-          <GridItem
-            w="full"
-            rounded="xl"
-            bg="white"
-            shadow="md"
-            borderWidth={1}
-            p={6}
-            key={computeNode.id}
-          >
-            <WorkerNodeComponent
-              workerNodeType="Compute"
-              workerNode={computeNode}
-            />
-          </GridItem>
-        ))}
-      </Grid>
-      <Title>CPU Usage</Title>
-      <SimpleGrid my={3} columns={3} spacing={6} width="full">
-        {metrics &&
-          metrics.cpuData.map((data) => (
-            <GridItem
-              w="full"
-              rounded="xl"
-              bg="white"
-              shadow="md"
-              borderWidth={1}
-              key={data.metric.instance}
-            >
-              <WorkerNodeMetricsComponent
-                job={data.metric.job}
-                instance={data.metric.instance}
-                metrics={data.sample}
-                isCpuMetrics={true}
-              />
-            </GridItem>
-          ))}
-      </SimpleGrid>
-      <Title>Memory Usage</Title>
-      <SimpleGrid my={3} columns={3} spacing={6} width="full">
-        {metrics &&
-          metrics.memoryData.map((data) => (
-            <GridItem
-              w="full"
-              rounded="xl"
-              bg="white"
-              shadow="md"
-              borderWidth={1}
-              key={data.metric.instance}
-            >
-              <WorkerNodeMetricsComponent
-                job={data.metric.job}
-                instance={data.metric.instance}
-                metrics={data.sample}
-                isCpuMetrics={false}
-              />
-            </GridItem>
-          ))}
-      </SimpleGrid>
-    </Box>
-  )
   return (
-    <Fragment>
+    <>
       <Head>
         <title>Cluster Overview</title>
       </Head>
-      {retVal}
-    </Fragment>
+      <Page>
+        <header>
+          <Heading>Cluster Overview</Heading>
+          <VersionText>Version: {version}</VersionText>
+        </header>
+        <Section>
+          <SectionTitle>Nodes</SectionTitle>
+          <CardsGrid>
+            {frontendList.map((frontend) => (
+              <Card key={frontend.id}>
+                <WorkerNodeComponent
+                  workerNodeType="Frontend"
+                  workerNode={frontend}
+                />
+              </Card>
+            ))}
+            {computeNodeList.map((computeNode) => (
+              <Card key={computeNode.id}>
+                <WorkerNodeComponent
+                  workerNodeType="Compute"
+                  workerNode={computeNode}
+                />
+              </Card>
+            ))}
+          </CardsGrid>
+        </Section>
+        <Section>
+          <SectionTitle>CPU Usage</SectionTitle>
+          <CardsGrid>
+            {metrics &&
+              metrics.cpuData.map((data) => (
+                <Card key={data.metric.instance}>
+                  <WorkerNodeMetricsComponent
+                    job={data.metric.job}
+                    instance={data.metric.instance}
+                    metrics={data.sample}
+                    isCpuMetrics={true}
+                  />
+                </Card>
+              ))}
+          </CardsGrid>
+        </Section>
+        <Section>
+          <SectionTitle>Memory Usage</SectionTitle>
+          <CardsGrid>
+            {metrics &&
+              metrics.memoryData.map((data) => (
+                <Card key={data.metric.instance}>
+                  <WorkerNodeMetricsComponent
+                    job={data.metric.job}
+                    instance={data.metric.instance}
+                    metrics={data.sample}
+                    isCpuMetrics={false}
+                  />
+                </Card>
+              ))}
+          </CardsGrid>
+        </Section>
+      </Page>
+    </>
   )
 }

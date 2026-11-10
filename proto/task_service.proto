@@ -39,7 +39,8 @@ message TaskInfoResponse {
 message CreateTaskRequest {
   batch_plan.TaskId task_id = 1;
   batch_plan.PlanFragment plan = 2;
-  common.BatchQueryEpoch epoch = 3;
+  reserved "epoch";
+  reserved 3;
   map<string, string> tracing_context = 4;
   plan_common.ExprContext expr_context = 5;
 }
@@ -60,10 +61,80 @@ message GetDataResponse {
   data.DataChunk record_batch = 2;
 }
 
+message FastInsertRequest {
+  reserved "column_indices";
+  reserved 3;
+
+  // Id of the table to perform inserting.
+  uint32 table_id = 1;
+  // Version of the table.
+  uint64 table_version_id = 2;
+  data.DataChunk data_chunk = 4;
+
+  // An optional field and will be `None` for tables without user-defined pk.
+  // The `BatchInsertExecutor` should add a column with NULL value which will
+  // be filled in streaming.
+  optional uint32 row_id_index = 5;
+
+  // Use this number to assign the insert req to different worker nodes and dml channels.
+  uint32 request_id = 6;
+  bool wait_for_persistence = 7;
+  // TODO(kexiang): add support for default columns. plan_common.ExprContext expr_context is needed for it.
+}
+
+message FastInsertResponse {
+  enum Status {
+    UNSPECIFIED = 0;
+    SUCCEEDED = 1;
+    DML_FAILED = 2;
+  }
+  Status status = 1;
+  string error_message = 2;
+}
+
+message IngestDmlInitRequest {
+  // Id of the table to perform DML on.
+  uint32 table_id = 1;
+  // Version of the table.
+  uint64 table_version_id = 2;
+  // Used to select the DML channel (same as request_id in FastInsertRequest).
+  uint32 request_id = 3;
+  // Same as row_id_index in FastInsertRequest.
+  optional uint32 row_id_index = 4;
+}
+
+message IngestDmlPayloadRequest {
+  // Monotonically increasing per websocket payload.
+  uint64 dml_batch_id = 1;
+  // A StreamChunk carrying the logical upsert / delete payload for a single websocket batch.
+  data.StreamChunk chunk = 2;
+}
+
+message IngestDmlRequest {
+  oneof request {
+    IngestDmlInitRequest init = 1;
+    IngestDmlPayloadRequest payload = 2;
+  }
+}
+
+message IngestDmlInitResponse {}
+
+message IngestDmlAckResponse {
+  uint64 dml_batch_id = 1;
+}
+
+message IngestDmlResponse {
+  oneof response {
+    IngestDmlInitResponse init = 1;
+    IngestDmlAckResponse ack = 2;
+  }
+}
+
 message ExecuteRequest {
   batch_plan.TaskId task_id = 1;
   batch_plan.PlanFragment plan = 2;
-  common.BatchQueryEpoch epoch = 3;
+  reserved "epoch";
+  reserved 3;
   map<string, string> tracing_context = 4;
   plan_common.ExprContext expr_context = 5;
 }
@@ -73,6 +144,10 @@ service TaskService {
   // Cancel an already-died (self execution-failure, previous aborted, completed) task will still succeed.
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
   rpc Execute(ExecuteRequest) returns (stream GetDataResponse);
+  // A lightweight version insert, only for non-pgwire insert, such as inserts from webhooks and websockets.
+  rpc FastInsert(FastInsertRequest) returns (FastInsertResponse);
+  // DML stream with async persistence ack, used by the WebSocket ingest endpoint.
+  rpc IngestDml(stream IngestDmlRequest) returns (stream IngestDmlResponse);
 }
 
 message GetDataRequest {
@@ -95,6 +170,8 @@ message GetStreamRequest {
     uint32 down_actor_id = 2;
     uint32 up_fragment_id = 3;
     uint32 down_fragment_id = 4;
+    uint64 up_partial_graph_id = 5;
+    string term_id = 6;
   }
 
   oneof value {
@@ -106,14 +183,17 @@ message GetStreamRequest {
 }
 
 message GetStreamResponse {
-  stream_plan.StreamMessage message = 1;
+  stream_plan.StreamMessageBatch message = 1;
   // The number of permits acquired for this message, which should be sent back to the upstream with `add_permits`.
   // In theory, this can also be derived from the message itself by the receiver. Here we send it explicitly to
   // avoid any sense of inconsistency for the derivation logic, so the receiver can simply send it back verbatim.
   Permits permits = 2;
 }
 
-service ExchangeService {
+service BatchExchangeService {
   rpc GetData(GetDataRequest) returns (stream GetDataResponse);
+}
+
+service StreamExchangeService {
   rpc GetStream(stream GetStreamRequest) returns (stream GetStreamResponse);
 }

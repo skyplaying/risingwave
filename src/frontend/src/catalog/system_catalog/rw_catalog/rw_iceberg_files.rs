@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::ops::Deref;
 
 use anyhow::anyhow;
-use icelake::Table;
+use futures::StreamExt;
+use iceberg::table::Table;
+use risingwave_common::id::SourceId;
 use risingwave_common::types::Fields;
-use risingwave_connector::sink::iceberg::IcebergConfig;
-use risingwave_connector::source::ConnectorProperties;
 use risingwave_connector::WithPropertiesExt;
+use risingwave_connector::source::ConnectorProperties;
 use risingwave_frontend_macro::system_catalog;
 
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
@@ -29,12 +29,12 @@ use crate::error::Result;
 #[derive(Fields)]
 struct RwIcebergFiles {
     #[primary_key]
-    source_id: i32,
+    source_id: SourceId,
     schema_name: String,
     source_name: String,
     /// Type of content stored by the data file: data, equality deletes,
     /// or position deletes (all v1 files are data files)
-    pub content: i32,
+    pub content: String,
     /// Full URI for the file with FS scheme
     pub file_path: String,
     /// String file format name, avro, orc or parquet
@@ -78,31 +78,41 @@ async fn read(reader: &SysCatalogReaderImpl) -> Result<Vec<RwIcebergFiles>> {
 
     let mut result = vec![];
     for (schema_name, source) in iceberg_sources {
-        let source_props: HashMap<String, String> =
-            HashMap::from_iter(source.with_properties.clone());
-        let config = ConnectorProperties::extract(source_props, false)?;
+        let config = ConnectorProperties::extract(source.with_properties.clone(), false)?;
         if let ConnectorProperties::Iceberg(iceberg_properties) = config {
-            let iceberg_config: IcebergConfig = iceberg_properties.to_iceberg_config();
-            let table: Table = iceberg_config.load_table().await?;
-            result.extend(
-                table
-                    .current_data_files()
+            let table: Table = iceberg_properties.load_table().await?;
+            let metadata = table.metadata_ref();
+            if let Some(snapshot) = table.metadata().current_snapshot() {
+                let manifest_list = table
+                    .object_cache()
+                    .get_manifest_list(snapshot, &metadata)
                     .await
-                    .map_err(|e| anyhow!(e))?
-                    .iter()
-                    .map(|file| RwIcebergFiles {
-                        source_id: source.id as i32,
-                        schema_name: schema_name.clone(),
-                        source_name: source.name.clone(),
-                        content: file.content as i32,
-                        file_path: file.file_path.clone(),
-                        file_format: file.file_format.to_string(),
-                        record_count: file.record_count,
-                        file_size_in_bytes: file.file_size_in_bytes,
-                        equality_ids: file.equality_ids.clone(),
-                        sort_order_id: file.sort_order_id,
-                    }),
-            );
+                    .map_err(|e| anyhow!(e))?;
+                for entry in manifest_list.entries() {
+                    let manifest = entry
+                        .load_manifest(table.file_io())
+                        .await
+                        .map_err(|e| anyhow!(e))?;
+                    let mut manifest_entries_stream =
+                        futures::stream::iter(manifest.entries().iter().filter(|e| e.is_alive()));
+
+                    while let Some(manifest_entry) = manifest_entries_stream.next().await {
+                        let file = manifest_entry.data_file();
+                        result.push(RwIcebergFiles {
+                            source_id: source.id,
+                            schema_name: schema_name.clone(),
+                            source_name: source.name.clone(),
+                            content: format!("{:?}", file.content_type()),
+                            file_path: file.file_path().to_owned(),
+                            file_format: file.file_format().to_string(),
+                            record_count: file.record_count() as i64,
+                            file_size_in_bytes: file.file_size_in_bytes() as i64,
+                            equality_ids: file.equality_ids(),
+                            sort_order_id: file.sort_order_id(),
+                        });
+                    }
+                }
+            }
         } else {
             unreachable!()
         }

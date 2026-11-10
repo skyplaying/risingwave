@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,8 +13,6 @@
 // limitations under the License.
 
 #![feature(rustc_private)]
-#![feature(let_chains)]
-#![feature(lazy_cell)]
 #![warn(unused_extern_crates)]
 
 extern crate rustc_ast;
@@ -26,23 +24,32 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 mod format_error;
+mod temporary_guarded_metric;
 mod utils;
 
 dylint_linting::dylint_library!();
 
 #[allow(clippy::no_mangle_with_rust_abi)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut rustc_lint::LintStore) {
     // -- Begin lint registration --
 
     // Preparation steps.
-    lint_store.register_early_pass(|| {
-        Box::<utils::format_args_collector::FormatArgsCollector>::default()
+    let format_args_storage = clippy_utils::macros::FormatArgsStorage::default();
+    let format_args = format_args_storage.clone();
+    lint_store.register_early_pass(move || {
+        Box::new(utils::format_args_collector::FormatArgsCollector::new(
+            format_args.clone(),
+        ))
     });
 
     // Actual lints.
     lint_store.register_lints(&[format_error::FORMAT_ERROR]);
-    lint_store.register_late_pass(|_| Box::<format_error::FormatError>::default());
+    lint_store.register_lints(&[temporary_guarded_metric::TEMPORARY_GUARDED_METRIC]);
+    let format_args = format_args_storage.clone();
+    lint_store
+        .register_late_pass(move |_| Box::new(format_error::FormatError::new(format_args.clone())));
+    lint_store.register_late_pass(|_| Box::new(temporary_guarded_metric::TemporaryGuardedMetric));
 
     // --  End lint registration  --
 

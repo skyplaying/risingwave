@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,17 +14,20 @@
 
 use std::collections::HashSet;
 
-use fixedbitset::FixedBitSet;
+use risingwave_common::catalog::Field;
+use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::OrderType;
+use risingwave_expr::window_function::WindowFuncKind;
 use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::generic::{self, PlanWindowFunction};
 use super::stream::prelude::*;
-use super::utils::{impl_distill_by_unit, TableCatalogBuilder};
-use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
-use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::stream_fragmenter::BuildFragmentGraphState;
+use super::utils::{TableCatalogBuilder, impl_distill_by_unit};
+use super::{ExprRewritable, PlanBase, PlanTreeNodeUnary, StreamNode, StreamPlanRef as PlanRef};
 use crate::TableCatalog;
+use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::property::{MonotonicityMap, StreamKind, WatermarkColumns};
+use crate::stream_fragmenter::BuildFragmentGraphState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamEowcOverWindow {
@@ -50,14 +53,16 @@ impl StreamEowcOverWindow {
 
         // `EowcOverWindowExecutor` cannot produce any watermark columns, because there may be some
         // ancient rows in some rarely updated partitions that are emitted at the end of time.
-        let watermark_columns = FixedBitSet::with_capacity(core.output_len());
+        let watermark_columns = WatermarkColumns::new();
 
         let base = PlanBase::new_stream_with_core(
             &core,
             input.distribution().clone(),
-            true,
+            StreamKind::AppendOnly,
             true,
             watermark_columns,
+            // we cannot derive monotonicity for any column for the same reason as watermark columns
+            MonotonicityMap::new(),
         );
         StreamEowcOverWindow { base, core }
     }
@@ -111,11 +116,107 @@ impl StreamEowcOverWindow {
         let in_dist_key = self.core.input.distribution().dist_column_indices();
         tbl_builder.build(in_dist_key.to_vec(), read_prefix_len_hint)
     }
+
+    /// Returns true if any window function requires intermediate state persistence.
+    /// This includes numbering functions (`row_number`, `rank`, `dense_rank`), and windows that may
+    /// be closed by watermark, whose output progress is persisted.
+    fn needs_intermediate_state_table(&self) -> bool {
+        self.window_functions().iter().any(|f| {
+            matches!(
+                f.kind,
+                WindowFuncKind::RowNumber | WindowFuncKind::Rank | WindowFuncKind::DenseRank
+            )
+        }) || self.needs_watermark_trigger_table()
+    }
+
+    /// Returns true if the window of any window function may be closed by the watermark of the
+    /// order key.
+    fn needs_watermark_trigger_table(&self) -> bool {
+        self.window_functions()
+            .iter()
+            .any(|f| f.frame.bounds.may_close_by_watermark())
+    }
+
+    /// Map the input distribution key to the given columns of partition key, which start at
+    /// `offset` in an internal table.
+    fn partition_dist_key(&self, offset: usize) -> Vec<usize> {
+        let partition_key_indices = self.partition_key_indices();
+        self.core
+            .input
+            .distribution()
+            .dist_column_indices()
+            .iter()
+            .filter_map(|&idx| {
+                partition_key_indices
+                    .iter()
+                    .position(|&pk_idx| pk_idx == idx)
+            })
+            .map(|pos| pos + offset)
+            .collect()
+    }
+
+    /// Infer the intermediate state table for persisting window function states.
+    ///
+    /// Schema: partition key columns + `state_0..state_{n-1}` (Bytea, one per window function
+    /// call) + `progress` (Bytea, only with the watermark trigger table).
+    /// PK: partition key columns (ascending) only.
+    fn infer_intermediate_state_table(&self) -> TableCatalog {
+        let in_fields = self.core.input.schema().fields();
+        let mut tbl_builder = TableCatalogBuilder::default();
+
+        // Add partition key columns
+        let partition_key_indices = self.partition_key_indices();
+        for &idx in &partition_key_indices {
+            tbl_builder.add_column(&in_fields[idx]);
+        }
+
+        // Add state columns: one per window function call (state_0, state_1, ..., state_{n-1})
+        let num_calls = self.window_functions().len();
+        for i in 0..num_calls {
+            tbl_builder.add_column(&Field::with_name(DataType::Bytea, format!("state_{}", i)));
+        }
+        if self.needs_watermark_trigger_table() {
+            tbl_builder.add_column(&Field::with_name(DataType::Bytea, "progress"));
+        }
+
+        // PK = partition key columns only (ascending)
+        for i in 0..partition_key_indices.len() {
+            tbl_builder.add_order_column(i, OrderType::ascending());
+        }
+        let read_prefix_len_hint = tbl_builder.get_current_pk_len();
+
+        // The partition key columns are added first at indices 0..partition_key_indices.len().
+        tbl_builder.build(self.partition_dist_key(0), read_prefix_len_hint)
+    }
+
+    /// Infer the table that indexes partitions by the watermark of the order key at which to check
+    /// them again, see `WatermarkTriggers` of the executor.
+    ///
+    /// Schema: `trigger_watermark` (order key type) + `trigger_exclusive` (Boolean) + partition key
+    /// columns. PK: all columns (ascending).
+    fn infer_watermark_trigger_table(&self) -> TableCatalog {
+        let in_fields = self.core.input.schema().fields();
+        let mut tbl_builder = TableCatalogBuilder::default();
+
+        let order_key_type = in_fields[self.order_key_index()].data_type();
+        tbl_builder.add_column(&Field::with_name(order_key_type, "trigger_watermark"));
+        tbl_builder.add_column(&Field::with_name(DataType::Boolean, "trigger_exclusive"));
+        let partition_key_indices = self.partition_key_indices();
+        for &idx in &partition_key_indices {
+            tbl_builder.add_column(&in_fields[idx]);
+        }
+        for i in 0..2 + partition_key_indices.len() {
+            tbl_builder.add_order_column(i, OrderType::ascending());
+        }
+
+        // Only range scans by the trigger watermark.
+        tbl_builder.build(self.partition_dist_key(2), 0)
+    }
 }
 
 impl_distill_by_unit!(StreamEowcOverWindow, core, "StreamEowcOverWindow");
 
-impl PlanTreeNodeUnary for StreamEowcOverWindow {
+impl PlanTreeNodeUnary<Stream> for StreamEowcOverWindow {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -126,7 +227,7 @@ impl PlanTreeNodeUnary for StreamEowcOverWindow {
         Self::new(core)
     }
 }
-impl_plan_tree_node_for_unary! { StreamEowcOverWindow }
+impl_plan_tree_node_for_unary! { Stream, StreamEowcOverWindow }
 
 impl StreamNode for StreamEowcOverWindow {
     fn to_stream_prost_body(&self, state: &mut BuildFragmentGraphState) -> PbNodeBody {
@@ -152,15 +253,35 @@ impl StreamNode for StreamEowcOverWindow {
             .with_id(state.gen_table_id_wrapped())
             .to_internal_table_prost();
 
-        PbNodeBody::EowcOverWindow(EowcOverWindowNode {
+        // Build intermediate state table if needed
+        let intermediate_state_table = if self.needs_intermediate_state_table() {
+            Some(
+                self.infer_intermediate_state_table()
+                    .with_id(state.gen_table_id_wrapped())
+                    .to_internal_table_prost(),
+            )
+        } else {
+            None
+        };
+
+        let watermark_trigger_table = self.needs_watermark_trigger_table().then(|| {
+            self.infer_watermark_trigger_table()
+                .with_id(state.gen_table_id_wrapped())
+                .to_internal_table_prost()
+        });
+
+        PbNodeBody::EowcOverWindow(Box::new(EowcOverWindowNode {
             calls,
             partition_by,
             order_by,
             state_table: Some(state_table),
-        })
+            intermediate_state_table,
+            watermark_trigger_table,
+            version: PbEowcOverWindowNodeVersion::LATEST as _,
+        }))
     }
 }
 
-impl ExprRewritable for StreamEowcOverWindow {}
+impl ExprRewritable<Stream> for StreamEowcOverWindow {}
 
 impl ExprVisitable for StreamEowcOverWindow {}

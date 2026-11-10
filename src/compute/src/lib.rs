@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(trait_alias)]
 #![feature(coroutines)]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
-#![feature(lint_reasons)]
 #![feature(impl_trait_in_assoc_type)]
-#![feature(lazy_cell)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
+#![warn(clippy::large_futures, clippy::large_stack_frames)]
 
 #[macro_use]
 extern crate tracing;
@@ -32,13 +29,15 @@ pub mod telemetry;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
-use risingwave_common::config::{AsyncStackTraceOption, MetricLevel, OverrideConfig};
+use clap::Parser;
+use risingwave_common::config::{AsyncStackTraceOption, MetricLevel, OverrideConfig, Role};
 use risingwave_common::util::meta_addr::MetaAddressStrategy;
 use risingwave_common::util::resource_util::cpu::total_cpu_available;
 use risingwave_common::util::resource_util::memory::system_memory_available_bytes;
-use serde::{Deserialize, Serialize};
+use risingwave_common::util::tokio_util::sync::CancellationToken;
+use risingwave_common::util::worker_util::DEFAULT_RESOURCE_GROUP;
 
 /// If `total_memory_bytes` is not specified, the default memory limit will be set to
 /// the system memory limit multiplied by this proportion
@@ -87,24 +86,44 @@ pub struct ComputeNodeOpts {
     pub total_memory_bytes: usize,
 
     /// Reserved memory for the compute node in bytes.
-    /// If not set, a portion (default to 30%) for the `total_memory_bytes` will be used as the reserved memory.
+    /// If not set, a portion (default to 30% for the first 16GB and 20% for the rest)
+    /// for the `total_memory_bytes` will be used as the reserved memory.
     ///
     /// The total memory compute and storage can use is `total_memory_bytes` - `reserved_memory_bytes`.
     #[clap(long, env = "RW_RESERVED_MEMORY_BYTES")]
     pub reserved_memory_bytes: Option<usize>,
+
+    /// Target memory usage for Memory Manager.
+    /// If not set, the default value is `total_memory_bytes` - `reserved_memory_bytes`
+    ///
+    /// It's strongly recommended to set it for standalone deployment.
+    ///
+    /// ## Why need this?
+    ///
+    /// Our [`crate::memory::manager::MemoryManager`] works by reading the memory statistics from
+    /// Jemalloc. This is fine when running the compute node alone; while for standalone mode,
+    /// the memory usage of **all nodes** are counted. Thus, we need to pass a reasonable total
+    /// usage so that the memory is kept around this value.
+    #[clap(long, env = "RW_MEMORY_MANAGER_TARGET_BYTES")]
+    pub memory_manager_target_bytes: Option<usize>,
 
     /// The parallelism that the compute node will register to the scheduler of the meta service.
     #[clap(long, env = "RW_PARALLELISM", default_value_t = default_parallelism())]
     #[override_opts(if_absent, path = streaming.actor_runtime_worker_threads_num)]
     pub parallelism: usize,
 
+    /// Resource group for scheduling, default value is "default"
+    #[clap(long, env = "RW_RESOURCE_GROUP", default_value_t = default_resource_group())]
+    pub resource_group: String,
+
     /// Decides whether the compute node can be used for streaming and serving.
     #[clap(long, env = "RW_COMPUTE_NODE_ROLE", value_enum, default_value_t = default_role())]
     pub role: Role,
 
     /// Used for control the metrics level, similar to log level.
-    /// 0 = disable metrics
-    /// >0 = enable metrics
+    ///
+    /// level = 0: disable metrics
+    /// level > 0: enable metrics
     #[clap(long, hide = true, env = "RW_METRICS_LEVEL")]
     #[override_opts(path = server.metrics_level)]
     pub metrics_level: Option<MetricLevel>,
@@ -135,6 +154,15 @@ pub struct ComputeNodeOpts {
     #[deprecated = "connector node has been deprecated."]
     #[clap(long, hide = true, env = "RW_CONNECTOR_RPC_ENDPOINT")]
     pub connector_rpc_endpoint: Option<String>,
+
+    /// The path of the temp secret file directory.
+    #[clap(
+        long,
+        hide = true,
+        env = "RW_TEMP_SECRET_FILE_DIR",
+        default_value = "./secrets"
+    )]
+    pub temp_secret_file_dir: String,
 }
 
 impl risingwave_common::opts::Opts for ComputeNodeOpts {
@@ -147,36 +175,13 @@ impl risingwave_common::opts::Opts for ComputeNodeOpts {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, ValueEnum, Serialize, Deserialize)]
-pub enum Role {
-    Serving,
-    Streaming,
-    #[default]
-    Both,
-}
-
-impl Role {
-    pub fn for_streaming(&self) -> bool {
-        match self {
-            Role::Serving => false,
-            Role::Streaming => true,
-            Role::Both => true,
-        }
-    }
-
-    pub fn for_serving(&self) -> bool {
-        match self {
-            Role::Serving => true,
-            Role::Streaming => false,
-            Role::Both => true,
-        }
-    }
-}
-
 fn validate_opts(opts: &ComputeNodeOpts) {
     let system_memory_available_bytes = system_memory_available_bytes();
     if opts.total_memory_bytes > system_memory_available_bytes {
-        let error_msg = format!("total_memory_bytes {} is larger than the total memory available bytes {} that can be acquired.", opts.total_memory_bytes, system_memory_available_bytes);
+        let error_msg = format!(
+            "total_memory_bytes {} is larger than the total memory available bytes {} that can be acquired.",
+            opts.total_memory_bytes, system_memory_available_bytes
+        );
         tracing::error!(error_msg);
         panic!("{}", error_msg);
     }
@@ -198,7 +203,10 @@ fn validate_opts(opts: &ComputeNodeOpts) {
 use crate::server::compute_node_serve;
 
 /// Start compute node
-pub fn start(opts: ComputeNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+pub fn start(
+    opts: ComputeNodeOpts,
+    shutdown: CancellationToken,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     // WARNING: don't change the function signature. Making it `async fn` will cause
     // slow compile in release mode.
     Box::pin(async move {
@@ -218,14 +226,7 @@ pub fn start(opts: ComputeNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> 
             .unwrap();
         tracing::info!("advertise addr is {}", advertise_addr);
 
-        let (join_handle_vec, _shutdown_send) =
-            compute_node_serve(listen_addr, advertise_addr, opts).await;
-
-        tracing::info!("Server listening at {}", listen_addr);
-
-        for join_handle in join_handle_vec {
-            join_handle.await.unwrap();
-        }
+        compute_node_serve(listen_addr, advertise_addr, Arc::new(opts), shutdown).await;
     })
 }
 
@@ -237,6 +238,20 @@ pub fn default_parallelism() -> usize {
     total_cpu_available().ceil() as usize
 }
 
+pub fn default_resource_group() -> String {
+    DEFAULT_RESOURCE_GROUP.to_owned()
+}
+
 pub fn default_role() -> Role {
     Role::Both
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_role_rejects_none() {
+        assert!(ComputeNodeOpts::try_parse_from(["compute", "--role", "none"]).is_err());
+    }
 }

@@ -1,4 +1,5 @@
 [env]
+CARGO_MAKE_CRATE_INSTALLATION_LOCKED = true
 RISEDEV = "1"
 RUST_BACKTRACE = "1"
 OS = { source = "${CARGO_MAKE_RUST_TARGET_OS}", mapping = { linux = "linux", macos = "darwin" } }
@@ -15,11 +16,21 @@ PREFIX_LOG = "${PREFIX}/log"
 PREFIX_TMP = "${PREFIX}/tmp"
 PREFIX_DOCKER = "${PREFIX}/rw-docker"
 PREFIX_PROFILING = "${PREFIX}/profiling"
+PREFIX_SECRET = "${PREFIX}/secrets"
 
 BUILD_MODE_DIR = { source = "${ENABLE_RELEASE_PROFILE}", default_value = "debug", mapping = { true = "release" } }
 RISINGWAVE_BUILD_PROFILE = { source = "${ENABLE_RELEASE_PROFILE}", default_value = "dev", mapping = { true = "release" } }
 
 [tasks.prepare-dir]
+condition = { condition_type = "Or", files_not_exist = [
+    "${PREFIX}",
+    "${PREFIX_BIN}",
+    "${PREFIX_TMP}",
+    "${PREFIX_DATA}",
+    "${PREFIX_CONFIG}",
+    "${PREFIX_CONFIG}/mcli",
+    "${PREFIX_LOG}",
+] }
 private = true
 script = '''
 #!/usr/bin/env bash
@@ -29,11 +40,11 @@ mkdir -p "${PREFIX}" "${PREFIX_BIN}" "${PREFIX_TMP}" "${PREFIX_DATA}" "${PREFIX_
 
 [tasks.check-risedev-configured]
 private = true
-condition = { env_not_set = [ "RISEDEV_CONFIGURED" ] }
+condition = { env_not_set = ["RISEDEV_CONFIGURED"] }
 script = '''
 #!/usr/bin/env bash
 set -e
-echo "RiseDev is not configured, please run ./risedev configure"
+echo "RiseDev is not configured, please run ${RISEDEV_CMD} configure"
 exit 1
 '''
 

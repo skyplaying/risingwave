@@ -1,5 +1,4 @@
 ---
-version: "3"
 services:
   risingwave-standalone:
     extends:
@@ -49,7 +48,7 @@ services:
       retries: 5
     container_name: mysql
   debezium:
-    image: debezium-connect
+    image: debezium/connect:1.9
     build: .
     environment:
       BOOTSTRAP_SERVERS: message_queue:29092

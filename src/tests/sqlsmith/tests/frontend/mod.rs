@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,11 +22,12 @@ use risingwave_frontend::handler::HandlerArgs;
 use risingwave_frontend::session::SessionImpl;
 use risingwave_frontend::test_utils::LocalFrontend;
 use risingwave_frontend::{
-    handler, Binder, FrontendOpts, OptimizerContext, OptimizerContextRef, Planner,
+    Binder, FrontendOpts, OptimizerContext, OptimizerContextRef, Planner, handler,
 };
 use risingwave_sqlparser::ast::Statement;
+use risingwave_sqlsmith::config::Configuration;
 use risingwave_sqlsmith::{
-    is_permissible_error, mview_sql_gen, parse_create_table_statements, parse_sql, sql_gen, Table,
+    Table, is_permissible_error, mview_sql_gen, parse_create_table_statements, parse_sql, sql_gen,
 };
 use thiserror_ext::AsReport;
 use tokio::runtime::Runtime;
@@ -46,7 +47,7 @@ pub struct SqlsmithEnv {
 /// Skip status is required, so that we know if a SQL statement writing to the database was skipped.
 /// Then, we can infer the correct state of the database.
 async fn handle(session: Arc<SessionImpl>, stmt: Statement, sql: Arc<str>) -> Result<bool> {
-    let result = handler::handle(session.clone(), stmt, sql, vec![])
+    let result = Box::pin(handler::handle(session.clone(), stmt, sql, vec![]))
         .await
         .map(|_| ())
         .map_err(|e| format!("Error Reason:\n{}", e.as_report()).into());
@@ -99,18 +100,23 @@ async fn create_tables(
 
     for s in statements {
         let create_sql: Arc<str> = Arc::from(s.to_string());
-        handle(session.clone(), s, create_sql).await?;
+        Box::pin(handle(session.clone(), s, create_sql)).await?;
     }
 
     // Generate some mviews
     for i in 0..20 {
-        let (sql, table) = mview_sql_gen(rng, tables.clone(), &format!("m{}", i));
+        let (sql, table) = mview_sql_gen(
+            rng,
+            tables.clone(),
+            &format!("m{}", i),
+            &Configuration::default(),
+        );
         let sql: Arc<str> = Arc::from(sql);
         reproduce_failing_queries(&setup_sql, &sql);
-        setup_sql.push_str(&format!("{};", &sql));
+        setup_sql.push_str(&format!("{};", sql));
         let stmts = parse_sql(&sql);
         let stmt = stmts[0].clone();
-        let skipped = handle(session.clone(), stmt, sql).await?;
+        let skipped = Box::pin(handle(session.clone(), stmt, sql)).await?;
         if !skipped {
             tables.push(table);
         }
@@ -154,22 +160,27 @@ async fn test_stream_query(
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = rand::make_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }
 
-    let (sql, table) = mview_sql_gen(&mut rng, tables.clone(), "stream_query");
+    let (sql, table) = mview_sql_gen(
+        &mut rng,
+        tables.clone(),
+        "stream_query",
+        &Configuration::default(),
+    );
     let sql: Arc<str> = Arc::from(sql);
     reproduce_failing_queries(setup_sql, &sql);
     // The generated SQL must be parsable.
     let stmt = round_trip_parse_test(&sql)?;
-    let skipped = handle(session.clone(), stmt, sql).await?;
+    let skipped = Box::pin(handle(session.clone(), stmt, sql)).await?;
     if !skipped {
         let drop_sql: Arc<str> = Arc::from(format!("DROP MATERIALIZED VIEW {}", table.name));
         let drop_stmts = parse_sql(&drop_sql);
         let drop_stmt = drop_stmts[0].clone();
-        handle(session.clone(), drop_stmt, drop_sql).await?;
+        Box::pin(handle(session.clone(), drop_stmt, drop_sql)).await?;
     }
     Ok(())
 }
@@ -181,24 +192,24 @@ fn run_batch_query(
 ) -> Result<()> {
     let _guard = session.txn_begin_implicit();
 
-    let mut binder = Binder::new(&session);
+    let mut binder = Binder::new_for_batch(&session);
     let bound = binder
         .bind(stmt)
         .map_err(|e| Failed::from(format!("Failed to bind:\nReason:\n{}", e.as_report())))?;
-    let mut planner = Planner::new(context);
-    let mut plan_root = planner.plan(bound).map_err(|e| {
+    let mut planner = Planner::new_for_batch(context);
+    let plan_root = planner.plan(bound).map_err(|e| {
         Failed::from(format!(
             "Failed to generate logical plan:\nReason:\n{}",
             e.as_report()
         ))
     })?;
-    plan_root.gen_batch_plan().map_err(|e| {
+    let batch_plan = plan_root.gen_batch_plan().map_err(|e| {
         Failed::from(format!(
             "Failed to generate batch plan:\nReason:\n{}",
             e.as_report()
         ))
     })?;
-    plan_root.gen_batch_distributed_plan().map_err(|e| {
+    batch_plan.gen_batch_distributed_plan().map_err(|e| {
         Failed::from(format!(
             "Failed to generate batch distributed plan:\nReason:\n{}",
             e.as_report()
@@ -217,18 +228,18 @@ fn test_batch_query(
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = rand::make_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }
 
-    let sql: Arc<str> = Arc::from(sql_gen(&mut rng, tables));
+    let sql: Arc<str> = Arc::from(sql_gen(&mut rng, tables, &Configuration::default()));
     reproduce_failing_queries(setup_sql, &sql);
 
     // The generated SQL must be parsable.
     let stmt = round_trip_parse_test(&sql)?;
     let context: OptimizerContextRef =
-        OptimizerContext::from_handler_args(HandlerArgs::new(session.clone(), &stmt, sql)?).into();
+        OptimizerContext::from_handler_args(HandlerArgs::new(session.clone(), &stmt, sql)?)?.into();
 
     match stmt {
         Statement::Query(_) => {
@@ -262,11 +273,11 @@ async fn setup_sqlsmith_with_seed_inner(seed: u64) -> Result<SqlsmithEnv> {
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = rand::make_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }
-    let (tables, setup_sql) = create_tables(session.clone(), &mut rng).await?;
+    let (tables, setup_sql) = Box::pin(create_tables(session.clone(), &mut rng)).await?;
     Ok(SqlsmithEnv {
         session,
         tables,

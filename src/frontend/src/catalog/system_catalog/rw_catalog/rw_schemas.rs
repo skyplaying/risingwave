@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::id::{SchemaId, UserId};
 use risingwave_common::types::Fields;
 use risingwave_frontend_macro::system_catalog;
-use risingwave_pb::user::grant_privilege::Object;
 
-use crate::catalog::system_catalog::{get_acl_items, SysCatalogReaderImpl};
 use crate::catalog::OwnedByUserCatalog;
+use crate::catalog::system_catalog::{SysCatalogReaderImpl, get_acl_items};
 use crate::error::Result;
 
 #[derive(Fields)]
 struct RwSchema {
     #[primary_key]
-    id: i32,
+    id: SchemaId,
     name: String,
-    owner: i32,
-    acl: String,
+    owner: UserId,
+    acl: Vec<String>,
 }
 
 #[system_catalog(table, "rw_catalog.rw_schemas")]
@@ -39,10 +39,10 @@ fn read_rw_schema_info(reader: &SysCatalogReaderImpl) -> Result<Vec<RwSchema>> {
 
     Ok(schemas
         .map(|schema| RwSchema {
-            id: schema.id() as i32,
+            id: schema.id(),
             name: schema.name(),
-            owner: schema.owner() as i32,
-            acl: get_acl_items(&Object::SchemaId(schema.id()), false, &users, username_map),
+            owner: schema.owner(),
+            acl: get_acl_items(schema.id(), false, &users, username_map),
         })
         .collect())
 }

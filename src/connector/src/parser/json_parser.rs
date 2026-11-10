@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,21 +21,24 @@
 // rely on the internal implementation and allow that to be changed, the tests use
 // `ByteStreamSourceParserImpl` to create a parser instance.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::Context as _;
-use apache_avro::Schema;
-use jst::{convert_avro, Context};
-use risingwave_pb::plan_common::ColumnDesc;
+use risingwave_common::bail;
+use risingwave_common::catalog::Field;
+use risingwave_connector_codec::JsonSchema;
+use risingwave_connector_codec::decoder::avro::avro_schema_to_fields;
 
-use super::util::{bytes_from_url, get_kafka_topic};
-use super::{JsonProperties, SchemaRegistryAuth};
+use super::utils::{bytes_from_url, get_kafka_topic, get_pulsar_topic};
+use super::{JsonProperties, SchemaRegistryConfig};
 use crate::error::ConnectorResult;
-use crate::parser::avro::util::avro_schema_to_column_descs;
-use crate::parser::unified::json::{JsonAccess, JsonParseOptions};
-use crate::parser::unified::AccessImpl;
 use crate::parser::AccessBuilder;
-use crate::schema::schema_registry::{handle_sr_list, Client};
+use crate::parser::unified::AccessImpl;
+use crate::parser::unified::json::{JsonAccess, JsonParseOptions};
+use crate::schema::pulsar_schema::{
+    self, PulsarSchema, PulsarSchemaConfig, parse_partitioned_topic,
+};
+use crate::schema::schema_registry::{Client, handle_sr_list};
 
 #[derive(Debug)]
 pub struct JsonAccessBuilder {
@@ -44,9 +47,8 @@ pub struct JsonAccessBuilder {
     json_parse_options: JsonParseOptions,
 }
 
-impl AccessBuilder for JsonAccessBuilder {
-    #[allow(clippy::unused_async)]
-    async fn generate_accessor(&mut self, payload: Vec<u8>) -> ConnectorResult<AccessImpl<'_, '_>> {
+impl JsonAccessBuilder {
+    pub fn generate_json_access(&mut self, payload: Vec<u8>) -> ConnectorResult<JsonAccess<'_>> {
         // XXX: When will we enter this branch?
         if payload.is_empty() {
             self.value = Some("{}".into());
@@ -57,21 +59,41 @@ impl AccessBuilder for JsonAccessBuilder {
             &mut self.value.as_mut().unwrap()[self.payload_start_idx..],
         )
         .context("failed to parse json payload")?;
-        Ok(AccessImpl::Json(JsonAccess::new_with_options(
+        Ok(JsonAccess::new_with_options(
             value,
             // Debezium and Canal have their special json access builder and will not
             // use this
             &self.json_parse_options,
-        )))
+        ))
+    }
+}
+
+impl AccessBuilder for JsonAccessBuilder {
+    async fn generate_accessor(
+        &mut self,
+        payload: Vec<u8>,
+        _: &crate::source::SourceMeta,
+    ) -> ConnectorResult<AccessImpl<'_>> {
+        Ok(AccessImpl::Json(self.generate_json_access(payload)?))
     }
 }
 
 impl JsonAccessBuilder {
     pub fn new(config: JsonProperties) -> ConnectorResult<Self> {
         let mut json_parse_options = JsonParseOptions::DEFAULT;
+        if let Some(mode) = config.timestamp_handling {
+            json_parse_options.timestamp_handling = mode;
+        }
         if let Some(mode) = config.timestamptz_handling {
             json_parse_options.timestamptz_handling = mode;
         }
+        if let Some(mode) = config.time_handling {
+            json_parse_options.time_handling = mode;
+        }
+        if let Some(mode) = config.bigint_unsigned_handling {
+            json_parse_options.bigint_unsigned_handling = mode;
+        }
+        json_parse_options.handle_toast_columns = config.handle_toast_columns;
         Ok(Self {
             value: None,
             payload_start_idx: if config.use_schema_registry { 5 } else { 0 },
@@ -80,29 +102,44 @@ impl JsonAccessBuilder {
     }
 }
 
-pub async fn schema_to_columns(
+pub async fn fetch_json_schema_and_map_to_columns(
     schema_location: &str,
-    schema_registry_auth: Option<SchemaRegistryAuth>,
-    props: &HashMap<String, String>,
-) -> ConnectorResult<Vec<ColumnDesc>> {
+    schema_registry_auth: Option<SchemaRegistryConfig>,
+    props: &BTreeMap<String, String>,
+) -> ConnectorResult<Vec<Field>> {
     let url = handle_sr_list(schema_location)?;
-    let json_schema = if let Some(schema_registry_auth) = schema_registry_auth {
-        let client = Client::new(url, &schema_registry_auth)?;
+    let mut json_schema = if let Some(schema_registry_auth) = schema_registry_auth {
+        let client = Client::new(url.clone(), &schema_registry_auth)?;
         let topic = get_kafka_topic(props)?;
         let schema = client
             .get_schema_by_subject(&format!("{}-value", topic))
             .await?;
-        serde_json::from_str(&schema.content)?
+        JsonSchema::parse_str(&schema.content)?
     } else {
         let url = url.first().unwrap();
         let bytes = bytes_from_url(url, None).await?;
-        serde_json::from_slice(&bytes)?
+        JsonSchema::parse_bytes(&bytes)?
     };
-    let context = Context::default();
-    let avro_schema = convert_avro(&json_schema, context).to_string();
-    let schema = Schema::parse_str(&avro_schema).context("failed to parse avro schema")?;
-    // TODO: do we need to support map type here?
-    avro_schema_to_column_descs(&schema, None).map_err(Into::into)
+    json_schema
+        .json_schema_to_columns(url.first().unwrap().clone())
+        .await
+        .map_err(Into::into)
+}
+
+/// Fetches the latest Pulsar `JSON` schema of the source topic and maps it to columns.
+///
+/// Pulsar stores `JSON` schemas as Avro record definitions, while payloads are plain JSON without
+/// a schema-registry header. JSON is self-describing, so only the latest schema is needed.
+pub async fn fetch_pulsar_json_schema_and_map_to_columns(
+    config: &PulsarSchemaConfig,
+    props: &BTreeMap<String, String>,
+) -> ConnectorResult<Vec<Field>> {
+    let client = pulsar_schema::Client::new(config)?;
+    let topic = parse_partitioned_topic(get_pulsar_topic(props)?)?;
+    match client.get_schema(&topic, None).await?.parse()? {
+        PulsarSchema::Json(schema) => Ok(avro_schema_to_fields(&schema, None)?),
+        PulsarSchema::Avro(_) => bail!("expected Pulsar JSON schema, got AVRO"),
+    }
 }
 
 #[cfg(test)]
@@ -114,7 +151,7 @@ mod tests {
     use risingwave_common::catalog::ColumnDesc;
     use risingwave_common::row::Row;
     use risingwave_common::test_prelude::StreamChunkTestExt;
-    use risingwave_common::types::{DataType, ScalarImpl, ToOwnedDatum};
+    use risingwave_common::types::{DataType, ScalarImpl, StructType, ToOwnedDatum};
     use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
     use risingwave_pb::plan_common::{AdditionalColumn, AdditionalColumnKey};
 
@@ -292,31 +329,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_parse_struct() {
-        let descs = vec![
-            ColumnDesc::new_struct(
+        let descs = [
+            ColumnDesc::named(
                 "data",
-                0,
-                "",
-                vec![
-                    ColumnDesc::new_atomic(DataType::Timestamp, "created_at", 1),
-                    ColumnDesc::new_atomic(DataType::Varchar, "id", 2),
-                    ColumnDesc::new_atomic(DataType::Varchar, "text", 3),
-                    ColumnDesc::new_atomic(DataType::Varchar, "lang", 4),
-                ],
+                0.into(),
+                DataType::from(StructType::new([
+                    ("created_at", DataType::Timestamp),
+                    ("id", DataType::Varchar),
+                    ("text", DataType::Varchar),
+                    ("lang", DataType::Varchar),
+                ])),
             ),
-            ColumnDesc::new_struct(
+            ColumnDesc::named(
                 "author",
-                5,
-                "",
-                vec![
-                    ColumnDesc::new_atomic(DataType::Timestamp, "created_at", 6),
-                    ColumnDesc::new_atomic(DataType::Varchar, "id", 7),
-                    ColumnDesc::new_atomic(DataType::Varchar, "name", 8),
-                    ColumnDesc::new_atomic(DataType::Varchar, "username", 9),
-                ],
+                5.into(),
+                DataType::from(StructType::new([
+                    ("created_at", DataType::Timestamp),
+                    ("id", DataType::Varchar),
+                    ("name", DataType::Varchar),
+                    ("username", DataType::Varchar),
+                ])),
             ),
-            ColumnDesc::new_atomic(DataType::Varchar, "I64CastToVarchar", 10),
-            ColumnDesc::new_atomic(DataType::Int64, "VarcharCastToI64", 11),
+            ColumnDesc::named("I64CastToVarchar", 10.into(), DataType::Varchar),
+            ColumnDesc::named("VarcharCastToI64", 11.into(), DataType::Int64),
         ]
         .iter()
         .map(SourceColumnDesc::from)
@@ -372,14 +407,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_parse_struct_from_string() {
-        let descs = vec![ColumnDesc::new_struct(
+        let descs = [ColumnDesc::named(
             "struct",
-            0,
-            "",
-            vec![
-                ColumnDesc::new_atomic(DataType::Varchar, "varchar", 1),
-                ColumnDesc::new_atomic(DataType::Boolean, "boolean", 2),
-            ],
+            0.into(),
+            DataType::from(StructType::new([
+                ("varchar", DataType::Varchar),
+                ("boolean", DataType::Boolean),
+            ])),
         )]
         .iter()
         .map(SourceColumnDesc::from)
@@ -409,14 +443,13 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_json_parse_struct_missing_field_warning() {
-        let descs = vec![ColumnDesc::new_struct(
+        let descs = [ColumnDesc::named(
             "struct",
-            0,
-            "",
-            vec![
-                ColumnDesc::new_atomic(DataType::Varchar, "varchar", 1),
-                ColumnDesc::new_atomic(DataType::Boolean, "boolean", 2),
-            ],
+            0.into(),
+            DataType::from(StructType::new([
+                ("varchar", DataType::Varchar),
+                ("boolean", DataType::Boolean),
+            ])),
         )]
         .iter()
         .map(SourceColumnDesc::from)
@@ -462,7 +495,6 @@ mod tests {
             name: "rw_key".into(),
             data_type: DataType::Bytea,
             column_id: 2.into(),
-            fields: vec![],
             column_type: SourceColumnType::Normal,
             is_pk: true,
             is_hidden_addition_col: false,

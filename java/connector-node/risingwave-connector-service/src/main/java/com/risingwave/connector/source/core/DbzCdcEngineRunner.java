@@ -1,28 +1,31 @@
-// Copyright 2024 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.source.core;
 
 import com.risingwave.connector.source.common.DbzConnectorConfig;
 import com.risingwave.connector.source.common.DbzSourceUtils;
-import com.risingwave.java.binding.Binding;
+import com.risingwave.java.binding.CdcSourceChannel;
 import com.risingwave.proto.ConnectorServiceProto.GetEventStreamResponse;
 import io.debezium.config.CommonConnectorConfig;
 import io.grpc.stub.StreamObserver;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,7 +72,7 @@ public class DbzCdcEngineRunner {
         return runner;
     }
 
-    public static DbzCdcEngineRunner create(DbzConnectorConfig config, long channelPtr) {
+    public static DbzCdcEngineRunner create(DbzConnectorConfig config, CdcSourceChannel channel) {
         DbzCdcEngineRunner runner = new DbzCdcEngineRunner(config);
         try {
             var sourceId = config.getSourceId();
@@ -90,8 +93,7 @@ public class DbzCdcEngineRunner {
                                             (error != null && error.getMessage() != null
                                                     ? error.getMessage()
                                                     : message);
-                                    if (!Binding.sendCdcSourceErrorToChannel(
-                                            channelPtr, errorMsg)) {
+                                    if (!channel.sendError(errorMsg)) {
                                         LOG.warn(
                                                 "engine#{} unable to send error message: {}",
                                                 sourceId,
@@ -128,9 +130,20 @@ public class DbzCdcEngineRunner {
         this.engine = engine;
     }
 
+    DbzCdcEngineRunner(DbzConnectorConfig config, DbzCdcEngine engine) {
+        this(config);
+        this.engine = engine;
+    }
+
     /** Start to run the cdc engine */
     public boolean start() throws InterruptedException {
-        if (isRunning()) {
+        return start(() -> true);
+    }
+
+    public boolean start(BooleanSupplier shouldContinue) throws InterruptedException {
+        // The engine must be stoppable as soon as it is submitted, including while waiting
+        // for streaming readiness. A completion callback may also stop it during startup.
+        if (!running.compareAndSet(false, true)) {
             LOG.info("engine#{} already started", engine.getId());
             return true;
         }
@@ -147,19 +160,24 @@ public class DbzCdcEngineRunner {
                     DbzSourceUtils.waitForStreamingRunning(
                             config.getSourceType(),
                             databaseServerName,
-                            config.getWaitStreamingStartTimeout());
+                            config.getWaitStreamingStartTimeout(),
+                            () -> isRunning() && shouldContinue.getAsBoolean());
         }
 
-        running.set(true);
+        startOk = startOk && isRunning();
         LOG.info("engine#{} start ok: {}", engine.getId(), startOk);
         return startOk;
     }
 
     public void stop() throws Exception {
-        if (isRunning()) {
-            engine.stop();
-            cleanUp();
-            LOG.info("engine#{} terminated", engine.getId());
+        if (running.compareAndSet(true, false)) {
+            try {
+                engine.stop();
+                LOG.info("engine#{} terminated", engine.getId());
+            } finally {
+                // Interrupt the runner thread even if closing the engine fails.
+                executor.shutdownNow();
+            }
         }
     }
 
@@ -173,11 +191,5 @@ public class DbzCdcEngineRunner {
 
     public DbzChangeEventConsumer getChangeEventConsumer() {
         return engine.getChangeEventConsumer();
-    }
-
-    private void cleanUp() {
-        running.set(false);
-        // interrupt the runner thread if it is still running
-        executor.shutdownNow();
     }
 }

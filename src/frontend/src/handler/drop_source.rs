@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use pgwire::pg_response::{PgResponse, StatementType};
+use risingwave_common::catalog::ICEBERG_SOURCE_PREFIX;
 use risingwave_sqlparser::ast::ObjectName;
 
 use super::RwPgResponse;
+use super::util::{LongRunningNotificationAction, execute_with_long_running_notification};
 use crate::binder::Binder;
+use crate::catalog::RelationKind;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::error::Result;
 use crate::handler::HandlerArgs;
@@ -28,17 +31,24 @@ pub async fn handle_drop_source(
     cascade: bool,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, source_name) = Binder::resolve_schema_qualified_name(db_name, name)?;
+    let db_name = &session.database();
+    let (schema_name, source_name) = Binder::resolve_schema_qualified_name(db_name, &name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
+
+    // Check if temporary source exists, if yes, drop it.
+    if let Some(_source) = session.get_temporary_source(&source_name) {
+        session.drop_temporary_source(&source_name);
+        return Ok(PgResponse::empty_result(StatementType::DROP_SOURCE));
+    }
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let (source, schema_name) = {
         let catalog_reader = session.env().catalog_reader().read_guard();
 
-        if let Ok((table, _)) = catalog_reader.get_table_by_name(db_name, schema_path, &source_name)
+        if let Ok((table, _)) =
+            catalog_reader.get_created_table_by_name(db_name, schema_path, &source_name)
         {
             return Err(table.bad_drop_error());
         }
@@ -54,16 +64,38 @@ pub async fn handle_drop_source(
                         ))
                         .into())
                 } else {
-                    Err(e.into())
-                }
+                    Err(catalog_reader
+                        .wrong_kind_for_drop(
+                            db_name,
+                            schema_path,
+                            &source_name,
+                            RelationKind::Source,
+                        )
+                        .unwrap_or(e)
+                        .into())
+                };
             }
         }
     };
 
+    if source_name.starts_with(ICEBERG_SOURCE_PREFIX) {
+        return Err(crate::error::ErrorCode::NotSupported(
+            "Dropping Iceberg sources is not supported".to_owned(),
+            "Please use DROP TABLE command.".to_owned(),
+        )
+        .into());
+    }
+
     session.check_privilege_for_drop_alter(schema_name, &*source)?;
 
     let catalog_writer = session.catalog_writer()?;
-    catalog_writer.drop_source(source.id, cascade).await?;
+    execute_with_long_running_notification(
+        catalog_writer.drop_source(source.id, cascade),
+        &session,
+        "DROP SOURCE",
+        LongRunningNotificationAction::SuggestRecover,
+    )
+    .await?;
 
     Ok(PgResponse::empty_result(StatementType::DROP_SOURCE))
 }

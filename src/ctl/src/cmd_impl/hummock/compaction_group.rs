@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@ use std::collections::{HashMap, HashSet};
 
 use comfy_table::{Row, Table};
 use itertools::Itertools;
-use risingwave_hummock_sdk::compaction_group::StateTableId;
 use risingwave_hummock_sdk::{CompactionGroupId, HummockContextId};
 use risingwave_pb::hummock::compact_task::TaskStatus;
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
-use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::CompressionAlgorithm;
+use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::{
+    CompressionAlgorithm, SstableFilterLayout, SstableFilterType,
+};
+use risingwave_pb::id::TableId;
 
 use crate::CtlContext;
 
@@ -47,7 +49,7 @@ pub async fn update_compaction_config(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn build_compaction_config_vec(
     max_bytes_for_level_base: Option<u64>,
     max_bytes_for_level_multiplier: Option<u64>,
@@ -65,6 +67,20 @@ pub fn build_compaction_config_vec(
     enable_emergency_picker: Option<bool>,
     tombstone_reclaim_ratio: Option<u32>,
     compress_algorithm: Option<CompressionAlgorithm>,
+    sstable_filter_type: Option<SstableFilterType>,
+    sstable_filter_layout: Option<SstableFilterLayout>,
+    max_l0_compact_level: Option<u32>,
+    sst_allowed_trivial_move_min_size: Option<u64>,
+    disable_auto_group_scheduling: Option<bool>,
+    max_overlapping_level_size: Option<u64>,
+    sst_allowed_trivial_move_max_count: Option<u32>,
+    emergency_level0_sst_file_count: Option<u32>,
+    emergency_level0_sub_level_partition: Option<u32>,
+    level0_stop_write_threshold_max_sst_count: Option<u32>,
+    level0_stop_write_threshold_max_size: Option<u64>,
+    enable_optimize_l0_interval_selection: Option<bool>,
+    blocked_xor_filter_kv_count_threshold: Option<u64>,
+    max_vnode_key_range_bytes: Option<u64>,
 ) -> Vec<MutableConfig> {
     let mut configs = vec![];
     if let Some(c) = max_bytes_for_level_base {
@@ -115,6 +131,48 @@ pub fn build_compaction_config_vec(
     if let Some(c) = compress_algorithm {
         configs.push(MutableConfig::CompressionAlgorithm(c))
     }
+    if let Some(c) = sstable_filter_type {
+        configs.push(MutableConfig::SstableFilterType(c))
+    }
+    if let Some(c) = sstable_filter_layout {
+        configs.push(MutableConfig::SstableFilterLayout(c))
+    }
+    if let Some(c) = max_l0_compact_level {
+        configs.push(MutableConfig::MaxL0CompactLevelCount(c))
+    }
+    if let Some(c) = sst_allowed_trivial_move_min_size {
+        configs.push(MutableConfig::SstAllowedTrivialMoveMinSize(c))
+    }
+    if let Some(c) = disable_auto_group_scheduling {
+        configs.push(MutableConfig::DisableAutoGroupScheduling(c))
+    }
+    if let Some(c) = max_overlapping_level_size {
+        configs.push(MutableConfig::MaxOverlappingLevelSize(c))
+    }
+    if let Some(c) = sst_allowed_trivial_move_max_count {
+        configs.push(MutableConfig::SstAllowedTrivialMoveMaxCount(c))
+    }
+    if let Some(c) = emergency_level0_sst_file_count {
+        configs.push(MutableConfig::EmergencyLevel0SstFileCount(c))
+    }
+    if let Some(c) = emergency_level0_sub_level_partition {
+        configs.push(MutableConfig::EmergencyLevel0SubLevelPartition(c))
+    }
+    if let Some(c) = level0_stop_write_threshold_max_sst_count {
+        configs.push(MutableConfig::Level0StopWriteThresholdMaxSstCount(c))
+    }
+    if let Some(c) = level0_stop_write_threshold_max_size {
+        configs.push(MutableConfig::Level0StopWriteThresholdMaxSize(c))
+    }
+    if let Some(c) = enable_optimize_l0_interval_selection {
+        configs.push(MutableConfig::EnableOptimizeL0IntervalSelection(c))
+    }
+    if let Some(c) = blocked_xor_filter_kv_count_threshold {
+        configs.push(MutableConfig::MaxKvCountForXor16(c))
+    }
+    if let Some(c) = max_vnode_key_range_bytes {
+        configs.push(MutableConfig::MaxVnodeKeyRangeBytes(c))
+    }
 
     configs
 }
@@ -122,11 +180,12 @@ pub fn build_compaction_config_vec(
 pub async fn split_compaction_group(
     context: &CtlContext,
     group_id: CompactionGroupId,
-    table_ids_to_new_group: &[StateTableId],
+    table_ids_to_new_group: &[TableId],
+    partition_vnode_count: u32,
 ) -> anyhow::Result<()> {
     let meta_client = context.meta_client().await?;
     let new_group_id = meta_client
-        .split_compaction_group(group_id, table_ids_to_new_group)
+        .split_compaction_group(group_id, table_ids_to_new_group, partition_vnode_count)
         .await?;
     println!(
         "Succeed: split compaction group {}. tables {:#?} are moved to new group {}.",
@@ -274,5 +333,17 @@ pub async fn cancel_compact_task(context: &CtlContext, task_id: u64) -> anyhow::
         .await?;
     println!("cancel_compact_task {} ret {:?}", task_id, ret);
 
+    Ok(())
+}
+
+pub async fn merge_compaction_group(
+    context: &CtlContext,
+    left_group_id: CompactionGroupId,
+    right_group_id: CompactionGroupId,
+) -> anyhow::Result<()> {
+    let meta_client = context.meta_client().await?;
+    meta_client
+        .merge_compaction_group(left_group_id, right_group_id)
+        .await?;
     Ok(())
 }

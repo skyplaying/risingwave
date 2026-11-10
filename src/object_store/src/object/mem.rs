@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
@@ -101,7 +100,7 @@ pub struct InMemObjectStore {
 impl ObjectStore for InMemObjectStore {
     type StreamingUploader = InMemStreamingUploader;
 
-    fn get_object_prefix(&self, _obj_id: u64) -> String {
+    fn get_object_prefix(&self, _obj_id: u64, _use_new_object_prefix_strategy: bool) -> String {
         String::default()
     }
 
@@ -123,7 +122,7 @@ impl ObjectStore for InMemObjectStore {
 
     async fn streaming_upload(&self, path: &str) -> ObjectResult<Self::StreamingUploader> {
         Ok(InMemStreamingUploader {
-            path: path.to_string(),
+            path: path.to_owned(),
             buf: BytesMut::new(),
             objects: self.objects.clone(),
         })
@@ -142,7 +141,7 @@ impl ObjectStore for InMemObjectStore {
     async fn streaming_read(
         &self,
         path: &str,
-        read_range: Range<usize>,
+        read_range: impl ObjectRangeBounds,
     ) -> ObjectResult<ObjectDataStream> {
         fail_point!("mem_streaming_read_err", |_| Err(ObjectError::internal(
             "mem streaming read error"
@@ -182,19 +181,30 @@ impl ObjectStore for InMemObjectStore {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter> {
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
         let list_result = self
             .objects
             .lock()
             .await
             .iter()
             .filter_map(|(path, (metadata, _))| {
+                if let Some(ref start_after) = start_after
+                    && metadata.key.le(start_after)
+                {
+                    return None;
+                }
                 if path.starts_with(prefix) {
                     return Some(metadata.clone());
                 }
                 None
             })
             .sorted_by(|a, b| Ord::cmp(&a.key, &b.key))
+            .take(limit.unwrap_or(usize::MAX))
             .collect_vec();
         Ok(Box::pin(InMemObjectIter::new(list_result)))
     }
@@ -234,13 +244,18 @@ static SHARED: LazyLock<spin::Mutex<InMemObjectStore>> =
     LazyLock::new(|| spin::Mutex::new(InMemObjectStore::new()));
 
 impl InMemObjectStore {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             objects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Create a shared reference to the in-memory object store in this process.
+    /// Create a new in-memory object store for testing, isolated with others.
+    pub fn for_test() -> Self {
+        Self::new()
+    }
+
+    /// Get a reference to the in-memory object store shared in this process.
     ///
     /// Note: Should only be used for `risedev playground`, when there're multiple compute-nodes or
     /// compactors in the same process.
@@ -316,7 +331,7 @@ mod tests {
     async fn test_upload() {
         let block = Bytes::from("123456");
 
-        let s3 = InMemObjectStore::new();
+        let s3 = InMemObjectStore::for_test();
         s3.upload("/abc", block).await.unwrap();
 
         // No such object.
@@ -324,7 +339,7 @@ mod tests {
         assert!(err.is_object_not_found_error());
 
         let bytes = s3.read("/abc", 4..6).await.unwrap();
-        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "56".to_string());
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "56".to_owned());
 
         // Overflow.
         s3.read("/abc", 4..8).await.unwrap_err();
@@ -340,7 +355,7 @@ mod tests {
         let blocks = vec![Bytes::from("123"), Bytes::from("456"), Bytes::from("789")];
         let obj = Bytes::from("123456789");
 
-        let store = InMemObjectStore::new();
+        let store = InMemObjectStore::for_test();
         let mut uploader = store.streaming_upload("/abc").await.unwrap();
 
         for block in blocks {
@@ -356,7 +371,7 @@ mod tests {
         let read_obj = store.read("/abc", 4..6).await.unwrap();
         assert_eq!(
             String::from_utf8(read_obj.to_vec()).unwrap(),
-            "56".to_string()
+            "56".to_owned()
         );
     }
 
@@ -364,7 +379,7 @@ mod tests {
     async fn test_metadata() {
         let block = Bytes::from("123456");
 
-        let obj_store = InMemObjectStore::new();
+        let obj_store = InMemObjectStore::for_test();
         obj_store.upload("/abc", block).await.unwrap();
 
         let err = obj_store.metadata("/not_exist").await.unwrap_err();
@@ -376,7 +391,7 @@ mod tests {
 
     async fn list_all(prefix: &str, store: &InMemObjectStore) -> Vec<ObjectMetadata> {
         store
-            .list(prefix)
+            .list(prefix, None, None)
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -387,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn test_list() {
         let payload = Bytes::from("123456");
-        let store = InMemObjectStore::new();
+        let store = InMemObjectStore::for_test();
         assert!(list_all("", &store).await.is_empty());
 
         let paths = vec!["001/002/test.obj", "001/003/test.obj"];
@@ -424,7 +439,7 @@ mod tests {
         let block1 = Bytes::from("123456");
         let block2 = Bytes::from("987654");
 
-        let store = InMemObjectStore::new();
+        let store = InMemObjectStore::for_test();
         store.upload("/abc", block1).await.unwrap();
         store.upload("/klm", block2).await.unwrap();
 

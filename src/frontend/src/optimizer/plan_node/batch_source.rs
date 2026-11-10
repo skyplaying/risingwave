@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,15 @@
 use std::rc::Rc;
 
 use pretty_xmlish::{Pretty, XmlNode};
-use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::SourceNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_sqlparser::ast::AsOf;
 
 use super::batch::prelude::*;
-use super::utils::{childless_record, column_names_pretty, Distill};
+use super::utils::{Distill, childless_record, column_names_pretty};
 use super::{
-    generic, ExprRewritable, PlanBase, PlanRef, ToBatchPb, ToDistributedBatch, ToLocalBatch,
+    BatchPlanRef as PlanRef, ExprRewritable, PlanBase, ToBatchPb, ToDistributedBatch, ToLocalBatch,
+    generic,
 };
 use crate::catalog::source_catalog::SourceCatalog;
 use crate::error::Result;
@@ -30,6 +31,8 @@ use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::property::{Distribution, Order};
 
 /// [`BatchSource`] represents a table/connector source at the very beginning of the graph.
+///
+/// For supported batch connectors, see [`crate::scheduler::plan_fragmenter::SourceScanInfo`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BatchSource {
     pub base: PlanBase<Batch>,
@@ -71,7 +74,7 @@ impl BatchSource {
     }
 }
 
-impl_plan_tree_node_for_leaf! { BatchSource }
+impl_plan_tree_node_for_leaf! { Batch, BatchSource }
 
 impl Distill for BatchSource {
     fn distill<'a>(&self) -> XmlNode<'a> {
@@ -102,6 +105,7 @@ impl ToDistributedBatch for BatchSource {
 impl ToBatchPb for BatchSource {
     fn to_batch_prost_body(&self) -> NodeBody {
         let source_catalog = self.source_catalog().unwrap();
+        let (with_properties, secret_refs) = source_catalog.with_properties.clone().into_parts();
         NodeBody::Source(SourceNode {
             source_id: source_catalog.id,
             info: Some(source_catalog.info.clone()),
@@ -111,12 +115,13 @@ impl ToBatchPb for BatchSource {
                 .iter()
                 .map(|c| c.to_protobuf())
                 .collect(),
-            with_properties: source_catalog.with_properties.clone().into_iter().collect(),
+            with_properties,
             split: vec![],
+            secret_refs,
         })
     }
 }
 
-impl ExprRewritable for BatchSource {}
+impl ExprRewritable<Batch> for BatchSource {}
 
 impl ExprVisitable for BatchSource {}

@@ -10,18 +10,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::ast::*;
 
 /// The most complete variant of a `SELECT` query expression, optionally
 /// including `WITH`, `UNION` / other set operations, and `ORDER BY`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Query {
     /// WITH (common table expressions, or CTEs)
     pub with: Option<With>,
@@ -30,7 +23,7 @@ pub struct Query {
     /// ORDER BY
     pub order_by: Vec<OrderByExpr>,
     /// `LIMIT { <N> | ALL }`
-    pub limit: Option<String>,
+    pub limit: Option<Expr>,
     /// `OFFSET <N> [ { ROW | ROWS } ]`
     ///
     /// `ROW` and `ROWS` are noise words that don't influence the effect of the clause.
@@ -55,6 +48,44 @@ impl Query {
                 offset: None,
                 fetch: None,
             } if order_by.is_empty() => Some(values),
+            _ => None,
+        }
+    }
+
+    /// `SELECT <expr>` without other clauses.
+    pub fn as_single_select_item(&self) -> Option<&Expr> {
+        match &self {
+            Query {
+                with: None,
+                body: SetExpr::Select(select),
+                order_by,
+                limit: None,
+                offset: None,
+                fetch: None,
+            } if order_by.is_empty() => match select.as_ref() {
+                Select {
+                    distinct: Distinct::All,
+                    projection,
+                    from,
+                    lateral_views,
+                    selection: None,
+                    group_by,
+                    having: None,
+                    window,
+                } if projection.len() == 1
+                    && from.is_empty()
+                    && lateral_views.is_empty()
+                    && group_by.is_empty()
+                    && window.is_empty() =>
+                {
+                    match &projection[0] {
+                        SelectItem::UnnamedExpr(expr) => Some(expr),
+                        SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -84,9 +115,8 @@ impl fmt::Display for Query {
 
 /// A node in a tree, representing a "query body" expression, roughly:
 /// `SELECT ... [ {UNION|EXCEPT|INTERSECT} SELECT ...]`
-#[allow(clippy::large_enum_variant)]
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SetExpr {
     /// Restricted SELECT .. FROM .. HAVING (no ORDER BY or set operations)
     Select(Box<Select>),
@@ -97,6 +127,7 @@ pub enum SetExpr {
     SetOperation {
         op: SetOperator,
         all: bool,
+        corresponding: Corresponding,
         left: Box<SetExpr>,
         right: Box<SetExpr>,
     },
@@ -114,16 +145,16 @@ impl fmt::Display for SetExpr {
                 right,
                 op,
                 all,
+                corresponding,
             } => {
                 let all_str = if *all { " ALL" } else { "" };
-                write!(f, "{} {}{} {}", left, op, all_str, right)
+                write!(f, "{} {}{}{} {}", left, op, all_str, corresponding, right)
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SetOperator {
     Union,
     Except,
@@ -140,11 +171,53 @@ impl fmt::Display for SetOperator {
     }
 }
 
+/// `CORRESPONDING [ BY <left paren> <corresponding column list> <right paren> ]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Corresponding {
+    pub corresponding: bool,
+    pub column_list: Option<Vec<Ident>>,
+}
+
+impl Corresponding {
+    pub fn with_column_list(column_list: Option<Vec<Ident>>) -> Self {
+        Self {
+            corresponding: true,
+            column_list,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            corresponding: false,
+            column_list: None,
+        }
+    }
+
+    pub fn is_corresponding(&self) -> bool {
+        self.corresponding
+    }
+
+    pub fn column_list(&self) -> Option<&[Ident]> {
+        self.column_list.as_deref()
+    }
+}
+
+impl fmt::Display for Corresponding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.corresponding {
+            write!(f, " CORRESPONDING")?;
+            if let Some(column_list) = &self.column_list {
+                write!(f, " BY ({})", display_comma_separated(column_list))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A restricted variant of `SELECT` (without CTEs/`ORDER BY`), which may
 /// appear either as the only body item of an `SQLQuery`, or as an operand
 /// to a set operation like `UNION`.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Select {
     pub distinct: Distinct,
     /// projection expressions
@@ -159,11 +232,13 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     /// HAVING
     pub having: Option<Expr>,
+    /// WINDOW
+    pub window: Vec<NamedWindow>,
 }
 
 impl fmt::Display for Select {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SELECT{}", &self.distinct)?;
+        write!(f, "SELECT{}", self.distinct)?;
         write!(f, " {}", display_comma_separated(&self.projection))?;
         if !self.from.is_empty() {
             write!(f, " FROM {}", display_comma_separated(&self.from))?;
@@ -182,13 +257,15 @@ impl fmt::Display for Select {
         if let Some(ref having) = self.having {
             write!(f, " HAVING {}", having)?;
         }
+        if !self.window.is_empty() {
+            write!(f, " WINDOW {}", display_comma_separated(&self.window))?;
+        }
         Ok(())
     }
 }
 
 /// An `ALL`, `DISTINCT` or `DISTINCT ON (expr, ...)` after `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[expect(clippy::enum_variant_names)]
 pub enum Distinct {
     /// An optional parameter that returns all matching rows.
@@ -224,7 +301,6 @@ impl fmt::Display for Distinct {
 
 /// A hive LATERAL VIEW with potential column aliases
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LateralView {
     /// LATERAL VIEW
     pub lateral_view: Expr,
@@ -257,7 +333,6 @@ impl fmt::Display for LateralView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct With {
     pub recursive: bool,
     pub cte_tables: Vec<Cte>,
@@ -275,30 +350,51 @@ impl fmt::Display for With {
 }
 
 /// A single CTE (used after `WITH`): `alias [(col1, col2, ...)] AS ( query )`
+///
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
 /// number of columns in the query matches the number of columns in the query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Cte {
     pub alias: TableAlias,
-    pub query: Query,
-    pub from: Option<Ident>,
+    pub cte_inner: CteInner,
 }
 
 impl fmt::Display for Cte {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} AS ({})", self.alias, self.query)?;
-        if let Some(ref fr) = self.from {
-            write!(f, " FROM {}", fr)?;
+        match &self.cte_inner {
+            CteInner::Query(query) => write!(f, "{} AS ({})", self.alias, query)?,
+            CteInner::ChangeLog {
+                from,
+                key,
+                distributed_by,
+            } => {
+                write!(f, "{} AS changelog from {}", self.alias, from)?;
+
+                if let Some(key) = key {
+                    write!(f, " KEY ({})", display_comma_separated(key))?;
+                }
+                if let Some(columns) = distributed_by {
+                    write!(f, " DISTRIBUTED BY ({})", display_comma_separated(columns))?;
+                }
+            }
         }
         Ok(())
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CteInner {
+    Query(Box<Query>),
+    ChangeLog {
+        from: ObjectName,
+        key: Option<Vec<Ident>>,
+        distributed_by: Option<Vec<Ident>>,
+    },
+}
+
 /// One item of the comma-separated list following `SELECT`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SelectItem {
     /// Any expression, not followed by `[ AS ] alias`
     UnnamedExpr(Expr),
@@ -357,7 +453,6 @@ impl fmt::Display for SelectItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TableWithJoins {
     pub relation: TableFactor,
     pub joins: Vec<Join>,
@@ -375,7 +470,6 @@ impl fmt::Display for TableWithJoins {
 
 /// A table name or a parenthesized subquery with an optional alias
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum TableFactor {
     Table {
         name: ObjectName,
@@ -403,6 +497,217 @@ pub enum TableFactor {
     /// The parser may also accept non-standard nesting of bare tables for some
     /// dialects, but the information about such nesting is stripped from AST.
     NestedJoin(Box<TableWithJoins>),
+    /// `<table> MATCH_RECOGNIZE (...)`: SQL:2016 row pattern recognition applied
+    /// to an input table factor.
+    MatchRecognize {
+        /// The input the pattern is matched over.
+        table: Box<TableFactor>,
+        /// `PARTITION BY <expr>, ...` — empty when omitted.
+        partition_by: Vec<Expr>,
+        /// `ORDER BY <expr> [ASC|DESC], ...` — empty when omitted.
+        order_by: Vec<OrderByExpr>,
+        /// `MEASURES <expr> AS <alias>, ...` — empty when omitted.
+        measures: Vec<Measure>,
+        /// `ONE ROW PER MATCH` | `ALL ROWS PER MATCH` — `None` when omitted.
+        rows_per_match: Option<RowsPerMatch>,
+        /// `AFTER MATCH SKIP ...` — `None` when omitted.
+        after_match_skip: Option<AfterMatchSkip>,
+        /// `PATTERN ( <pattern> )` — required.
+        pattern: MatchRecognizePattern,
+        /// `WITHIN <interval>` — bounds a match's time span; `None` when omitted.
+        within: Option<Expr>,
+        /// `SUBSET <name> = (<vars>), ...` — empty when omitted.
+        subsets: Vec<SubsetDefinition>,
+        /// `DEFINE <symbol> AS <condition>, ...` — required.
+        symbols: Vec<SymbolDefinition>,
+        /// Optional alias for the row-pattern output.
+        alias: Option<TableAlias>,
+    },
+}
+
+/// A single `MEASURES` item: `<expr> AS <alias>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Measure {
+    pub expr: Expr,
+    pub alias: Ident,
+}
+
+impl fmt::Display for Measure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} AS {}", self.expr, self.alias)
+    }
+}
+
+/// The output mode of a `MATCH_RECOGNIZE` clause.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowsPerMatch {
+    /// `ONE ROW PER MATCH`
+    OneRow,
+    /// `ALL ROWS PER MATCH`
+    AllRows,
+}
+
+impl fmt::Display for RowsPerMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RowsPerMatch::OneRow => write!(f, "ONE ROW PER MATCH"),
+            RowsPerMatch::AllRows => write!(f, "ALL ROWS PER MATCH"),
+        }
+    }
+}
+
+/// The `AFTER MATCH SKIP` strategy of a `MATCH_RECOGNIZE` clause.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AfterMatchSkip {
+    /// `AFTER MATCH SKIP PAST LAST ROW`
+    PastLastRow,
+    /// `AFTER MATCH SKIP TO NEXT ROW`
+    ToNextRow,
+    /// `AFTER MATCH SKIP TO FIRST <symbol>`
+    ToFirst(Ident),
+    /// `AFTER MATCH SKIP TO LAST <symbol>`
+    ToLast(Ident),
+}
+
+impl fmt::Display for AfterMatchSkip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AFTER MATCH SKIP ")?;
+        match self {
+            AfterMatchSkip::PastLastRow => write!(f, "PAST LAST ROW"),
+            AfterMatchSkip::ToNextRow => write!(f, "TO NEXT ROW"),
+            AfterMatchSkip::ToFirst(symbol) => write!(f, "TO FIRST {}", symbol),
+            AfterMatchSkip::ToLast(symbol) => write!(f, "TO LAST {}", symbol),
+        }
+    }
+}
+
+/// A single `DEFINE` item: `<symbol> AS <condition>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolDefinition {
+    pub symbol: Ident,
+    pub definition: Expr,
+}
+
+impl fmt::Display for SymbolDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} AS {}", self.symbol, self.definition)
+    }
+}
+
+/// A single `SUBSET` item: `<name> = (<pattern variable>, ...)` — a union variable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubsetDefinition {
+    pub name: Ident,
+    pub members: Vec<Ident>,
+}
+
+impl fmt::Display for SubsetDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} = ({})",
+            self.name,
+            display_comma_separated(&self.members)
+        )
+    }
+}
+
+/// A row-pattern variable, or one of the row-pattern anchors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MatchRecognizeSymbol {
+    /// A named pattern variable, defined (or referenced) in `DEFINE`.
+    Named(Ident),
+    /// The start anchor `^`.
+    Start,
+    /// The end anchor `$`.
+    End,
+}
+
+impl fmt::Display for MatchRecognizeSymbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatchRecognizeSymbol::Named(symbol) => write!(f, "{}", symbol),
+            MatchRecognizeSymbol::Start => write!(f, "^"),
+            MatchRecognizeSymbol::End => write!(f, "$"),
+        }
+    }
+}
+
+/// A row-pattern expression inside `PATTERN ( ... )`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MatchRecognizePattern {
+    /// A single symbol, e.g. `A`, `^`, `$`.
+    Symbol(MatchRecognizeSymbol),
+    /// An exclusion `{- <pattern> -}`.
+    Exclude(MatchRecognizeSymbol),
+    /// `PERMUTE(<symbol>, ...)`.
+    Permute(Vec<MatchRecognizeSymbol>),
+    /// Concatenation, e.g. `A B C`.
+    Concat(Vec<MatchRecognizePattern>),
+    /// A parenthesized sub-pattern `( <pattern> )`.
+    Group(Box<MatchRecognizePattern>),
+    /// Alternation, e.g. `A | B | C`.
+    Alternation(Vec<MatchRecognizePattern>),
+    /// A quantified sub-pattern, e.g. `A*`, `A+`, `A?`, `A{1,3}`. The bool is `reluctant` (a trailing
+    /// `?`, e.g. `A*?`, which prefers the fewest matches).
+    Repetition(Box<MatchRecognizePattern>, RepetitionQuantifier, bool),
+}
+
+impl fmt::Display for MatchRecognizePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use MatchRecognizePattern::*;
+        match self {
+            Symbol(symbol) => write!(f, "{}", symbol),
+            Exclude(symbol) => write!(f, "{{- {} -}}", symbol),
+            Permute(symbols) => write!(f, "PERMUTE({})", display_comma_separated(symbols)),
+            Concat(patterns) => write!(f, "{}", display_separated(patterns, " ")),
+            Group(pattern) => write!(f, "({})", pattern),
+            Alternation(patterns) => write!(f, "{}", display_separated(patterns, " | ")),
+            Repetition(pattern, quantifier, reluctant) => {
+                write!(
+                    f,
+                    "{}{}{}",
+                    pattern,
+                    quantifier,
+                    if *reluctant { "?" } else { "" }
+                )
+            }
+        }
+    }
+}
+
+/// A quantifier applied to a row-pattern, e.g. `*`, `+`, `?`, `{n,m}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RepetitionQuantifier {
+    /// `*`
+    ZeroOrMore,
+    /// `+`
+    OneOrMore,
+    /// `?`
+    AtMostOne,
+    /// `{n}`
+    Exactly(u32),
+    /// `{n,}`
+    AtLeast(u32),
+    /// `{,m}`
+    AtMost(u32),
+    /// `{n,m}`
+    Range(u32, u32),
+}
+
+impl fmt::Display for RepetitionQuantifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use RepetitionQuantifier::*;
+        match self {
+            ZeroOrMore => write!(f, "*"),
+            OneOrMore => write!(f, "+"),
+            AtMostOne => write!(f, "?"),
+            Exactly(n) => write!(f, "{{{}}}", n),
+            AtLeast(n) => write!(f, "{{{},}}", n),
+            AtMost(m) => write!(f, "{{,{}}}", m),
+            Range(n, m) => write!(f, "{{{},{}}}", n, m),
+        }
+    }
 }
 
 impl fmt::Display for TableFactor {
@@ -410,9 +715,8 @@ impl fmt::Display for TableFactor {
         match self {
             TableFactor::Table { name, alias, as_of } => {
                 write!(f, "{}", name)?;
-                match as_of {
-                    Some(as_of) => write!(f, "{}", as_of)?,
-                    None => (),
+                if let Some(as_of) = as_of {
+                    write!(f, "{}", as_of)?
                 }
                 if let Some(alias) = alias {
                     write!(f, " AS {}", alias)?;
@@ -449,12 +753,53 @@ impl fmt::Display for TableFactor {
                 Ok(())
             }
             TableFactor::NestedJoin(table_reference) => write!(f, "({})", table_reference),
+            TableFactor::MatchRecognize {
+                table,
+                partition_by,
+                order_by,
+                measures,
+                rows_per_match,
+                after_match_skip,
+                pattern,
+                within,
+                subsets,
+                symbols,
+                alias,
+            } => {
+                write!(f, "{} MATCH_RECOGNIZE (", table)?;
+                if !partition_by.is_empty() {
+                    write!(f, "PARTITION BY {} ", display_comma_separated(partition_by))?;
+                }
+                if !order_by.is_empty() {
+                    write!(f, "ORDER BY {} ", display_comma_separated(order_by))?;
+                }
+                if !measures.is_empty() {
+                    write!(f, "MEASURES {} ", display_comma_separated(measures))?;
+                }
+                if let Some(rows_per_match) = rows_per_match {
+                    write!(f, "{} ", rows_per_match)?;
+                }
+                if let Some(after_match_skip) = after_match_skip {
+                    write!(f, "{} ", after_match_skip)?;
+                }
+                write!(f, "PATTERN ({}) ", pattern)?;
+                if let Some(within) = within {
+                    write!(f, "WITHIN {} ", within)?;
+                }
+                if !subsets.is_empty() {
+                    write!(f, "SUBSET {} ", display_comma_separated(subsets))?;
+                }
+                write!(f, "DEFINE {})", display_comma_separated(symbols))?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {}", alias)?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TableAlias {
     pub name: Ident,
     pub columns: Vec<Ident>,
@@ -471,7 +816,6 @@ impl fmt::Display for TableAlias {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Join {
     pub relation: TableFactor,
     pub join_operator: JoinOperator,
@@ -487,7 +831,7 @@ impl fmt::Display for Join {
         }
         fn suffix(constraint: &'_ JoinConstraint) -> impl fmt::Display + '_ {
             struct Suffix<'a>(&'a JoinConstraint);
-            impl<'a> fmt::Display for Suffix<'a> {
+            impl fmt::Display for Suffix<'_> {
                 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     match self.0 {
                         JoinConstraint::On(expr) => write!(f, " ON {}", expr),
@@ -500,18 +844,31 @@ impl fmt::Display for Join {
             }
             Suffix(constraint)
         }
+        let broadcast = if matches!(
+            self.relation,
+            TableFactor::Table {
+                as_of: Some(AsOf::ProcessTimeBroadcast),
+                ..
+            }
+        ) {
+            "BROADCAST "
+        } else {
+            ""
+        };
         match &self.join_operator {
             JoinOperator::Inner(constraint) => write!(
                 f,
-                " {}JOIN {}{}",
+                " {}{}JOIN {}{}",
                 prefix(constraint),
+                broadcast,
                 self.relation,
                 suffix(constraint)
             ),
             JoinOperator::LeftOuter(constraint) => write!(
                 f,
-                " {}LEFT JOIN {}{}",
+                " {}{}LEFT JOIN {}{}",
                 prefix(constraint),
+                broadcast,
                 self.relation,
                 suffix(constraint)
             ),
@@ -530,22 +887,36 @@ impl fmt::Display for Join {
                 suffix(constraint)
             ),
             JoinOperator::CrossJoin => write!(f, " CROSS JOIN {}", self.relation),
+            JoinOperator::AsOfInner(constraint) => write!(
+                f,
+                " {}ASOF JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
+            JoinOperator::AsOfLeft(constraint) => write!(
+                f,
+                " {}ASOF LEFT JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum JoinOperator {
     Inner(JoinConstraint),
     LeftOuter(JoinConstraint),
     RightOuter(JoinConstraint),
     FullOuter(JoinConstraint),
     CrossJoin,
+    AsOfInner(JoinConstraint),
+    AsOfLeft(JoinConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum JoinConstraint {
     On(Expr),
     Using(Vec<Ident>),
@@ -555,7 +926,6 @@ pub enum JoinConstraint {
 
 /// An `ORDER BY` expression
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct OrderByExpr {
     pub expr: Expr,
     /// Optional `ASC` or `DESC`
@@ -582,7 +952,6 @@ impl fmt::Display for OrderByExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Fetch {
     pub with_ties: bool,
     pub quantity: Option<String>,
@@ -600,7 +969,6 @@ impl fmt::Display for Fetch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Top {
     /// SQL semantic equivalent of LIMIT but with same structure as FETCH.
     pub with_ties: bool,
@@ -621,7 +989,6 @@ impl fmt::Display for Top {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Values(pub Vec<Vec<Expr>>);
 
 impl fmt::Display for Values {
@@ -634,5 +1001,18 @@ impl fmt::Display for Values {
             write!(f, "({})", display_comma_separated(row))?;
         }
         Ok(())
+    }
+}
+
+/// A named window definition in the WINDOW clause
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamedWindow {
+    pub name: Ident,
+    pub window_spec: WindowSpec,
+}
+
+impl fmt::Display for NamedWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} AS ({})", self.name, self.window_spec)
     }
 }

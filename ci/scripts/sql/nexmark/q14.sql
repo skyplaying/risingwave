@@ -1,15 +1,7 @@
 -- noinspection SqlNoDataSourceInspectionForFile
 -- noinspection SqlResolveForFile
-
-CREATE FUNCTION count_char(s varchar, c varchar) RETURNS int LANGUAGE javascript AS $$
-    var count = 0;
-    for (var cc of s) {
-        if (cc === c) {
-            count++;
-        }
-    }
-    return count;
-$$;
+CREATE FUNCTION count_char(s varchar, c varchar) RETURNS int LANGUAGE SQL AS
+  $$SELECT LENGTH(s) - LENGTH(REPLACE(s, c, ''))$$;
 
 CREATE SINK nexmark_q14 AS
 SELECT auction,
@@ -27,8 +19,9 @@ SELECT auction,
            ELSE 'otherTime'
            END       AS bidTimeType,
        date_time,
+       -- extra
        count_char(extra, 'c') AS c_counts
 FROM bid
 WHERE 0.908 * price > 1000000
   AND 0.908 * price < 50000000
-WITH ( connector = 'blackhole', type = 'append-only');
+WITH ( connector = 'blackhole', type = 'append-only', force_append_only = 'true');

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{GlobalReplay, ReplayWorkerScheduler, WorkerScheduler};
+use crate::Operation;
 use crate::error::Result;
 use crate::read::TraceReader;
-use crate::Operation;
 
 pub struct HummockReplay<R: TraceReader, G: GlobalReplay> {
     reader: R,
@@ -57,7 +57,7 @@ impl<R: TraceReader, G: GlobalReplay + 'static> HummockReplay<R, G> {
                 _ => {
                     worker_scheduler.schedule(r);
                     total_ops += 1;
-                    if total_ops % 10000 == 0 {
+                    if total_ops.is_multiple_of(10000) {
                         println!("replayed {} ops", total_ops);
                     }
                 }
@@ -90,9 +90,7 @@ mod tests {
     async fn test_replay() {
         let mut mock_reader = MockTraceReader::new();
         let get_result = TracedBytes::from(vec![54, 32, 198, 236, 24]);
-        let seal_checkpoint = true;
         let sync_id = 4561245432;
-        let seal_id = 5734875243;
 
         let opts1 = TracedNewLocalOptions::for_test(1);
         let opts2 = TracedNewLocalOptions::for_test(2);
@@ -197,9 +195,8 @@ mod tests {
         .map(|(record_id, op)| Ok(Record::new(storage_type3, record_id, op)));
 
         let mut non_local: Vec<Result<Record>> = vec![
-            (12, Operation::Seal(seal_id, seal_checkpoint)),
             (12, Operation::Finish),
-            (13, Operation::Sync(sync_id)),
+            (13, Operation::Sync(vec![(sync_id, vec![1, 2, 3])])),
             (
                 13,
                 Operation::Result(OperationResult::Sync(TraceResult::Ok(0))),
@@ -247,15 +244,9 @@ mod tests {
 
         mock_replay
             .expect_sync()
-            .with(predicate::eq(sync_id))
+            .with(predicate::eq(vec![(sync_id, vec![1, 2, 3])]))
             .times(1)
             .returning(|_| Ok(0));
-
-        mock_replay
-            .expect_seal_epoch()
-            .with(predicate::eq(seal_id), predicate::eq(seal_checkpoint))
-            .times(1)
-            .return_const(());
 
         let mut replay = HummockReplay::new(mock_reader, mock_replay);
 

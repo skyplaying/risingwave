@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@ use std::sync::LazyLock;
 
 use prometheus::core::{AtomicU64, GenericCounter, GenericCounterVec};
 use prometheus::{
-    exponential_buckets, histogram_opts, register_histogram_vec_with_registry,
-    register_histogram_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, register_int_gauge_with_registry, Histogram, HistogramVec,
-    IntGauge, Registry,
+    Histogram, HistogramVec, IntGauge, Registry, exponential_buckets, histogram_opts,
+    register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_counter_vec_with_registry, register_int_counter_with_registry,
+    register_int_gauge_with_registry,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
 
@@ -50,6 +50,9 @@ pub struct CompactorMetrics {
     pub sstable_distinct_epoch_count: Histogram,
     pub compaction_event_consumed_latency: Histogram,
     pub compaction_event_loop_iteration_latency: Histogram,
+    pub sstable_block_size: Histogram,
+    pub iceberg_compaction_memory_budget_bytes: IntGauge,
+    pub iceberg_compaction_running_memory_reservation_bytes: IntGauge,
 }
 
 pub static GLOBAL_COMPACTOR_METRICS: LazyLock<CompactorMetrics> =
@@ -57,8 +60,8 @@ pub static GLOBAL_COMPACTOR_METRICS: LazyLock<CompactorMetrics> =
 
 impl CompactorMetrics {
     fn new(registry: &Registry) -> Self {
-        // 256B - 4GB
-        let size_buckets = exponential_buckets(256.0, 16.0, 7).unwrap();
+        // 256B - 4GB, finer resolution near 256MB (adds two extra buckets)
+        let size_buckets = exponential_buckets(256.0, 8.0, 9).unwrap();
         // 10ms - 2.7h
         let time_buckets = exponential_buckets(0.01, 10.0, 7).unwrap();
         let opts = histogram_opts!(
@@ -169,7 +172,7 @@ impl CompactorMetrics {
 
         let opts = histogram_opts!(
             "compactor_sstable_bloom_filter_size",
-            "Total bytes gotten from sstable_bloom_filter, for observing bloom_filter size",
+            "Total bytes gotten from the SST filter payload, for observing filter size",
             exponential_buckets(16.0, 16.0, 7).unwrap() // max 256MB
         );
 
@@ -194,7 +197,7 @@ impl CompactorMetrics {
         let opts = histogram_opts!(
             "compactor_sstable_avg_value_size",
             "Total bytes gotten from sstable_avg_value_size, for observing sstable_avg_value_size",
-            size_buckets
+            size_buckets.clone()
         );
 
         let sstable_avg_value_size = register_histogram_with_registry!(opts, registry).unwrap();
@@ -251,6 +254,27 @@ impl CompactorMetrics {
         let compaction_event_loop_iteration_latency =
             register_histogram_with_registry!(opts, registry).unwrap();
 
+        let opts = histogram_opts!(
+            "compactor_sstable_block_size",
+            "Total bytes gotten from sstable_block_size, for observing sstable_block_size",
+            size_buckets,
+        );
+
+        let sstable_block_size = register_histogram_with_registry!(opts, registry).unwrap();
+
+        let iceberg_compaction_memory_budget_bytes = register_int_gauge_with_registry!(
+            "storage_iceberg_compaction_memory_budget_bytes",
+            "Heap admission budget for running Iceberg compaction plans on this compactor node",
+            registry
+        )
+        .unwrap();
+        let iceberg_compaction_running_memory_reservation_bytes =
+            register_int_gauge_with_registry!(
+                "storage_iceberg_compaction_running_memory_reservation_bytes",
+                "Estimated heap peak reservations of currently running Iceberg compaction plans",
+                registry
+            )
+            .unwrap();
         Self {
             compaction_upload_sst_counts,
             compact_fast_runner_bytes,
@@ -277,6 +301,9 @@ impl CompactorMetrics {
             sstable_distinct_epoch_count,
             compaction_event_consumed_latency,
             compaction_event_loop_iteration_latency,
+            sstable_block_size,
+            iceberg_compaction_memory_budget_bytes,
+            iceberg_compaction_running_memory_reservation_bytes,
         }
     }
 

@@ -5,6 +5,8 @@ set -euo pipefail
 export RW_PREFIX=$PWD/.risingwave
 export PREFIX_BIN=$RW_PREFIX/bin
 export PREFIX_LOG=$RW_PREFIX/log
+export PREFIX_DATA=$RW_PREFIX/data
+export RW_SQLITE_DB=$PREFIX_DATA/metadata.db
 
 # NOTE(kwannoel): Compared to start_standalone below, we omitted the compactor-opts,
 # so it should not start.
@@ -16,10 +18,11 @@ start_standalone_without_compactor() {
         --advertise-addr 127.0.0.1:5690 \
         --dashboard-host 127.0.0.1:5691 \
         --prometheus-host 127.0.0.1:1250 \
-        --backend etcd \
-        --etcd-endpoints 127.0.0.1:2388 \
+        --backend sqlite \
+        --sql-endpoint ${RW_SQLITE_DB} \
         --state-store hummock+minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
-        --data-directory hummock_001" \
+        --data-directory hummock_001 \
+        --config-path src/config/ci-single-node-standalone.toml" \
      --compute-opts=" \
         --listen-addr 127.0.0.1:5688 \
         --prometheus-listener-addr 127.0.0.1:1222 \
@@ -28,18 +31,19 @@ start_standalone_without_compactor() {
         --parallelism 4 \
         --total-memory-bytes 8589934592 \
         --role both \
-        --meta-address http://127.0.0.1:5690" \
+        --meta-address http://127.0.0.1:5690 \
+        --config-path src/config/ci-single-node-standalone.toml" \
      --frontend-opts=" \
        --listen-addr 127.0.0.1:4566 \
        --advertise-addr 127.0.0.1:4566 \
        --prometheus-listener-addr 127.0.0.1:2222 \
-       --health-check-listener-addr 127.0.0.1:6786 \
-       --meta-addr http://127.0.0.1:5690" >"$1" 2>&1
+       --health-check-listener-addr 0.0.0.0:6786 \
+       --meta-addr http://127.0.0.1:5690 \
+       --config-path src/config/ci-single-node-standalone.toml" >"$1" 2>&1
 }
 
 # You can fill up this section by consulting
 # .risingwave/log/risedev.log, after calling `risedev d full`.
-# It is expected that minio, etcd will be started after this is called.
 start_standalone() {
   RUST_BACKTRACE=1 \
   "$PREFIX_BIN"/risingwave/standalone \
@@ -48,10 +52,11 @@ start_standalone() {
         --advertise-addr 127.0.0.1:5690 \
         --dashboard-host 127.0.0.1:5691 \
         --prometheus-host 127.0.0.1:1250 \
-        --backend etcd \
-        --etcd-endpoints 127.0.0.1:2388 \
+        --backend sqlite \
+        --sql-endpoint ${RW_SQLITE_DB} \
         --state-store hummock+minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
-        --data-directory hummock_001" \
+        --data-directory hummock_001 \
+        --config-path src/config/ci-single-node-standalone.toml" \
      --compute-opts=" \
         --listen-addr 127.0.0.1:5688 \
         --prometheus-listener-addr 127.0.0.1:1222 \
@@ -60,22 +65,25 @@ start_standalone() {
         --parallelism 4 \
         --total-memory-bytes 8589934592 \
         --role both \
-        --meta-address http://127.0.0.1:5690" \
+        --meta-address http://127.0.0.1:5690 \
+        --config-path src/config/ci-single-node-standalone.toml" \
      --frontend-opts=" \
        --listen-addr 127.0.0.1:4566 \
        --advertise-addr 127.0.0.1:4566 \
        --prometheus-listener-addr 127.0.0.1:2222 \
-       --health-check-listener-addr 127.0.0.1:6786 \
-       --meta-addr http://127.0.0.1:5690" \
+       --health-check-listener-addr 0.0.0.0:6786 \
+       --meta-addr http://127.0.0.1:5690 \
+       --config-path src/config/ci-single-node-standalone.toml" \
      --compactor-opts=" \
          --listen-addr 127.0.0.1:6660 \
          --prometheus-listener-addr 127.0.0.1:1260 \
          --advertise-addr 127.0.0.1:6660 \
-         --meta-address http://127.0.0.1:5690" >"$1" 2>&1
+         --meta-address http://127.0.0.1:5690 \
+         --config-path src/config/ci-single-node-standalone.toml" >"$1" 2>&1
 }
 
 stop_standalone() {
-  pkill standalone
+  killall --wait standalone
 }
 
 wait_standalone() {
@@ -97,11 +105,13 @@ wait_standalone() {
   else
     echo "Standalone is ready"
   fi
+
+  echo "Waiting additional 5s for stability"
+  sleep 5
 }
 
 restart_standalone() {
   stop_standalone
-  sleep 5
   start_standalone "$PREFIX_LOG"/standalone-restarted.log &
   wait_standalone
 }

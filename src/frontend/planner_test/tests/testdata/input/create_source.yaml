@@ -13,7 +13,24 @@
     create source s with(connector='kafka') FORMAT PLAIN ENCODE JSON;
   expected_outputs:
   - planner_error
-- id: csv_delimiter_tab
+- id: parquet_case_insensitive_invalid_value
+  sql: |
+    create source s (
+      id int,
+      age int
+    ) with (
+      connector = 's3',
+      match_pattern = 'data.parquet',
+      s3.region_name = 'custom',
+      s3.bucket_name = 'hummock001',
+      s3.credentials.access = 'hummockadmin',
+      s3.credentials.secret = 'hummockadmin',
+      s3.endpoint_url = 'http://127.0.0.1:9301',
+      parquet.case_insensitive = 'maybe'
+    ) FORMAT PLAIN ENCODE PARQUET;
+  expected_outputs:
+  - planner_error
+- id: csv_delimiter_comma
   sql: |
     explain create table s0 (v1 int, v2 varchar) with (
       connector = 'kafka',
@@ -23,6 +40,16 @@
     ) FORMAT PLAIN ENCODE CSV (delimiter = ',', without_header = true);
   expected_outputs:
   - explain_output
+- id: csv_delimiter_semicolon
+  sql: |
+    explain create table s0 (v1 int, v2 varchar) with (
+      connector = 'kafka',
+      topic = 'kafka_1_csv_topic',
+      properties.bootstrap.server = 'message_queue:29092',
+      scan.startup.mode = 'earliest'
+    ) FORMAT PLAIN ENCODE CSV (delimiter = ';', without_header = true);
+  expected_outputs:
+    - explain_output
 - id: csv_delimiter_tab
   sql: |
     explain create table s0 (v1 int, v2 varchar) with (
@@ -33,39 +60,40 @@
     ) FORMAT PLAIN ENCODE CSV (delimiter = E'\t', without_header = true);
   expected_outputs:
   - explain_output
-- id: create_source_with_cdc_backfill
+- id: s3_streaming_keeps_file_list_dedup
   sql: |
-    create source mysql_mydb with (
-      connector = 'mysql-cdc',
-      hostname = '127.0.0.1',
-      port = '8306',
-      username = 'root',
-      password = '123456',
-      database.name = 'mydb',
-      server.id = 5888
-    );
-    explain (logical) create table t1_rw (
-      v1 int,
-      v2 int,
-      primary key(v1)
-    ) from mysql_mydb table 'mydb.t1';
+    explain create table s3_streaming_t (id int primary key, name varchar) with (
+      connector = 's3',
+      match_pattern = 'planner/*.csv',
+      s3.region_name = 'custom',
+      s3.bucket_name = 'hummock001',
+      s3.credentials.access = 'hummockadmin',
+      s3.credentials.secret = 'hummockadmin',
+      s3.endpoint_url = 'http://127.0.0.1:9301'
+    ) FORMAT PLAIN ENCODE CSV (without_header = 'true', delimiter = ',');
   expected_outputs:
-    - explain_output
-- id: create_source_with_cdc_backfill
+  - explain_output
+- id: s3_full_reload_skips_file_list_dedup
   sql: |
-    create source mysql_mydb with (
-      connector = 'mysql-cdc',
-      hostname = '127.0.0.1',
-      port = '8306',
-      username = 'root',
-      password = '123456',
-      database.name = 'mydb',
-      server.id = 5888
-    );
-    explain create table t1_rw (
-      v1 int,
-      v2 int,
-      primary key(v1)
-    ) from mysql_mydb table 'mydb.t1';
+    explain create table s3_full_reload_t (id int primary key, name varchar) with (
+      connector = 's3',
+      match_pattern = 'planner/*.csv',
+      s3.region_name = 'custom',
+      s3.bucket_name = 'hummock001',
+      s3.credentials.access = 'hummockadmin',
+      s3.credentials.secret = 'hummockadmin',
+      s3.endpoint_url = 'http://127.0.0.1:9301',
+      refresh_mode = 'FULL_RELOAD'
+    ) FORMAT PLAIN ENCODE CSV (without_header = 'true', delimiter = ',');
+  expected_outputs:
+  - explain_output
+- id: gcs_full_reload_skips_file_list_dedup
+  sql: |
+    explain create table gcs_full_reload_t (id int primary key, name varchar) with (
+      connector = 'gcs',
+      match_pattern = 'planner/*.csv',
+      gcs.bucket_name = 'planner-bucket',
+      refresh_mode = 'FULL_RELOAD'
+    ) FORMAT PLAIN ENCODE CSV (without_header = 'true', delimiter = ',');
   expected_outputs:
   - explain_output

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, HashSet};
+
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pretty_xmlish::XmlNode;
 
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    gen_filter_and_pushdown, generic, BatchProject, ColPrunable, ExprRewritable, Logical, PlanBase,
-    PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamProject, ToBatch, ToStream,
+    BatchPlanRef, BatchProject, ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef,
+    LogicalPlanRef, PlanBase, PlanTreeNodeUnary, PredicatePushdown, StreamMaterializedExprs,
+    StreamPlanRef, StreamProject, ToBatch, ToStream, gen_filter_and_pushdown, generic,
 };
 use crate::error::Result;
-use crate::expr::{collect_input_refs, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
+use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef, collect_input_refs};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::GenericPlanRef;
+use crate::optimizer::plan_node::stream::StreamPlanNodeMetadata;
 use crate::optimizer::plan_node::{
     ColumnPruningContext, PredicatePushdownContext, RewriteStreamContext, ToStreamContext,
 };
-use crate::optimizer::property::{Distribution, Order, RequiredDist};
+use crate::optimizer::property::{Distribution, Order, RequiredDist, StreamKind};
+use crate::session::current;
 use crate::utils::{ColIndexMapping, ColIndexMappingRewriteExt, Condition, Substitute};
 
 /// `LogicalProject` computes a set of expressions from its input relation.
@@ -43,6 +48,7 @@ impl LogicalProject {
         Self::new(input, exprs).into()
     }
 
+    // TODO(kwannoel): We only need create/new don't keep both.
     pub fn new(input: PlanRef, exprs: Vec<ExprImpl>) -> Self {
         let core = generic::Project::new(exprs, input);
         Self::with_core(core)
@@ -102,12 +108,12 @@ impl LogicalProject {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalProject {
-    fn input(&self) -> PlanRef {
+impl PlanTreeNodeUnary<Logical> for LogicalProject {
+    fn input(&self) -> LogicalPlanRef {
         self.core.input.clone()
     }
 
-    fn clone_with_input(&self, input: PlanRef) -> Self {
+    fn clone_with_input(&self, input: LogicalPlanRef) -> Self {
         Self::new(input, self.exprs().clone())
     }
 
@@ -129,7 +135,7 @@ impl PlanTreeNodeUnary for LogicalProject {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalProject}
+impl_plan_tree_node_for_unary! { Logical, LogicalProject}
 
 impl Distill for LogicalProject {
     fn distill<'a>(&self) -> XmlNode<'a> {
@@ -165,7 +171,7 @@ impl ColPrunable for LogicalProject {
     }
 }
 
-impl ExprRewritable for LogicalProject {
+impl ExprRewritable<Logical> for LogicalProject {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -214,18 +220,17 @@ impl PredicatePushdown for LogicalProject {
 }
 
 impl ToBatch for LogicalProject {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<BatchPlanRef> {
         self.to_batch_with_order_required(&Order::any())
     }
 
-    fn to_batch_with_order_required(&self, required_order: &Order) -> Result<PlanRef> {
+    fn to_batch_with_order_required(&self, required_order: &Order) -> Result<BatchPlanRef> {
         let input_order = self
             .o2i_col_mapping()
             .rewrite_provided_order(required_order);
         let new_input = self.input().to_batch_with_order_required(&input_order)?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        let batch_project = BatchProject::new(new_logical);
+        let project = self.core.clone_with_input(new_input);
+        let batch_project = BatchProject::new(project);
         required_order.enforce_if_not_satisfies(batch_project.into())
     }
 }
@@ -235,7 +240,7 @@ impl ToStream for LogicalProject {
         &self,
         required_dist: &RequiredDist,
         ctx: &mut ToStreamContext,
-    ) -> Result<PlanRef> {
+    ) -> Result<StreamPlanRef> {
         let input_required = if required_dist.satisfies(&RequiredDist::AnyShard) {
             RequiredDist::Any
         } else {
@@ -253,13 +258,112 @@ impl ToStream for LogicalProject {
         let new_input = self
             .input()
             .to_stream_with_dist_required(&input_required, ctx)?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        let stream_plan = StreamProject::new(new_logical);
-        required_dist.enforce_if_not_satisfies(stream_plan.into(), &Order::any())
+
+        let unsafe_allow_unmaterialized_impure_expr = current::config()
+            .map(|c| c.read().streaming_unsafe_allow_unmaterialized_impure_expr())
+            .unwrap_or_else(|| {
+                self.base
+                    .ctx()
+                    .session_ctx()
+                    .config()
+                    .streaming_unsafe_allow_unmaterialized_impure_expr()
+            });
+        let should_materialize_expr = match new_input.stream_kind() {
+            StreamKind::AppendOnly => None,
+            StreamKind::Upsert => {
+                // A project propagates its input stream key only through direct `InputRef`s.
+                // `logical_rewrite_for_stream` appends any missing key columns as hidden direct
+                // references, so a computed impure expression cannot itself be a stream-key
+                // column. Therefore, we can safely leave impure expressions in `StreamProject`
+                // on upsert streams.
+                None
+            }
+            StreamKind::Retract if unsafe_allow_unmaterialized_impure_expr => {
+                // This deliberately leaves impure expressions in `StreamProject` on retract
+                // streams. The behavior is unsafe and only enabled by the explicit session option.
+                None
+            }
+            StreamKind::Retract => {
+                // Extract expressions that need materialization to `MaterializedExprs` operator
+                let mut materialized_field_names = BTreeMap::new();
+                let mut materialized_expr_indices = HashSet::new();
+                let materialized_exprs: Vec<_> = self
+                    .exprs()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, expr)| {
+                        if expr.needs_materialization() {
+                            materialized_expr_indices.insert(idx);
+                            if let Some(name) = self.core.field_names.get(&idx) {
+                                materialized_field_names.insert(idx, name.clone());
+                            }
+                            Some(expr.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if materialized_exprs.is_empty() {
+                    None
+                } else {
+                    Some((
+                        materialized_field_names,
+                        materialized_expr_indices,
+                        materialized_exprs,
+                    ))
+                }
+            }
+        };
+
+        let stream_plan = if let Some((
+            materialized_field_names,
+            materialized_expr_indices,
+            materialized_exprs,
+        )) = should_materialize_expr
+        {
+            {
+                let new_input = new_input.enforce_concrete_distribution();
+
+                // Create `MaterializedExprs` for the extracted expressions
+                let mat_exprs_plan: StreamPlanRef = StreamMaterializedExprs::new(
+                    new_input.clone(),
+                    materialized_exprs,
+                    materialized_field_names,
+                )?
+                .into();
+
+                let input_len = new_input.schema().len();
+                let mut materialized_pos = 0;
+
+                // Create final expressions list with materialized expressions replaced by `InputRef`s
+                let final_exprs = self
+                    .exprs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| {
+                        if materialized_expr_indices.contains(&idx) {
+                            let output_idx = input_len + materialized_pos;
+                            materialized_pos += 1;
+                            InputRef::new(output_idx, expr.return_type()).into()
+                        } else {
+                            expr.clone()
+                        }
+                    })
+                    .collect();
+
+                let core = generic::Project::new(final_exprs, mat_exprs_plan);
+                StreamProject::new(core).into()
+            }
+        } else {
+            // No expressions to materialize or the feature is not enabled, create a regular `StreamProject`
+            let core = generic::Project::new(self.exprs().clone(), new_input);
+            StreamProject::new(core).into()
+        };
+
+        required_dist.streaming_enforce_if_not_satisfies(stream_plan)
     }
 
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         self.to_stream_with_dist_required(&RequiredDist::Any, ctx)
     }
 
@@ -270,7 +374,7 @@ impl ToStream for LogicalProject {
         let (input, input_col_change) = self.input().logical_rewrite_for_stream(ctx)?;
         let (proj, out_col_change) = self.rewrite_with_input(input.clone(), input_col_change);
 
-        // Add missing columns of input_pk into the select list.
+        // Add missing columns of `input_pk` into the select list.
         let input_pk = input.expect_stream_key();
         let i2o = proj.i2o_col_mapping();
         let col_need_to_add = input_pk
@@ -294,7 +398,39 @@ impl ToStream for LogicalProject {
         let out_col_change = ColIndexMapping::new(map, proj.base.schema().len());
         Ok((proj.into(), out_col_change))
     }
+
+    fn try_better_locality(&self, columns: &[usize]) -> Option<PlanRef> {
+        if columns.is_empty() {
+            return None;
+        }
+
+        let input_columns = columns
+            .iter()
+            .map(|&col| {
+                // First try the original o2i mapping for direct InputRef
+                if let Some(input_col) = self.o2i_col_mapping().try_map(col) {
+                    return Some(input_col);
+                }
+
+                // If not a direct InputRef, check if it's a pure function with single InputRef
+                let expr = &self.exprs()[col];
+                if expr.is_pure() {
+                    let input_refs = expr.collect_input_refs(self.input().schema().len());
+                    // Check if expression references exactly one input column
+                    if input_refs.count_ones(..) == 1 {
+                        return input_refs.ones().next();
+                    }
+                }
+
+                None
+            })
+            .collect::<Option<Vec<usize>>>()?;
+
+        let new_input = self.input().try_better_locality(&input_columns)?;
+        Some(self.clone_with_input(new_input).into())
+    }
 }
+
 #[cfg(test)]
 mod tests {
 
@@ -303,7 +439,7 @@ mod tests {
     use risingwave_pb::expr::expr_node::Type;
 
     use super::*;
-    use crate::expr::{assert_eq_input_ref, FunctionCall, Literal};
+    use crate::expr::{FunctionCall, Literal, assert_eq_input_ref};
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::LogicalValues;
 
@@ -320,7 +456,7 @@ mod tests {
     /// ```
     async fn test_prune_project() {
         let ty = DataType::Int32;
-        let ctx = OptimizerContext::mock().await;
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = vec![
             Field::with_name(ty.clone(), "v1"),
             Field::with_name(ty.clone(), "v2"),

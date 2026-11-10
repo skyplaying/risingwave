@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_async_stream::try_stream;
@@ -49,7 +50,6 @@ pub struct DatagenMeta {
 }
 
 impl DatagenEventGenerator {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fields_vec: Vec<FieldDesc>,
         field_names: Vec<String>,
@@ -277,8 +277,11 @@ mod tests {
                 encoding_config: EncodingProperties::Json(crate::parser::JsonProperties {
                     use_schema_registry: false,
                     timestamptz_handling: None,
+                    timestamp_handling: None,
+                    time_handling: None,
+                    bigint_unsigned_handling: None,
+                    handle_toast_columns: false,
                 }),
-                key_encoding_config: None,
             },
             data_types,
             rows_per_second,

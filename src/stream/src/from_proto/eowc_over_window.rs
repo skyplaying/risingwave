@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,14 @@ use risingwave_pb::stream_plan::PbEowcOverWindowNode;
 use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
-use crate::common::table::state_table::StateTable;
+use crate::common::table::state_table::{StateTableBuilder, StateTableOpConsistencyLevel};
 use crate::error::StreamResult;
 use crate::executor::{EowcOverWindowExecutor, EowcOverWindowExecutorArgs, Executor};
 use crate::task::ExecutorParams;
 
 pub struct EowcOverWindowExecutorBuilder;
+
+impl_stream_node_body!(EowcOverWindow(PbEowcOverWindowNode) => EowcOverWindowExecutorBuilder);
 
 impl ExecutorBuilder for EowcOverWindowExecutorBuilder {
     type Node = PbEowcOverWindowNode;
@@ -46,14 +48,42 @@ impl ExecutorBuilder for EowcOverWindowExecutorBuilder {
             .map(|i| *i as usize)
             .collect();
         let order_key_index = node.get_order_by()[0].get_column_index() as usize;
-        let vnodes = Some(Arc::new(
-            params
-                .vnode_bitmap
-                .expect("vnodes not set for EOWC over window"),
-        ));
+        let vnodes = Some(Arc::new(params.vnode_bitmap));
         let state_table =
-            StateTable::from_table_catalog_inconsistent_op(node.get_state_table()?, store, vnodes)
+            StateTableBuilder::new(node.get_state_table()?, store.clone(), vnodes.clone())
+                .with_op_consistency_level(StateTableOpConsistencyLevel::Inconsistent)
+                .enable_preload_all_rows_by_config(&params.config)
+                .build()
                 .await;
+
+        // Build optional intermediate state table for persisting window function states
+        let intermediate_state_table =
+            if let Some(table_pb) = node.intermediate_state_table.as_ref() {
+                Some(
+                    StateTableBuilder::new(table_pb, store.clone(), vnodes.clone())
+                        // Use ConsistentOldValue because we update existing rows
+                        .with_op_consistency_level(StateTableOpConsistencyLevel::ConsistentOldValue)
+                        .enable_preload_all_rows_by_config(&params.config)
+                        .build()
+                        .await,
+                )
+            } else {
+                None
+            };
+
+        let watermark_trigger_table = if let Some(table_pb) = node.watermark_trigger_table.as_ref()
+        {
+            Some(
+                StateTableBuilder::new(table_pb, store, vnodes)
+                    .with_op_consistency_level(StateTableOpConsistencyLevel::ConsistentOldValue)
+                    .enable_preload_all_rows_by_config(&params.config)
+                    .build()
+                    .await,
+            )
+        } else {
+            None
+        };
+
         let exec = EowcOverWindowExecutor::new(EowcOverWindowExecutorArgs {
             actor_ctx: params.actor_context,
 
@@ -65,6 +95,10 @@ impl ExecutorBuilder for EowcOverWindowExecutorBuilder {
             order_key_index,
             state_table,
             watermark_epoch: params.watermark_epoch,
+            intermediate_state_table,
+            watermark_trigger_table,
+            version: node.version(),
+            chunk_size: params.config.developer.chunk_size,
         });
         Ok((params.info, exec).into())
     }

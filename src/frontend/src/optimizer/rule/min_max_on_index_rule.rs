@@ -1,21 +1,16 @@
-//  Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//  http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//
-// Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under both the GPLv2 (found in the
-// COPYING file in the root directory) and Apache 2.0 License
-// (found in the LICENSE.Apache file in the root directory).
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeMap;
 use std::vec;
@@ -23,21 +18,20 @@ use std::vec;
 use itertools::Itertools;
 use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_expr::aggregate::AggKind;
+use risingwave_expr::aggregate::{AggType, PbAggKind};
 
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
 use crate::optimizer::plan_node::generic::{Agg, GenericPlanRef};
 use crate::optimizer::plan_node::{
     LogicalAgg, LogicalFilter, LogicalScan, LogicalTopN, PlanAggCall, PlanTreeNodeUnary,
 };
 use crate::optimizer::property::Order;
-use crate::optimizer::PlanRef;
 use crate::utils::{Condition, IndexSet};
 
 pub struct MinMaxOnIndexRule {}
 
-impl Rule for MinMaxOnIndexRule {
+impl Rule<Logical> for MinMaxOnIndexRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let logical_agg: &LogicalAgg = plan.as_logical_agg()?;
         if !logical_agg.group_key().is_empty() {
@@ -47,22 +41,24 @@ impl Rule for MinMaxOnIndexRule {
         if calls.is_empty() {
             return None;
         }
-        let first_call = calls.iter().exactly_one().ok()?;
+        let first_call = Itertools::exactly_one(calls.iter()).ok()?;
 
-        if matches!(first_call.agg_kind, AggKind::Min | AggKind::Max)
-            && !first_call.distinct
+        if matches!(
+            first_call.agg_type,
+            AggType::Builtin(PbAggKind::Min | PbAggKind::Max)
+        ) && !first_call.distinct
             && first_call.filter.always_true()
             && first_call.order_by.is_empty()
         {
             let logical_scan: LogicalScan = logical_agg.input().as_logical_scan()?.to_owned();
-            let kind = calls.first()?.agg_kind;
+            let kind = &calls.first()?.agg_type;
             if !logical_scan.predicate().always_true() {
                 return None;
             }
             let order = Order {
                 column_orders: vec![ColumnOrder::new(
                     calls.first()?.inputs.first()?.index(),
-                    if kind == AggKind::Min {
+                    if matches!(kind, AggType::Builtin(PbAggKind::Min)) {
                         OrderType::ascending()
                     } else {
                         OrderType::descending()
@@ -112,7 +108,7 @@ impl MinMaxOnIndexRule {
 
                 let formatting_agg = Agg::new(
                     vec![PlanAggCall {
-                        agg_kind: logical_agg.agg_calls().first()?.agg_kind,
+                        agg_type: logical_agg.agg_calls().first()?.agg_type.clone(),
                         return_type: logical_agg.schema().fields[0].data_type.clone(),
                         inputs: vec![InputRef::new(
                             0,
@@ -124,7 +120,6 @@ impl MinMaxOnIndexRule {
                             conjunctions: vec![],
                         },
                         direct_args: vec![],
-                        user_defined: None,
                     }],
                     IndexSet::empty(),
                     topn.into(),
@@ -183,7 +178,7 @@ impl MinMaxOnIndexRule {
 
             let formatting_agg = Agg::new(
                 vec![PlanAggCall {
-                    agg_kind: logical_agg.agg_calls().first()?.agg_kind,
+                    agg_type: logical_agg.agg_calls().first()?.agg_type.clone(),
                     return_type: logical_agg.schema().fields[0].data_type.clone(),
                     inputs: vec![InputRef::new(
                         0,
@@ -195,7 +190,6 @@ impl MinMaxOnIndexRule {
                         conjunctions: vec![],
                     },
                     direct_args: vec![],
-                    user_defined: None,
                 }],
                 IndexSet::empty(),
                 topn.into(),

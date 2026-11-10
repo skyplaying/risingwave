@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #![feature(coroutines)]
-#![feature(stmt_expr_attributes)]
 #![feature(proc_macro_hygiene)]
 #![feature(register_tool)]
 #![register_tool(rw)]
@@ -28,25 +27,25 @@ use std::path::Path;
 use std::sync::Arc;
 
 use clap::Parser;
-use foyer::HybridCacheBuilder;
-use replay_impl::{get_replay_notification_client, GlobalReplayImpl};
+use foyer::{CacheBuilder, HybridCacheBuilder};
+use replay_impl::{GlobalReplayImpl, get_replay_notification_client};
 use risingwave_common::config::{
-    extract_storage_memory_config, load_config, NoOverride, ObjectStoreConfig, StorageConfig,
+    NoOverride, ObjectStoreConfig, Role, extract_storage_memory_config, load_config,
 };
 use risingwave_common::system_param::reader::SystemParamsReader;
 use risingwave_hummock_trace::{
     GlobalReplay, HummockReplay, Operation, Record, Result, TraceReader, TraceReaderImpl, USE_TRACE,
 };
-use risingwave_meta::hummock::test_utils::setup_compute_env;
 use risingwave_meta::hummock::MockHummockMetaClient;
+use risingwave_meta::hummock::test_utils::setup_compute_env;
 use risingwave_object_store::object::build_remote_object_store;
-use risingwave_storage::filter_key_extractor::{
-    FakeRemoteTableAccessor, RpcFilterKeyExtractorManager,
+use risingwave_storage::compaction_catalog_manager::{
+    CompactionCatalogManager, FakeRemoteTableAccessor,
 };
+use risingwave_storage::hummock::none::NoneRecentFilter;
 use risingwave_storage::hummock::{HummockStorage, SstableStore, SstableStoreConfig};
 use risingwave_storage::monitor::{CompactorMetrics, HummockStateStoreMetrics, ObjectStoreMetrics};
 use risingwave_storage::opts::StorageOpts;
-use serde::{Deserialize, Serialize};
 
 // use a large offset to avoid collision with real sstables
 const SST_OFFSET: u64 = 2147383647000;
@@ -62,14 +61,17 @@ struct Args {
 
     #[arg(short, long)]
     object_storage: String,
+
+    #[arg(short, long)]
+    use_new_object_prefix_strategy: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = Args::parse();
     // disable runtime tracing when replaying
-    std::env::set_var(USE_TRACE, "false");
-    run_replay(args).await.unwrap();
+    unsafe { std::env::set_var(USE_TRACE, "false") };
+    Box::pin(run_replay(args)).await.unwrap();
 }
 
 async fn run_replay(args: Args) -> Result<()> {
@@ -78,14 +80,14 @@ async fn run_replay(args: Args) -> Result<()> {
     let mut reader = TraceReaderImpl::new_bincode(f)?;
     // first record is the snapshot
     let r: Record = reader.read().unwrap();
-    let replay_interface = create_replay_hummock(r, &args).await.unwrap();
+    let replay_interface = Box::pin(create_replay_hummock(r, &args)).await.unwrap();
     let mut replayer = HummockReplay::new(reader, replay_interface);
     replayer.run().await.unwrap();
 
     Ok(())
 }
 
-async fn create_replay_hummock(r: Record, args: &Args) -> Result<impl GlobalReplay> {
+async fn create_replay_hummock(r: Record, args: &Args) -> Result<impl GlobalReplay + use<>> {
     let config = load_config(&args.config, NoOverride);
     let storage_memory_config = extract_storage_memory_config(&config);
     let system_params_reader =
@@ -110,14 +112,14 @@ async fn create_replay_hummock(r: Record, args: &Args) -> Result<impl GlobalRepl
     )
     .await;
 
-    let meta_cache_v2 = HybridCacheBuilder::new()
+    let meta_cache = HybridCacheBuilder::new()
         .memory(storage_opts.meta_cache_capacity_mb * (1 << 20))
         .with_shards(storage_opts.meta_cache_shard_num)
         .storage()
         .build()
         .await
         .unwrap();
-    let block_cache_v2 = HybridCacheBuilder::new()
+    let block_cache = HybridCacheBuilder::new()
         .memory(storage_opts.block_cache_capacity_mb * (1 << 20))
         .with_shards(storage_opts.block_cache_shard_num)
         .storage()
@@ -127,31 +129,39 @@ async fn create_replay_hummock(r: Record, args: &Args) -> Result<impl GlobalRepl
 
     let sstable_store = Arc::new(SstableStore::new(SstableStoreConfig {
         store: Arc::new(object_store),
-        path: storage_opts.data_directory.to_string(),
+        path: storage_opts.data_directory.clone(),
         prefetch_buffer_capacity: storage_opts.prefetch_buffer_capacity_mb * (1 << 20),
         max_prefetch_block_number: storage_opts.max_prefetch_block_number,
-        recent_filter: None,
+        recent_filter: Arc::new(NoneRecentFilter::default().into()),
         state_store_metrics: state_store_metrics.clone(),
-        meta_cache_v2,
-        block_cache_v2,
+        use_new_object_prefix_strategy: args.use_new_object_prefix_strategy,
+        skip_bloom_filter_in_serde: storage_opts.sst_skip_bloom_filter_in_serde,
+        meta_cache,
+        block_cache,
+        vector_meta_cache: CacheBuilder::new(1 << 10).build(),
+        vector_block_cache: CacheBuilder::new(1 << 10).build(),
     }));
 
     let (hummock_meta_client, notification_client, notifier) = {
-        let (env, hummock_manager_ref, _cluster_manager_ref, worker_node) =
+        let (env, hummock_manager_ref, cluster_controller_ref, worker_id) =
             setup_compute_env(8080).await;
         let notifier = env.notification_manager_ref();
 
+        let worker_node = cluster_controller_ref
+            .get_worker_by_id(worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
         let notification_client = match r.operation {
-            Operation::MetaMessage(resp) => {
-                get_replay_notification_client(env, worker_node.clone(), resp)
-            }
+            Operation::MetaMessage(resp) => get_replay_notification_client(env, worker_node, resp),
             _ => panic!("unexpected operation, found {:?}", r.operation),
         };
 
         (
             Arc::new(MockHummockMetaClient::with_sst_offset(
                 hummock_manager_ref,
-                worker_node.id,
+                worker_id as _,
                 SST_OFFSET,
             )),
             notification_client,
@@ -159,28 +169,22 @@ async fn create_replay_hummock(r: Record, args: &Args) -> Result<impl GlobalRepl
         )
     };
 
-    let key_filter_manager = Arc::new(RpcFilterKeyExtractorManager::new(Box::new(
-        FakeRemoteTableAccessor {},
-    )));
-
     let storage = HummockStorage::new(
+        Role::None,
         storage_opts,
         sstable_store,
         hummock_meta_client.clone(),
         notification_client,
-        key_filter_manager,
+        Arc::new(CompactionCatalogManager::new(Box::new(
+            FakeRemoteTableAccessor {},
+        ))),
         state_store_metrics,
         compactor_metrics,
         None,
     )
     .await
-    .expect("fail to create a HummockStorage object");
+    .expect("failed to create a HummockStorage object");
     let replay_interface = GlobalReplayImpl::new(storage, notifier);
 
     Ok(replay_interface)
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct ReplayConfig {
-    storage: StorageConfig,
 }

@@ -2,17 +2,15 @@
 
 Welcome to an overview of the developer documentations of RisingWave!
 
-## Design Docs
+## Developer Docs
 
-The [design docs](https://github.com/risingwavelabs/risingwave/blob/main/docs/README.md) covers some high-level ideas of how we built RisingWave.
+To learn how to develop RisingWave, and access high-level design docs, see the [RisingWave Developer Guide](https://risingwavelabs.github.io/risingwave/).
 
 ## Crate Docs
 
 Here are the rustdocs of the core crates in RisingWave. You can read them to understand the implementation details of RisingWave.
 
 <!-- Not all crates are listed here. For example, binary crates and test crates are not included. -->
-
-There's also a [Dash](https://kapeli.com/dash) docset feed containing all crate docs including dependencies, which might be handy for developing RisingWave: [subscribe here](dash-feed://https%3A%2F%2Frisingwavelabs.github.io%2Frisingwave%2FRisingWave.xml)
 
 ### Core Components
 
@@ -49,6 +47,5 @@ Common functionalities shared inside RisingWave.
 
 The crates under `src/utils` are several independent util crates which helps to simplify development. We plan to publish them to [crates.io](https://crates.io/) in future when they are more mature.
 
-- [local_stats_alloc](local_stats_alloc/index.html)
 - [memcomparable](memcomparable/index.html)
 - [pgwire](pgwire/index.html)

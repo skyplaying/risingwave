@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 
 #![cfg_attr(not(madsim), allow(unused_imports))]
 
+use std::cmp::max;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use cfg_or_panic::cfg_or_panic;
 use clap::Parser;
 use futures::channel::{mpsc, oneshot};
@@ -30,14 +31,18 @@ use futures::{SinkExt, StreamExt};
 use itertools::Itertools;
 #[cfg(madsim)]
 use madsim::runtime::{Handle, NodeHandle};
+use rand::RngExt as _;
 use rand::seq::IteratorRandom;
-use rand::Rng;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
+use risingwave_common::util::worker_util::DEFAULT_RESOURCE_GROUP;
 #[cfg(madsim)]
 use risingwave_object_store::object::sim::SimServer as ObjectStoreSimServer;
 use risingwave_pb::common::WorkerNode;
 use sqllogictest::AsyncDB;
+use tempfile::NamedTempFile;
 #[cfg(not(madsim))]
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::client::RisingWave;
 
@@ -79,19 +84,23 @@ pub struct Configuration {
     /// The number of compactor nodes.
     pub compactor_nodes: usize,
 
+    /// The number of dedicated Iceberg compactor nodes.
+    pub iceberg_compactor_nodes: usize,
+
     /// The number of CPU cores for each compute node.
     ///
     /// This determines `worker_node_parallelism`.
     pub compute_node_cores: usize,
 
-    /// The probability of etcd request timeout.
-    pub etcd_timeout_rate: f32,
-
-    /// Path to etcd data file.
-    pub etcd_data_path: Option<PathBuf>,
-
     /// Queries to run per session.
     pub per_session_queries: Arc<Vec<String>>,
+
+    /// Resource groups for compute nodes.
+    pub compute_resource_groups: HashMap<usize, String>,
+
+    /// Roles for compute nodes (1-indexed). If not set, defaults to "both".
+    /// Values: "serving", "streaming", "both".
+    pub compute_node_roles: HashMap<usize, String>,
 }
 
 impl Default for Configuration {
@@ -105,7 +114,7 @@ impl Default for Configuration {
 telemetry_enabled = false
 metrics_level = "Disabled"
 "#
-            .to_string();
+            .to_owned();
             file.write_all(config_data.as_bytes())
                 .expect("failed to write config file");
             file.into_temp_path()
@@ -117,10 +126,11 @@ metrics_level = "Disabled"
             compute_nodes: 1,
             meta_nodes: 1,
             compactor_nodes: 1,
+            iceberg_compactor_nodes: 0,
             compute_node_cores: 1,
-            etcd_timeout_rate: 0.0,
-            etcd_data_path: None,
             per_session_queries: vec![].into(),
+            compute_resource_groups: Default::default(),
+            compute_node_roles: Default::default(),
         }
     }
 }
@@ -142,9 +152,10 @@ impl Configuration {
             config_path: ConfigPath::Temp(config_path.into()),
             frontend_nodes: 2,
             compute_nodes: 3,
-            meta_nodes: 3,
+            meta_nodes: 1,
             compactor_nodes: 2,
             compute_node_cores: 2,
+            per_session_queries: vec![].into(),
             ..Default::default()
         }
     }
@@ -152,27 +163,19 @@ impl Configuration {
     /// Provides a configuration for scale test which ensures that the arrangement backfill is disabled,
     /// so table scan will use `no_shuffle`.
     pub fn for_scale_no_shuffle() -> Self {
-        // Embed the config file and create a temporary file at runtime. The file will be deleted
-        // automatically when it's dropped.
-        let config_path = {
-            let mut file =
-                tempfile::NamedTempFile::new().expect("failed to create temp config file");
-            file.write_all(include_bytes!("risingwave-scale.toml"))
-                .expect("failed to write config file");
-            file.into_temp_path()
-        };
+        let mut conf = Self::for_scale();
+        conf.per_session_queries = vec![
+            "SET STREAMING_USE_ARRANGEMENT_BACKFILL = false;".into(),
+            "SET STREAMING_USE_SNAPSHOT_BACKFILL = false;".into(),
+        ]
+        .into();
+        conf
+    }
 
-        Configuration {
-            config_path: ConfigPath::Temp(config_path.into()),
-            frontend_nodes: 2,
-            compute_nodes: 3,
-            meta_nodes: 3,
-            compactor_nodes: 2,
-            compute_node_cores: 2,
-            per_session_queries: vec!["SET STREAMING_USE_ARRANGEMENT_BACKFILL = false;".into()]
-                .into(),
-            ..Default::default()
-        }
+    pub fn for_scale_shared_source() -> Self {
+        let mut conf = Self::for_scale();
+        conf.per_session_queries = vec!["SET STREAMING_USE_SHARED_SOURCE = true;".into()].into();
+        conf
     }
 
     pub fn for_auto_parallelism(
@@ -190,7 +193,7 @@ impl Configuration {
 max_heartbeat_interval_secs = {max_heartbeat_interval_secs}
 disable_automatic_parallelism_control = {disable_automatic_parallelism_control}
 parallelism_control_trigger_first_delay_sec = 0
-parallelism_control_batch_size = 0
+parallelism_control_batch_size = 10
 parallelism_control_trigger_period_sec = 10
 
 [system]
@@ -220,6 +223,39 @@ metrics_level = "Disabled"
             ]
                 .into(),
             ..Default::default()
+        }
+    }
+
+    pub fn for_default_parallelism(default_parallelism: usize) -> Self {
+        let config_path = {
+            let mut file =
+                tempfile::NamedTempFile::new().expect("failed to create temp config file");
+
+            let config_data = format!(
+                r#"
+[server]
+telemetry_enabled = false
+metrics_level = "Disabled"
+[meta]
+default_parallelism = {default_parallelism}
+"#
+            );
+            file.write_all(config_data.as_bytes())
+                .expect("failed to write config file");
+            file.into_temp_path()
+        };
+
+        Configuration {
+            config_path: ConfigPath::Temp(config_path.into()),
+            frontend_nodes: 1,
+            compute_nodes: 1,
+            meta_nodes: 1,
+            compactor_nodes: 1,
+            iceberg_compactor_nodes: 0,
+            compute_node_cores: default_parallelism * 2,
+            per_session_queries: vec![].into(),
+            compute_resource_groups: Default::default(),
+            compute_node_roles: Default::default(),
         }
     }
 
@@ -264,8 +300,11 @@ metrics_level = "Disabled"
             meta_nodes: 1,
             compactor_nodes: 1,
             compute_node_cores: 1,
-            per_session_queries: vec!["SET STREAMING_USE_ARRANGEMENT_BACKFILL = true;".into()]
-                .into(),
+            per_session_queries: vec![
+                "SET STREAMING_USE_ARRANGEMENT_BACKFILL = true;".into(),
+                "SET STREAMING_USE_SNAPSHOT_BACKFILL = false;".into(),
+            ]
+            .into(),
             ..Default::default()
         }
     }
@@ -290,7 +329,7 @@ metrics_level = "Disabled"
             // in a different process.
             frontend_nodes: 1,
             compute_nodes: 3,
-            meta_nodes: 3,
+            meta_nodes: 1,
             compactor_nodes: 2,
             compute_node_cores: 2,
             ..Default::default()
@@ -316,6 +355,11 @@ metrics_level = "Disabled"
             ..Default::default()
         }
     }
+
+    /// Returns the total number of cores for streaming compute nodes.
+    pub fn total_streaming_cores(&self) -> u32 {
+        (self.compute_nodes * self.compute_node_cores) as u32
+    }
 }
 
 /// A risingwave cluster.
@@ -328,7 +372,7 @@ metrics_level = "Disabled"
 /// | frontend-x       | 192.168.2.x   |
 /// | compute-x        | 192.168.3.x   |
 /// | compactor-x      | 192.168.4.x   |
-/// | etcd             | 192.168.10.1  |
+/// | iceberg-compactor-x | 192.168.5.x |
 /// | kafka-broker     | 192.168.11.1  |
 /// | kafka-producer   | 192.168.11.2  |
 /// | object_store_sim | 192.168.12.1  |
@@ -341,9 +385,17 @@ pub struct Cluster {
     pub(crate) client: NodeHandle,
     #[cfg(madsim)]
     pub(crate) ctl: NodeHandle,
+    #[cfg(madsim)]
+    pub(crate) sqlite_file_handle: NamedTempFile,
 }
 
 impl Cluster {
+    /// Filesystem path of the `SQLite` metastore backing this simulated cluster.
+    #[cfg_or_panic(madsim)]
+    pub fn meta_sqlite_path(&self) -> &Path {
+        self.sqlite_file_handle.path()
+    }
+
     /// Start a RisingWave cluster for testing.
     ///
     /// This function should be called exactly once in a test.
@@ -355,9 +407,11 @@ impl Cluster {
         println!("seed = {}", handle.seed());
         println!("{:#?}", conf);
 
+        // TODO: support mutil meta nodes
+        assert_eq!(conf.meta_nodes, 1);
+
         // setup DNS and load balance
         let net = madsim::net::NetSim::current();
-        net.add_dns_record("etcd", "192.168.10.1".parse().unwrap());
         for i in 1..=conf.meta_nodes {
             net.add_dns_record(
                 &format!("meta-{i}"),
@@ -377,26 +431,6 @@ impl Cluster {
                 &format!("192.168.2.{i}:4566"),
             )
         }
-
-        // etcd node
-        let etcd_data = conf
-            .etcd_data_path
-            .as_ref()
-            .map(|path| std::fs::read_to_string(path).unwrap());
-        handle
-            .create_node()
-            .name("etcd")
-            .ip("192.168.10.1".parse().unwrap())
-            .init(move || {
-                let addr = "0.0.0.0:2388".parse().unwrap();
-                let mut builder =
-                    etcd_client::SimServer::builder().timeout_rate(conf.etcd_timeout_rate);
-                if let Some(data) = &etcd_data {
-                    builder = builder.load(data.clone());
-                }
-                builder.serve(addr)
-            })
-            .build();
 
         // kafka broker
         handle
@@ -429,11 +463,17 @@ impl Cluster {
         for i in 1..=conf.meta_nodes {
             meta_addrs.push(format!("http://meta-{i}:5690"));
         }
-        std::env::set_var("RW_META_ADDR", meta_addrs.join(","));
+        unsafe { std::env::set_var("RW_META_ADDR", meta_addrs.join(",")) };
+
+        let sqlite_file_handle: NamedTempFile = NamedTempFile::new().unwrap();
+        let file_path = sqlite_file_handle.path().display().to_string();
+        tracing::info!(?file_path, "sqlite_file_path");
+        let sql_endpoint = format!("sqlite://{}?mode=rwc", file_path);
+        let backend_args = vec!["--backend", "sql", "--sql-endpoint", &sql_endpoint];
 
         // meta node
         for i in 1..=conf.meta_nodes {
-            let opts = risingwave_meta_node::MetaNodeOpts::parse_from([
+            let args = [
                 "meta-node",
                 "--config-path",
                 conf.config_path.as_str(),
@@ -441,20 +481,25 @@ impl Cluster {
                 "0.0.0.0:5690",
                 "--advertise-addr",
                 &format!("meta-{i}:5690"),
-                "--backend",
-                "etcd",
-                "--etcd-endpoints",
-                "etcd:2388",
                 "--state-store",
                 "hummock+sim://hummockadmin:hummockadmin@192.168.12.1:9301/hummock001",
                 "--data-directory",
                 "hummock_001",
-            ]);
+                "--temp-secret-file-dir",
+                &format!("./secrets/meta-{i}"),
+            ];
+            let args = args.into_iter().chain(backend_args.clone().into_iter());
+            let opts = risingwave_meta_node::MetaNodeOpts::parse_from(args);
             handle
                 .create_node()
                 .name(format!("meta-{i}"))
                 .ip([192, 168, 1, i as u8].into())
-                .init(move || risingwave_meta_node::start(opts.clone()))
+                .init(move || {
+                    risingwave_meta_node::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -469,14 +514,23 @@ impl Cluster {
                 conf.config_path.as_str(),
                 "--listen-addr",
                 "0.0.0.0:4566",
+                "--health-check-listener-addr",
+                "0.0.0.0:6786",
                 "--advertise-addr",
                 &format!("192.168.2.{i}:4566"),
+                "--temp-secret-file-dir",
+                &format!("./secrets/frontend-{i}"),
             ]);
             handle
                 .create_node()
                 .name(format!("frontend-{i}"))
                 .ip([192, 168, 2, i as u8].into())
-                .init(move || risingwave_frontend::start(opts.clone()))
+                .init(move || {
+                    risingwave_frontend::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -494,13 +548,32 @@ impl Cluster {
                 "6979321856",
                 "--parallelism",
                 &conf.compute_node_cores.to_string(),
+                "--temp-secret-file-dir",
+                &format!("./secrets/compute-{i}"),
+                "--resource-group",
+                &conf
+                    .compute_resource_groups
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or(DEFAULT_RESOURCE_GROUP.to_string()),
+                "--role",
+                &conf
+                    .compute_node_roles
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or("both".to_string()),
             ]);
             handle
                 .create_node()
                 .name(format!("compute-{i}"))
                 .ip([192, 168, 3, i as u8].into())
                 .cores(conf.compute_node_cores)
-                .init(move || risingwave_compute::start(opts.clone()))
+                .init(move || {
+                    risingwave_compute::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -519,7 +592,34 @@ impl Cluster {
                 .create_node()
                 .name(format!("compactor-{i}"))
                 .ip([192, 168, 4, i as u8].into())
-                .init(move || risingwave_compactor::start(opts.clone()))
+                .init(move || {
+                    risingwave_compactor::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
+                .build();
+        }
+
+        // Iceberg compaction uses a different worker loop and registration
+        // stream from Hummock compaction, so it needs a dedicated node mode.
+        for i in 1..=conf.iceberg_compactor_nodes {
+            let opts = risingwave_compactor::CompactorOpts::parse_from([
+                "compactor-node",
+                "--config-path",
+                conf.config_path.as_str(),
+                "--listen-addr",
+                "0.0.0.0:6660",
+                "--advertise-addr",
+                &format!("192.168.5.{i}:6660"),
+                "--compactor-mode",
+                "dedicated-iceberg",
+            ]);
+            handle
+                .create_node()
+                .name(format!("iceberg-compactor-{i}"))
+                .ip([192, 168, 5, i as u8].into())
+                .init(move || risingwave_compactor::start(opts.clone(), CancellationToken::new()))
                 .build();
         }
 
@@ -545,6 +645,7 @@ impl Cluster {
             handle,
             client,
             ctl,
+            sqlite_file_handle,
         })
     }
 
@@ -618,10 +719,7 @@ impl Cluster {
         if worker_nodes.len() < n {
             return Err(anyhow!("cannot remove more nodes than present"));
         }
-        let rand_nodes = worker_nodes
-            .iter()
-            .choose_multiple(&mut rand::thread_rng(), n)
-            .to_vec();
+        let rand_nodes = worker_nodes.iter().sample(&mut rand::rng(), n).clone();
         Ok(rand_nodes.iter().cloned().cloned().collect_vec())
     }
 
@@ -666,12 +764,12 @@ impl Cluster {
     pub async fn kill_node(&self, opts: &KillOpts) {
         let mut nodes = vec![];
         if opts.kill_meta {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.meta_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("meta-{}", i));
@@ -682,46 +780,49 @@ impl Cluster {
             }
         }
         if opts.kill_frontend {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.frontend_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("frontend-{}", i));
             }
         }
         if opts.kill_compute {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.compute_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("compute-{}", i));
             }
         }
         if opts.kill_compactor {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.compactor_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("compactor-{}", i));
+            }
+            for i in 1..=self.config.iceberg_compactor_nodes {
+                nodes.push(format!("iceberg-compactor-{}", i));
             }
         }
 
         self.kill_nodes(nodes, opts.restart_delay_secs).await
     }
 
-    /// Kill the given nodes by their names and restart them in 2s + restart_delay_secs with a
+    /// Kill the given nodes by their names and restart them in 2s + `restart_delay_secs` with a
     /// probability of 0.1.
     #[cfg_or_panic(madsim)]
     pub async fn kill_nodes(
@@ -731,16 +832,15 @@ impl Cluster {
     ) {
         join_all(nodes.into_iter().map(|name| async move {
             let name = name.as_ref();
-            let t = rand::thread_rng().gen_range(Duration::from_secs(0)..Duration::from_secs(1));
+            let t = rand::rng().random_range(Duration::from_secs(0)..Duration::from_secs(1));
             tokio::time::sleep(t).await;
             tracing::info!("kill {name}");
             Handle::current().kill(name);
 
-            let mut t =
-                rand::thread_rng().gen_range(Duration::from_secs(0)..Duration::from_secs(1));
+            let mut t = rand::rng().random_range(Duration::from_secs(0)..Duration::from_secs(1));
             // has a small chance to restart after a long time
             // so that the node is expired and removed from the cluster
-            if rand::thread_rng().gen_bool(0.1) {
+            if rand::rng().random_bool(0.1) {
                 // max_heartbeat_interval_secs = 15
                 t += Duration::from_secs(restart_delay_secs as u64);
             }
@@ -840,6 +940,9 @@ impl Cluster {
         for i in 1..=self.config.compactor_nodes {
             nodes.push(format!("compactor-{i}"));
         }
+        for i in 1..=self.config.iceberg_compactor_nodes {
+            nodes.push(format!("iceberg-compactor-{i}"));
+        }
 
         tracing::info!("graceful shutdown");
         let waiting_time = Duration::from_secs(10);
@@ -861,6 +964,45 @@ impl Cluster {
             }
         }
     }
+
+    pub async fn wait_for_recovery(&mut self) -> Result<()> {
+        let timeout = Duration::from_secs(200);
+        let mut session = self.start_session();
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(result) = session.run("select rw_recovery_status()").await
+                    && result == "RUNNING"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_nanos(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// This function only works if all actors in your cluster are following adaptive scaling.
+    pub async fn wait_for_scale(&mut self, parallelism: usize) -> Result<()> {
+        let timeout = Duration::from_secs(200);
+        let mut session = self.start_session();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let parallelism_sql = format!(
+                    "select count(parallelism) filter (where parallelism != {parallelism})\
+                from (select count(*) parallelism from rw_actors group by fragment_id);"
+                );
+                if let Ok(result) = session.run(&parallelism_sql).await
+                    && result == "0"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_nanos(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 type SessionRequest = (
@@ -875,6 +1017,16 @@ pub struct Session {
 }
 
 impl Session {
+    /// Run the given SQLs on the session.
+    pub async fn run_all(&mut self, sqls: Vec<impl Into<String>>) -> Result<Vec<String>> {
+        let mut results = Vec::with_capacity(sqls.len());
+        for sql in sqls {
+            let result = self.run(sql).await?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     /// Run the given SQL query on the session.
     pub async fn run(&mut self, sql: impl Into<String>) -> Result<String> {
         let (tx, rx) = oneshot::channel();
@@ -909,7 +1061,7 @@ impl KillOpts {
     /// Killing all kind of nodes.
     pub const ALL: Self = KillOpts {
         kill_rate: 1.0,
-        kill_meta: true,
+        kill_meta: false, // FIXME: make it true when multiple meta nodes are supported
         kill_frontend: true,
         kill_compute: true,
         kill_compactor: true,
@@ -917,7 +1069,7 @@ impl KillOpts {
     };
     pub const ALL_FAST: Self = KillOpts {
         kill_rate: 1.0,
-        kill_meta: true,
+        kill_meta: false, // FIXME: make it true when multiple meta nodes are supported
         kill_frontend: true,
         kill_compute: true,
         kill_compactor: true,

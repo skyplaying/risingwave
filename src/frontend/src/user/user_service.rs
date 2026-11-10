@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,28 +16,30 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use parking_lot::lock_api::ArcRwLockReadGuard;
-use parking_lot::{RawRwLock, RwLock};
+use parking_lot::{RawRwLockRecursive, RecursiveRwLock};
+use risingwave_pb::user::alter_default_privilege_request::Operation as AlterDefaultPrivilegeOperation;
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::{GrantPrivilege, UserInfo};
 use risingwave_rpc_client::MetaClient;
 use tokio::sync::watch::Receiver;
 
+use crate::catalog::{DatabaseId, SchemaId};
 use crate::error::Result;
 use crate::user::user_manager::UserInfoManager;
 use crate::user::{UserId, UserInfoVersion};
 
-pub type UserInfoReadGuard = ArcRwLockReadGuard<RawRwLock, UserInfoManager>;
+pub type UserInfoReadGuard = ArcRwLockReadGuard<RawRwLockRecursive, UserInfoManager>;
 
 #[derive(Clone)]
-pub struct UserInfoReader(Arc<RwLock<UserInfoManager>>);
+pub struct UserInfoReader(Arc<RecursiveRwLock<UserInfoManager>>);
 impl UserInfoReader {
-    pub fn new(inner: Arc<RwLock<UserInfoManager>>) -> Self {
+    pub fn new(inner: Arc<RecursiveRwLock<UserInfoManager>>) -> Self {
         UserInfoReader(inner)
     }
 
     pub fn read_guard(&self) -> UserInfoReadGuard {
-        // Make this recursive so that one can get this guard in the same thread without fear.
-        self.0.read_arc_recursive()
+        // RecursiveRwLock allows nested read guards even while a writer is waiting.
+        self.0.read_arc()
     }
 }
 
@@ -65,6 +67,15 @@ pub trait UserInfoWriter: Send + Sync {
         revoke_by: UserId,
         revoke_grant_option: bool,
         cascade: bool,
+    ) -> Result<()>;
+
+    async fn alter_default_privilege(
+        &self,
+        users: Vec<UserId>,
+        database_id: DatabaseId,
+        schemas: Vec<SchemaId>,
+        operation: AlterDefaultPrivilegeOperation,
+        granted_by: UserId,
     ) -> Result<()>;
 }
 
@@ -126,6 +137,20 @@ impl UserInfoWriter for UserInfoWriterImpl {
             )
             .await?;
         self.wait_version(version).await
+    }
+
+    async fn alter_default_privilege(
+        &self,
+        users: Vec<UserId>,
+        database_id: DatabaseId,
+        schemas: Vec<SchemaId>,
+        operation: AlterDefaultPrivilegeOperation,
+        granted_by: UserId,
+    ) -> Result<()> {
+        self.meta_client
+            .alter_default_privilege(users, database_id, schemas, operation, granted_by)
+            .await?;
+        Ok(())
     }
 }
 

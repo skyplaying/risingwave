@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+use risingwave_common::session_config::VisibilityMode;
 use risingwave_hummock_sdk::EpochWithGap;
 
 use super::SessionImpl;
@@ -137,6 +138,11 @@ impl SessionImpl {
             // explicit transaction.
             State::Initial => unreachable!("no implicit transaction in progress"),
             State::Implicit(ctx) => {
+                if self.config().visibility_mode() == VisibilityMode::All {
+                    self.notice_to_user(
+                        "`visibility_mode` is set to `All`, and there is no consistency ensured in the transaction",
+                    );
+                }
                 *txn = State::Explicit(Context {
                     id: ctx.id,
                     access_mode,
@@ -219,15 +225,24 @@ impl SessionImpl {
 
                 if let Some(query_epoch) = query_epoch {
                     ReadSnapshot::Other(query_epoch)
+                } else if self.config().batch_read_latest_committed() {
+                    ReadSnapshot::LatestCommitted {
+                        hummock_version_id: self
+                            .env()
+                            .hummock_snapshot_manager()
+                            .acquire()
+                            .version()
+                            .id,
+                    }
+                } else if self.is_barrier_read() {
+                    ReadSnapshot::ReadUncommitted
                 } else {
                     // Acquire hummock snapshot for execution.
-                    let is_barrier_read = self.is_barrier_read();
                     let hummock_snapshot_manager = self.env().hummock_snapshot_manager();
                     let pinned_snapshot = hummock_snapshot_manager.acquire();
 
                     ReadSnapshot::FrontendPinned {
                         snapshot: pinned_snapshot,
-                        is_barrier_read,
                     }
                 }
             })
@@ -265,5 +280,63 @@ impl SessionImpl {
     pub fn user_info_writer(&self) -> Result<&dyn UserInfoWriter> {
         self.txn_write_guard()
             .map(|guard| self.env().user_info_writer(guard))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::LocalFrontend;
+
+    #[tokio::test]
+    async fn test_latest_committed_snapshot_precedence() {
+        let frontend = LocalFrontend::new(Default::default()).await;
+        let session = frontend.session_ref();
+        session.set_config("visibility_mode", "all".into()).unwrap();
+        {
+            let _txn = session.txn_begin_implicit();
+            assert!(session.is_barrier_read());
+            assert!(matches!(
+                session.pinned_snapshot(),
+                ReadSnapshot::ReadUncommitted
+            ));
+        }
+        session
+            .set_config("batch_read_latest_committed", "true".into())
+            .unwrap();
+        let snapshot_manager = session.env().hummock_snapshot_manager();
+        let mut version = snapshot_manager.acquire().version().clone();
+        version.id = 123.into();
+        snapshot_manager.init(version);
+        {
+            let _txn = session.txn_begin_implicit();
+            assert!(!session.is_barrier_read());
+            assert!(matches!(
+                session.pinned_snapshot(),
+                ReadSnapshot::LatestCommitted { hummock_version_id } if hummock_version_id.as_raw_id() == 123
+            ));
+            // Changing configuration does not reacquire an existing transaction snapshot.
+            session.reset_config("batch_read_latest_committed").unwrap();
+            assert!(matches!(
+                session.pinned_snapshot(),
+                ReadSnapshot::LatestCommitted { hummock_version_id } if hummock_version_id.as_raw_id() == 123
+            ));
+        }
+        session
+            .set_config("batch_read_latest_committed", "true".into())
+            .unwrap();
+        session.set_config("query_epoch", "65536".into()).unwrap();
+        {
+            let _txn = session.txn_begin_implicit();
+            assert!(!session.is_barrier_read());
+            assert!(matches!(session.pinned_snapshot(), ReadSnapshot::Other(_)));
+        }
+        session.reset_config("query_epoch").unwrap();
+        session.reset_config("batch_read_latest_committed").unwrap();
+        let _txn = session.txn_begin_implicit();
+        assert!(matches!(
+            session.pinned_snapshot(),
+            ReadSnapshot::ReadUncommitted
+        ));
     }
 }

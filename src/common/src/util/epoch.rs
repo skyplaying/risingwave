@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,13 @@ pub const INVALID_EPOCH: u64 = 0;
 
 const EPOCH_PHYSICAL_SHIFT_BITS: u8 = 16;
 
+/// Minimum physical-time delta between normally generated epochs.
+///
+/// A delta of 2 leaves one complete physical epoch for state machines that need to split an
+/// existing epoch interval later. With the default 1-second barrier interval, normally generated
+/// epochs are about 1000 physical ticks apart and therefore leave about 999 intermediate epochs.
+const MIN_EPOCH_PHYSICAL_TIME_DELTA: u64 = 2;
+
 impl Epoch {
     pub fn now() -> Self {
         Self(Self::physical_now() << EPOCH_PHYSICAL_SHIFT_BITS)
@@ -44,9 +51,12 @@ impl Epoch {
     pub fn next(self) -> Self {
         let mut physical_now = Epoch::physical_now();
         let prev_physical_time = self.physical_time();
+        let min_physical_time = prev_physical_time
+            .checked_add(MIN_EPOCH_PHYSICAL_TIME_DELTA)
+            .expect("next epoch physical time should not overflow");
 
         loop {
-            if physical_now > prev_physical_time {
+            if physical_now >= min_physical_time {
                 break;
             }
             physical_now = Epoch::physical_now();
@@ -75,6 +85,10 @@ impl Epoch {
 
     pub fn from_unix_millis(mi: u64) -> Self {
         Epoch((mi - UNIX_RISINGWAVE_DATE_SEC * 1000) << EPOCH_PHYSICAL_SHIFT_BITS)
+    }
+
+    pub fn from_unix_millis_or_earliest(mi: u64) -> Self {
+        Epoch((mi.saturating_sub(UNIX_RISINGWAVE_DATE_SEC * 1000)) << EPOCH_PHYSICAL_SHIFT_BITS)
     }
 
     pub fn physical_now() -> u64 {
@@ -125,8 +139,7 @@ pub const MAX_SPILL_TIMES: u16 = ((1 << EPOCH_AVAILABLE_BITS) - 1) as u16;
 // Low EPOCH_AVAILABLE_BITS bits set to 1
 pub const EPOCH_SPILL_TIME_MASK: u64 = (1 << EPOCH_AVAILABLE_BITS) - 1;
 // High (64-EPOCH_AVAILABLE_BITS) bits set to 1
-const EPOCH_MASK: u64 = !EPOCH_SPILL_TIME_MASK;
-pub const MAX_EPOCH: u64 = u64::MAX & EPOCH_MASK;
+pub const MAX_EPOCH: u64 = !((1 << EPOCH_AVAILABLE_BITS) - 1);
 
 // EPOCH_INC_MIN_STEP_FOR_TEST is the minimum increment step for epoch in unit tests.
 // We need to keep the lower 16 bits of the epoch unchanged during each increment,
@@ -174,10 +187,11 @@ impl EpochPair {
         Self::new(curr, curr - EPOCH_INC_MIN_STEP_FOR_TEST)
     }
 }
-/// As most unit tests initializ a new epoch from a random value (e.g. 1, 2, 233 etc.), but the correct epoch in the system is a u64 with the last `EPOCH_AVAILABLE_BITS` bits set to 0.
+
+/// As most unit tests initialize a new epoch from a random value (e.g. 1, 2, 233 etc.), but the correct epoch in the system is a u64 with the last `EPOCH_AVAILABLE_BITS` bits set to 0.
 /// This method is to turn a a random epoch into a well shifted value.
-pub const fn test_epoch(value: u64) -> u64 {
-    value << EPOCH_AVAILABLE_BITS
+pub const fn test_epoch(value_millis: u64) -> u64 {
+    value_millis << EPOCH_AVAILABLE_BITS
 }
 
 /// There are numerous operations in our system's unit tests that involve incrementing or decrementing the epoch.
@@ -265,6 +279,9 @@ mod tests {
         for _ in 0..1000 {
             let epoch = prev_epoch.next();
             assert!(epoch > prev_epoch);
+            assert!(
+                epoch.physical_time() >= prev_epoch.physical_time() + MIN_EPOCH_PHYSICAL_TIME_DELTA
+            );
             prev_epoch = epoch;
         }
     }

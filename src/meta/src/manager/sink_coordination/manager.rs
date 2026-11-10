@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,30 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
+use std::sync::Arc;
 
-use futures::future::{select, BoxFuture, Either};
+use anyhow::anyhow;
+use futures::future::{BoxFuture, Either, select};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
-use risingwave_common::buffer::Bitmap;
+use risingwave_common::bitmap::Bitmap;
+use risingwave_common::id::{DatabaseId, JobId};
+use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
 use risingwave_connector::sink::catalog::SinkId;
-use risingwave_connector::sink::SinkParam;
+use risingwave_connector::sink::{SinkCommittedEpochSubscriber, SinkError, SinkParam};
 use risingwave_pb::connector_service::coordinate_request::Msg;
-use risingwave_pb::connector_service::{coordinate_request, CoordinateRequest, CoordinateResponse};
+use risingwave_pb::connector_service::{CoordinateRequest, CoordinateResponse, coordinate_request};
 use rw_futures_util::pending_on_none;
+use sea_orm::DatabaseConnection;
 use thiserror_ext::AsReport;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot::{Receiver, Sender, channel};
 use tokio::task::{JoinError, JoinHandle};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Status;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
+use crate::hummock::HummockManagerRef;
+use crate::manager::MetadataManager;
+use crate::manager::sink_coordination::SinkWriterRequestStream;
 use crate::manager::sink_coordination::coordinator_worker::CoordinatorWorker;
-use crate::manager::sink_coordination::{NewSinkWriterRequest, SinkWriterRequestStream};
+use crate::manager::sink_coordination::handle::SinkWriterCoordinationHandle;
+use crate::notification::{
+    CollectionNotifier, Notifier, NotifierStarter, StartReceiver, wait_collection,
+};
 
 macro_rules! send_with_err_check {
     ($tx:expr, $msg:expr) => {
@@ -45,37 +55,117 @@ macro_rules! send_with_err_check {
     };
 }
 
-macro_rules! send_await_with_err_check {
-    ($tx:expr, $msg:expr) => {
-        if $tx.send($msg).await.is_err() {
-            error!("unable to send msg");
-        }
-    };
-}
-
 const BOUNDED_CHANNEL_SIZE: usize = 16;
 
 enum ManagerRequest {
-    NewSinkWriter(NewSinkWriterRequest),
+    NewSinkWriter(SinkWriterCoordinationHandle),
     StopCoordinator {
-        finish_notifier: Sender<()>,
-        /// sink id to stop. When `None`, stop all sink coordinator
-        sink_id: Option<SinkId>,
+        notifier: Notifier,
+        /// Streaming jobs whose sink coordinators should be stopped.
+        job_ids: Vec<JobId>,
     },
+    RecoveryStart {
+        recovery: RecoveryStart,
+        notifier: Notifier,
+    },
+    RecoverySucceeded {
+        recovery: RecoverySucceeded,
+        notifier: Notifier,
+    },
+}
+
+#[derive(Debug)]
+pub enum RecoveryStart {
+    Global,
+    Database {
+        database_id: DatabaseId,
+        job_ids: HashSet<JobId>,
+    },
+}
+
+#[derive(Debug)]
+pub enum RecoverySucceeded {
+    Global {
+        failed_databases: HashMap<DatabaseId, HashSet<JobId>>,
+    },
+    Database(DatabaseId),
+}
+
+#[derive(Debug)]
+enum RecoveryFence {
+    Global,
+    Databases(HashMap<DatabaseId, HashSet<JobId>>),
 }
 
 #[derive(Clone)]
 pub struct SinkCoordinatorManager {
     request_tx: mpsc::Sender<ManagerRequest>,
 }
+fn new_committed_epoch_subscriber(
+    hummock_manager: HummockManagerRef,
+    metadata_manager: MetadataManager,
+) -> SinkCommittedEpochSubscriber {
+    Arc::new(move |sink_id| {
+        let hummock_manager = hummock_manager.clone();
+        let metadata_manager = metadata_manager.clone();
+        async move {
+            let state_table_ids = metadata_manager
+                .get_sink_state_table_ids(sink_id)
+                .await
+                .map_err(SinkError::from)?;
+            let Some(table_id) = state_table_ids.first() else {
+                return Err(anyhow!("no state table id in sink: {}", sink_id).into());
+            };
+            hummock_manager
+                .subscribe_table_committed_epoch(*table_id)
+                .await
+                .map_err(SinkError::from)
+        }
+        .boxed()
+    })
+}
 
 impl SinkCoordinatorManager {
-    pub fn start_worker() -> (Self, (JoinHandle<()>, Sender<()>)) {
-        Self::start_worker_with_spawn_worker(|writer_request, manager_request_stream| {
-            tokio::spawn(CoordinatorWorker::run(
-                writer_request,
-                manager_request_stream,
-            ))
+    /// Let lifecycle tests control when coordinator stop requests complete.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, UnboundedReceiver<(Vec<JobId>, Notifier)>) {
+        let (request_tx, mut request_rx) = mpsc::channel(BOUNDED_CHANNEL_SIZE);
+        let (stop_tx, stop_rx) = unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                let ManagerRequest::StopCoordinator { notifier, job_ids } = request else {
+                    panic!("expected a coordinator stop request");
+                };
+                stop_tx.send((job_ids, notifier)).unwrap();
+            }
+        });
+        (Self { request_tx }, stop_rx)
+    }
+
+    pub fn start_worker(
+        db: DatabaseConnection,
+        hummock_manager: HummockManagerRef,
+        metadata_manager: MetadataManager,
+        iceberg_compact_stat_sender: UnboundedSender<IcebergSinkCompactionUpdate>,
+        await_tree_reg: await_tree::Registry,
+    ) -> (Self, (JoinHandle<()>, Sender<()>)) {
+        let subscriber = new_committed_epoch_subscriber(hummock_manager, metadata_manager);
+        Self::start_worker_with_spawn_worker({
+            move |param, manager_request_stream| {
+                let sink_id = param.sink_id;
+                let fut = CoordinatorWorker::run(
+                    param,
+                    manager_request_stream,
+                    db.clone(),
+                    subscriber.clone(),
+                    iceberg_compact_stat_sender.clone(),
+                );
+                tokio::spawn(
+                    await_tree_reg
+                        .register_derived_root(format!("Sink Coordinator {sink_id}"))
+                        .instrument(fut),
+                )
+            }
         })
     }
 
@@ -95,7 +185,7 @@ impl SinkCoordinatorManager {
     pub async fn handle_new_request(
         &self,
         mut request_stream: SinkWriterRequestStream,
-    ) -> Result<impl Stream<Item = Result<CoordinateResponse, Status>>, Status> {
+    ) -> Result<impl Stream<Item = Result<CoordinateResponse, Status>> + use<>, Status> {
         let (param, vnode_bitmap) = match request_stream.try_next().await? {
             Some(CoordinateRequest {
                 msg:
@@ -111,14 +201,11 @@ impl SinkCoordinatorManager {
                 )));
             }
         };
-        let (response_tx, response_rx) = mpsc::channel(BOUNDED_CHANNEL_SIZE);
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
-            .send(ManagerRequest::NewSinkWriter(NewSinkWriterRequest {
-                request_stream,
-                response_tx,
-                param,
-                vnode_bitmap,
-            }))
+            .send(ManagerRequest::NewSinkWriter(
+                SinkWriterCoordinationHandle::new(request_stream, response_tx, param, vnode_bitmap),
+            ))
             .await
             .map_err(|_| {
                 Status::unavailable(
@@ -126,48 +213,68 @@ impl SinkCoordinatorManager {
                 )
             })?;
 
-        Ok(ReceiverStream::new(response_rx))
+        Ok(UnboundedReceiverStream::new(response_rx))
     }
 
-    async fn stop_coordinator(&self, sink_id: Option<SinkId>) {
-        let (tx, rx) = channel();
-        send_await_with_err_check!(
-            self.request_tx,
-            ManagerRequest::StopCoordinator {
-                finish_notifier: tx,
-                sink_id,
-            }
-        );
-        if rx.await.is_err() {
-            error!("fail to wait for resetting sink manager worker");
+    pub async fn stop_sink_coordinators_for_jobs(&self, job_ids: Vec<JobId>) {
+        let (notifier, started_rx) = Notifier::new();
+        if self
+            .request_tx
+            .send(ManagerRequest::StopCoordinator { notifier, job_ids })
+            .await
+            .is_err()
+        {
+            error!("unable to send sink coordinator stop request");
+            return;
         }
-        info!("successfully stop coordinator: {:?}", sink_id);
+        if let Err(err) = Self::wait_for_completion(started_rx).await {
+            error!(error = %err.as_report(), "failed to wait for sink coordinators to stop");
+        }
     }
 
-    pub async fn reset(&self) {
-        self.stop_coordinator(None).await;
+    pub async fn start_recovery(&self, recovery: RecoveryStart) -> anyhow::Result<()> {
+        let (notifier, started_rx) = Notifier::new();
+        self.request_tx
+            .send(ManagerRequest::RecoveryStart { recovery, notifier })
+            .await
+            .map_err(|_| anyhow!("sink coordinator manager worker has stopped"))?;
+        Self::wait_for_completion(started_rx).await
     }
 
-    pub async fn stop_sink_coordinator(&self, sink_id: SinkId) {
-        self.stop_coordinator(Some(sink_id)).await;
+    pub async fn recovery_succeeded(&self, recovery: RecoverySucceeded) -> anyhow::Result<()> {
+        let (notifier, started_rx) = Notifier::new();
+        self.request_tx
+            .send(ManagerRequest::RecoverySucceeded { recovery, notifier })
+            .await
+            .map_err(|_| anyhow!("sink coordinator manager worker has stopped"))?;
+        Self::wait_for_completion(started_rx).await
+    }
+
+    async fn wait_for_completion(started_rx: StartReceiver) -> anyhow::Result<()> {
+        let receivers = started_rx
+            .await
+            .map_err(|_| anyhow!("sink coordinator manager dropped start notifier"))??;
+        wait_collection(receivers).await?;
+        Ok(())
     }
 }
 
 struct CoordinatorWorkerHandle {
     /// Sender to coordinator worker. Drop the sender as a stop signal
-    request_sender: Option<UnboundedSender<NewSinkWriterRequest>>,
+    request_sender: Option<UnboundedSender<SinkWriterCoordinationHandle>>,
     /// Notify when the coordinator worker stops
-    finish_notifiers: Vec<Sender<()>>,
+    finish_notifiers: Vec<CollectionNotifier>,
 }
 
 struct ManagerWorker {
     request_rx: mpsc::Receiver<ManagerRequest>,
     // Make it option so that it can be polled with &mut SinkManagerWorker
-    shutdown_rx: Option<Receiver<()>>,
+    shutdown_rx: Receiver<()>,
 
     running_coordinator_worker_join_handles:
         FuturesUnordered<BoxFuture<'static, (SinkId, Result<(), JoinError>)>>,
     running_coordinator_worker: HashMap<SinkId, CoordinatorWorkerHandle>,
+    recovery_fence: Option<RecoveryFence>,
 }
 
 enum ManagerEvent {
@@ -178,7 +285,7 @@ enum ManagerEvent {
     },
 }
 
-trait SpawnCoordinatorFn = FnMut(NewSinkWriterRequest, UnboundedReceiver<NewSinkWriterRequest>) -> JoinHandle<()>
+trait SpawnCoordinatorFn = FnMut(SinkParam, UnboundedReceiver<SinkWriterCoordinationHandle>) -> JoinHandle<()>
     + Send
     + 'static;
 
@@ -186,9 +293,10 @@ impl ManagerWorker {
     fn new(request_rx: mpsc::Receiver<ManagerRequest>, shutdown_rx: Receiver<()>) -> Self {
         ManagerWorker {
             request_rx,
-            shutdown_rx: Some(shutdown_rx),
+            shutdown_rx,
             running_coordinator_worker_join_handles: Default::default(),
             running_coordinator_worker: Default::default(),
+            recovery_fence: None,
         }
     }
 
@@ -199,31 +307,25 @@ impl ManagerWorker {
                     ManagerRequest::NewSinkWriter(request) => {
                         self.handle_new_sink_writer(request, &mut spawn_coordinator_worker)
                     }
-                    ManagerRequest::StopCoordinator {
-                        finish_notifier,
-                        sink_id,
-                    } => {
-                        if let Some(sink_id) = sink_id {
-                            if let Some(worker_handle) =
-                                self.running_coordinator_worker.get_mut(&sink_id)
+                    ManagerRequest::StopCoordinator { notifier, job_ids } => {
+                        let mut notifier = notifier.start();
+                        for job_id in job_ids {
+                            if let Some(worker_handle) = self
+                                .running_coordinator_worker
+                                .get_mut(&job_id.as_sink_id())
                             {
-                                if let Some(sender) = worker_handle.request_sender.take() {
-                                    // drop the sender as a signal to notify the coordinator worker
-                                    // to stop
-                                    drop(sender);
-                                }
-                                worker_handle.finish_notifiers.push(finish_notifier);
-                            } else {
-                                debug!(
-                                    "sink coordinator of {} is not running. Notify finish directly",
-                                    sink_id.sink_id
-                                );
-                                send_with_err_check!(finish_notifier, ());
+                                Self::drain_coordinator(worker_handle, &mut notifier);
                             }
-                        } else {
-                            self.clean_up().await;
-                            send_with_err_check!(finish_notifier, ());
                         }
+                        notifier.started();
+                    }
+                    ManagerRequest::RecoveryStart { recovery, notifier } => {
+                        self.apply_recovery_start(recovery, notifier);
+                    }
+                    ManagerRequest::RecoverySucceeded { recovery, notifier } => {
+                        let notifier = notifier.start();
+                        self.apply_recovery_succeeded(recovery);
+                        notifier.started();
                     }
                 },
                 ManagerEvent::CoordinatorWorkerFinished {
@@ -236,8 +338,94 @@ impl ManagerWorker {
         info!("sink manager worker exited");
     }
 
+    fn apply_recovery_start(&mut self, recovery: RecoveryStart, notifier: Notifier) {
+        let job_ids_to_stop = match recovery {
+            RecoveryStart::Global => {
+                self.recovery_fence = Some(RecoveryFence::Global);
+                None
+            }
+            RecoveryStart::Database {
+                database_id,
+                job_ids,
+            } => {
+                let job_ids_to_stop = job_ids.clone();
+                match &mut self.recovery_fence {
+                    Some(RecoveryFence::Global) => {}
+                    Some(RecoveryFence::Databases(databases)) => {
+                        databases.entry(database_id).or_default().extend(job_ids);
+                    }
+                    None => {
+                        self.recovery_fence = Some(RecoveryFence::Databases(HashMap::from([(
+                            database_id,
+                            job_ids,
+                        )])));
+                    }
+                }
+                Some(job_ids_to_stop)
+            }
+        };
+
+        let mut notifier = notifier.start();
+        if let Some(job_ids) = job_ids_to_stop {
+            for job_id in job_ids {
+                if let Some(worker_handle) = self
+                    .running_coordinator_worker
+                    .get_mut(&job_id.as_sink_id())
+                {
+                    Self::drain_coordinator(worker_handle, &mut notifier);
+                }
+            }
+        } else {
+            for worker_handle in self.running_coordinator_worker.values_mut() {
+                Self::drain_coordinator(worker_handle, &mut notifier);
+            }
+        }
+        notifier.started();
+    }
+
+    fn drain_coordinator(
+        worker_handle: &mut CoordinatorWorkerHandle,
+        notifier: &mut NotifierStarter,
+    ) {
+        worker_handle.finish_notifiers.push(notifier.add_notify());
+        if let Some(sender) = worker_handle.request_sender.take() {
+            // Drop the sender as a signal to notify the coordinator worker to stop.
+            drop(sender);
+        }
+    }
+
+    fn apply_recovery_succeeded(&mut self, recovery: RecoverySucceeded) {
+        match recovery {
+            RecoverySucceeded::Global { failed_databases } => {
+                self.recovery_fence = if failed_databases.is_empty() {
+                    None
+                } else {
+                    Some(RecoveryFence::Databases(failed_databases))
+                };
+            }
+            RecoverySucceeded::Database(database_id) => {
+                let Some(RecoveryFence::Databases(databases)) = &mut self.recovery_fence else {
+                    return;
+                };
+                databases.remove(&database_id);
+                if databases.is_empty() {
+                    self.recovery_fence = None;
+                }
+            }
+        }
+    }
+
+    fn is_sink_fenced(&self, sink_id: SinkId) -> bool {
+        match &self.recovery_fence {
+            Some(RecoveryFence::Global) => true,
+            Some(RecoveryFence::Databases(databases)) => databases
+                .values()
+                .any(|job_ids| job_ids.contains(&sink_id.as_job_id())),
+            None => false,
+        }
+    }
+
     async fn next_event(&mut self) -> Option<ManagerEvent> {
-        let shutdown_rx = self.shutdown_rx.take().expect("should not be empty");
         match select(
             select(
                 pin!(self.request_rx.recv()),
@@ -245,23 +433,20 @@ impl ManagerWorker {
                     self.running_coordinator_worker_join_handles.next()
                 )),
             ),
-            shutdown_rx,
+            &mut self.shutdown_rx,
         )
         .await
         {
-            Either::Left((either, shutdown_rx)) => {
-                self.shutdown_rx = Some(shutdown_rx);
-                match either {
-                    Either::Left((Some(request), _)) => Some(ManagerEvent::NewRequest(request)),
-                    Either::Left((None, _)) => None,
-                    Either::Right(((sink_id, join_result), _)) => {
-                        Some(ManagerEvent::CoordinatorWorkerFinished {
-                            sink_id,
-                            join_result,
-                        })
-                    }
+            Either::Left((either, _)) => match either {
+                Either::Left((Some(request), _)) => Some(ManagerEvent::NewRequest(request)),
+                Either::Left((None, _)) => None,
+                Either::Right(((sink_id, join_result), _)) => {
+                    Some(ManagerEvent::CoordinatorWorkerFinished {
+                        sink_id,
+                        join_result,
+                    })
                 }
-            }
+            },
             Either::Right(_) => None,
         }
     }
@@ -288,18 +473,18 @@ impl ManagerWorker {
             .remove(&sink_id)
             .expect("finished coordinator should have an associated worker handle");
         for finish_notifier in worker_handle.finish_notifiers {
-            send_with_err_check!(finish_notifier, ());
+            finish_notifier.notify_collected();
         }
         match join_result {
             Ok(()) => {
                 info!(
-                    id = sink_id.sink_id,
+                    id = %sink_id,
                     "sink coordinator has gracefully finished",
                 );
             }
             Err(err) => {
                 error!(
-                    id = sink_id.sink_id,
+                    id = %sink_id,
                     error = %err.as_report(),
                     "sink coordinator finished with error",
                 );
@@ -309,103 +494,597 @@ impl ManagerWorker {
 
     fn handle_new_sink_writer(
         &mut self,
-        request: NewSinkWriterRequest,
+        new_writer: SinkWriterCoordinationHandle,
         spawn_coordinator_worker: &mut impl SpawnCoordinatorFn,
     ) {
-        let param = &request.param;
+        let param = new_writer.param();
         let sink_id = param.sink_id;
 
-        // Launch the coordinator worker task if it is the first
-        match self.running_coordinator_worker.entry(param.sink_id) {
-            Entry::Occupied(mut entry) => {
-                if let Some(sender) = entry.get_mut().request_sender.as_mut() {
-                    send_with_err_check!(sender, request);
-                } else {
-                    warn!(
-                        "handle a new request while the sink coordinator is being stopped: {:?}",
-                        param
-                    );
-                    drop(request.response_tx);
-                }
-            }
-            Entry::Vacant(entry) => {
+        if self.is_sink_fenced(sink_id) {
+            new_writer.abort(Status::unavailable(format!(
+                "sink coordinator for sink {} is unavailable during recovery",
+                sink_id
+            )));
+            return;
+        }
+
+        let handle = self
+            .running_coordinator_worker
+            .entry(param.sink_id)
+            .or_insert_with(|| {
+                // Launch the coordinator worker task if it is the first
                 let (request_tx, request_rx) = unbounded_channel();
-                let join_handle = spawn_coordinator_worker(request, request_rx);
+                let join_handle = spawn_coordinator_worker(param.clone(), request_rx);
                 self.running_coordinator_worker_join_handles.push(
                     join_handle
                         .map(move |join_result| (sink_id, join_result))
                         .boxed(),
                 );
-                entry.insert(CoordinatorWorkerHandle {
+                CoordinatorWorkerHandle {
                     request_sender: Some(request_tx),
                     finish_notifiers: Vec::new(),
-                });
-            }
-        };
+                }
+            });
+
+        if let Some(sender) = handle.request_sender.as_mut() {
+            send_with_err_check!(sender, new_writer);
+        } else {
+            warn!(
+                "handle a new request while the sink coordinator is being stopped: {:?}",
+                param
+            );
+            new_writer.abort(Status::internal("the sink is being stopped"));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::future::{poll_fn, Future};
+    use std::collections::{HashMap, HashSet};
+    use std::future::{Future, poll_fn};
     use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::task::Poll;
 
     use anyhow::anyhow;
     use async_trait::async_trait;
-    use futures::future::join;
-    use futures::{FutureExt, StreamExt};
+    use futures::future::{join, try_join};
+    use futures::{FutureExt, StreamExt, TryFutureExt};
     use itertools::Itertools;
     use rand::seq::SliceRandom;
-    use risingwave_common::buffer::{Bitmap, BitmapBuilder};
+    use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
     use risingwave_common::hash::VirtualNode;
+    use risingwave_common::id::{DatabaseId, JobId};
     use risingwave_connector::sink::catalog::{SinkId, SinkType};
-    use risingwave_connector::sink::{SinkCommitCoordinator, SinkError, SinkParam};
+    use risingwave_connector::sink::{
+        SinglePhaseCommitCoordinator, SinkCommitCoordinator, SinkError, SinkParam,
+        TwoPhaseCommitCoordinator,
+    };
+    use risingwave_meta_model::SinkSchemachange;
     use risingwave_pb::connector_service::sink_metadata::{Metadata, SerializedMetadata};
-    use risingwave_pb::connector_service::SinkMetadata;
+    use risingwave_pb::connector_service::{CoordinateResponse, SinkMetadata};
+    use risingwave_pb::data::PbDataType;
+    use risingwave_pb::data::data_type::PbTypeName;
+    use risingwave_pb::plan_common::PbField;
+    use risingwave_pb::stream_plan::sink_schema_change::Op as SinkSchemachangeOp;
+    use risingwave_pb::stream_plan::{PbSinkAddColumnsOp, PbSinkSchemaChange};
     use risingwave_rpc_client::CoordinatorStreamHandle;
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio_stream::wrappers::ReceiverStream;
+    use tonic::Status;
 
+    use super::{
+        ManagerRequest, ManagerWorker, RecoveryFence, RecoveryStart, RecoverySucceeded,
+        SinkWriterCoordinationHandle,
+    };
+    use crate::manager::sink_coordination::SinkCoordinatorManager;
     use crate::manager::sink_coordination::coordinator_worker::CoordinatorWorker;
-    use crate::manager::sink_coordination::{NewSinkWriterRequest, SinkCoordinatorManager};
+    use crate::manager::sink_coordination::manager::SinkCommittedEpochSubscriber;
 
-    struct MockCoordinator<C, F: FnMut(u64, Vec<SinkMetadata>, &mut C) -> Result<(), SinkError>> {
+    fn test_writer_handle(
+        param: SinkParam,
+    ) -> (
+        SinkWriterCoordinationHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<CoordinateResponse, Status>>,
+    ) {
+        let (response_tx, response_rx) = unbounded_channel();
+        (
+            SinkWriterCoordinationHandle::new(
+                futures::stream::pending().boxed(),
+                response_tx,
+                param,
+                Bitmap::ones(1),
+            ),
+            response_rx,
+        )
+    }
+
+    #[test]
+    fn test_recovery_fence_transitions() {
+        let (_request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut worker = ManagerWorker::new(request_rx, shutdown_rx);
+        let database_1 = DatabaseId::new(1);
+        let database_2 = DatabaseId::new(2);
+        let sink_1 = SinkId::new(11);
+        let sink_2 = SinkId::new(12);
+        let sink_3 = SinkId::new(21);
+        let job_1 = sink_1.as_job_id();
+        let job_2 = sink_2.as_job_id();
+        let job_3 = sink_3.as_job_id();
+
+        assert!(!worker.is_sink_fenced(sink_1));
+
+        worker.apply_recovery_start(
+            RecoveryStart::Database {
+                database_id: database_1,
+                job_ids: HashSet::from([job_1]),
+            },
+            crate::notification::Notifier::new().0,
+        );
+        assert!(worker.is_sink_fenced(sink_1));
+        assert!(!worker.is_sink_fenced(sink_2));
+
+        worker.apply_recovery_start(
+            RecoveryStart::Database {
+                database_id: database_1,
+                job_ids: HashSet::from([job_2]),
+            },
+            crate::notification::Notifier::new().0,
+        );
+        worker.apply_recovery_start(
+            RecoveryStart::Database {
+                database_id: database_2,
+                job_ids: HashSet::from([job_3]),
+            },
+            crate::notification::Notifier::new().0,
+        );
+        assert!(worker.is_sink_fenced(sink_1));
+        assert!(worker.is_sink_fenced(sink_2));
+        assert!(worker.is_sink_fenced(sink_3));
+
+        worker.apply_recovery_start(
+            RecoveryStart::Global,
+            crate::notification::Notifier::new().0,
+        );
+        worker.apply_recovery_start(
+            RecoveryStart::Global,
+            crate::notification::Notifier::new().0,
+        );
+        assert!(matches!(worker.recovery_fence, Some(RecoveryFence::Global)));
+        assert!(worker.is_sink_fenced(SinkId::new(999)));
+
+        worker.apply_recovery_start(
+            RecoveryStart::Database {
+                database_id: database_1,
+                job_ids: HashSet::from([job_1]),
+            },
+            crate::notification::Notifier::new().0,
+        );
+        assert!(matches!(worker.recovery_fence, Some(RecoveryFence::Global)));
+        worker.apply_recovery_succeeded(RecoverySucceeded::Database(database_1));
+        assert!(matches!(worker.recovery_fence, Some(RecoveryFence::Global)));
+
+        worker.apply_recovery_succeeded(RecoverySucceeded::Global {
+            failed_databases: HashMap::from([
+                (database_1, HashSet::from([job_1, job_2])),
+                (database_2, HashSet::from([job_3])),
+            ]),
+        });
+        assert!(worker.is_sink_fenced(sink_1));
+        assert!(worker.is_sink_fenced(sink_3));
+        assert!(!worker.is_sink_fenced(SinkId::new(999)));
+
+        worker.apply_recovery_succeeded(RecoverySucceeded::Database(database_1));
+        assert!(!worker.is_sink_fenced(sink_1));
+        assert!(worker.is_sink_fenced(sink_3));
+
+        worker.apply_recovery_succeeded(RecoverySucceeded::Database(database_2));
+        assert!(worker.recovery_fence.is_none());
+
+        worker.apply_recovery_start(
+            RecoveryStart::Global,
+            crate::notification::Notifier::new().0,
+        );
+        worker.apply_recovery_succeeded(RecoverySucceeded::Global {
+            failed_databases: HashMap::new(),
+        });
+        assert!(worker.recovery_fence.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_fence_blocks_spawn_and_waits_for_coordinator_exit() {
+        let database_id = DatabaseId::new(1);
+        let sink_id = SinkId::new(11);
+        let param = SinkParam {
+            sink_id,
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawned = Arc::new(Notify::new());
+        let stopping = Arc::new(Notify::new());
+        let allow_exit = Arc::new(Notify::new());
+        let (manager, (_join_handle, _shutdown_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let spawn_count = spawn_count.clone();
+                let spawned = spawned.clone();
+                let stopping = stopping.clone();
+                let allow_exit = allow_exit.clone();
+                move |_param, mut request_rx| {
+                    spawn_count.fetch_add(1, Ordering::SeqCst);
+                    spawned.notify_one();
+                    let stopping = stopping.clone();
+                    let allow_exit = allow_exit.clone();
+                    tokio::spawn(async move {
+                        while request_rx.recv().await.is_some() {}
+                        stopping.notify_one();
+                        allow_exit.notified().await;
+                    })
+                }
+            });
+
+        manager
+            .start_recovery(RecoveryStart::Database {
+                database_id,
+                job_ids: HashSet::from([sink_id.as_job_id()]),
+            })
+            .await
+            .unwrap();
+
+        let (writer, mut response_rx) = test_writer_handle(param.clone());
+        manager
+            .request_tx
+            .send(ManagerRequest::NewSinkWriter(writer))
+            .await
+            .unwrap();
+        let status = response_rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+
+        manager
+            .recovery_succeeded(RecoverySucceeded::Database(database_id))
+            .await
+            .unwrap();
+        let (writer, _response_rx) = test_writer_handle(param.clone());
+        manager
+            .request_tx
+            .send(ManagerRequest::NewSinkWriter(writer))
+            .await
+            .unwrap();
+        spawned.notified().await;
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+
+        let stop_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .stop_sink_coordinators_for_jobs(vec![sink_id.as_job_id()])
+                    .await;
+            }
+        });
+        stopping.notified().await;
+        assert!(!stop_task.is_finished());
+        allow_exit.notify_one();
+        stop_task.await.unwrap();
+
+        let (writer, _response_rx) = test_writer_handle(param.clone());
+        manager
+            .request_tx
+            .send(ManagerRequest::NewSinkWriter(writer))
+            .await
+            .unwrap();
+        spawned.notified().await;
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 2);
+
+        let recovery_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .start_recovery(RecoveryStart::Database {
+                        database_id,
+                        job_ids: HashSet::from([sink_id.as_job_id()]),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        stopping.notified().await;
+        assert!(!recovery_task.is_finished());
+
+        let (writer, mut response_rx) = test_writer_handle(param);
+        manager
+            .request_tx
+            .send(ManagerRequest::NewSinkWriter(writer))
+            .await
+            .unwrap();
+        let status = response_rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 2);
+
+        allow_exit.notify_one();
+        recovery_task.await.unwrap();
+    }
+
+    struct MockSinglePhaseCoordinator<
+        C,
+        F: FnMut(u64, Vec<SinkMetadata>, &mut C) -> Result<(), SinkError>,
+    > {
         context: C,
         f: F,
     }
 
-    impl<C, F: FnMut(u64, Vec<SinkMetadata>, &mut C) -> Result<(), SinkError>> MockCoordinator<C, F> {
-        fn new(context: C, f: F) -> Self {
-            MockCoordinator { context, f }
+    impl<
+        C: Send + 'static,
+        F: FnMut(u64, Vec<SinkMetadata>, &mut C) -> Result<(), SinkError> + Send + 'static,
+    > MockSinglePhaseCoordinator<C, F>
+    {
+        fn new_coordinator(context: C, f: F) -> SinkCommitCoordinator {
+            SinkCommitCoordinator::SinglePhase(Box::new(MockSinglePhaseCoordinator { context, f }))
         }
     }
 
     #[async_trait]
     impl<C: Send, F: FnMut(u64, Vec<SinkMetadata>, &mut C) -> Result<(), SinkError> + Send>
-        SinkCommitCoordinator for MockCoordinator<C, F>
+        SinglePhaseCommitCoordinator for MockSinglePhaseCoordinator<C, F>
     {
         async fn init(&mut self) -> risingwave_connector::sink::Result<()> {
             Ok(())
         }
 
-        async fn commit(
+        async fn commit_data(
             &mut self,
             epoch: u64,
             metadata: Vec<SinkMetadata>,
         ) -> risingwave_connector::sink::Result<()> {
             (self.f)(epoch, metadata, &mut self.context)
         }
+
+        async fn commit_schema_change(
+            &mut self,
+            _epoch: u64,
+            _schema_change: PbSinkSchemaChange,
+        ) -> risingwave_connector::sink::Result<()> {
+            unreachable!()
+        }
     }
 
     #[tokio::test]
     async fn test_basic() {
+        let db = prepare_db_backend().await;
+
         let param = SinkParam {
             sink_id: SinkId::from(1),
             sink_name: "test".into(),
             properties: Default::default(),
             columns: vec![],
-            downstream_pk: vec![],
+            downstream_pk: None,
             sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch0 = 232;
+        let epoch1 = 233;
+        let epoch2 = 234;
+
+        let mut all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        all_vnode.shuffle(&mut rand::rng());
+        let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 2);
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode1 = build_bitmap(first);
+        let vnode2 = build_bitmap(second);
+
+        let metadata = [
+            [vec![1u8, 2u8], vec![3u8, 4u8]],
+            [vec![5u8, 6u8], vec![7u8, 8u8]],
+        ];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let metadata = metadata.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let metadata = metadata.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockSinglePhaseCoordinator::new_coordinator(
+                                    0,
+                                    move |epoch, metadata_list, count: &mut usize| {
+                                        *count += 1;
+                                        let mut metadata_list =
+                                            metadata_list
+                                                .into_iter()
+                                                .map(|metadata| match metadata {
+                                                    SinkMetadata {
+                                                        metadata:
+                                                            Some(Metadata::Serialized(
+                                                                SerializedMetadata { metadata },
+                                                            )),
+                                                    } => metadata,
+                                                    _ => unreachable!(),
+                                                })
+                                                .collect_vec();
+                                        metadata_list.sort();
+                                        match *count {
+                                            1 => {
+                                                assert_eq!(epoch, epoch1);
+                                                assert_eq!(2, metadata_list.len());
+                                                assert_eq!(metadata[0][0], metadata_list[0]);
+                                                assert_eq!(metadata[0][1], metadata_list[1]);
+                                            }
+                                            2 => {
+                                                assert_eq!(epoch, epoch2);
+                                                assert_eq!(2, metadata_list.len());
+                                                assert_eq!(metadata[1][0], metadata_list[0]);
+                                                assert_eq!(metadata[1][1], metadata_list[1]);
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let (mut client1, mut client2) =
+            join(build_client(vnode1), pin!(build_client(vnode2))).await;
+
+        let (aligned_epoch1, aligned_epoch2) = try_join(
+            client1.align_initial_epoch(epoch0),
+            client2.align_initial_epoch(epoch1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(aligned_epoch1, epoch1);
+        assert_eq!(aligned_epoch2, epoch1);
+
+        {
+            // commit epoch1
+            let mut commit_future = pin!(
+                client2
+                    .commit(
+                        epoch1,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata[0][1].clone(),
+                            })),
+                        },
+                        None,
+                    )
+                    .map(|result| result.unwrap())
+            );
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            join(
+                commit_future,
+                client1
+                    .commit(
+                        epoch1,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata[0][0].clone(),
+                            })),
+                        },
+                        None,
+                    )
+                    .map(|result| result.unwrap()),
+            )
+            .await;
+        }
+
+        // commit epoch2
+        let mut commit_future = pin!(
+            client1
+                .commit(
+                    epoch2,
+                    SinkMetadata {
+                        metadata: Some(Metadata::Serialized(SerializedMetadata {
+                            metadata: metadata[1][0].clone(),
+                        })),
+                    },
+                    None,
+                )
+                .map(|result| result.unwrap())
+        );
+        assert!(
+            poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        join(
+            commit_future,
+            client2
+                .commit(
+                    epoch2,
+                    SinkMetadata {
+                        metadata: Some(Metadata::Serialized(SerializedMetadata {
+                            metadata: metadata[1][1].clone(),
+                        })),
+                    },
+                    None,
+                )
+                .map(|result| result.unwrap()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_single_writer() {
+        let db = prepare_db_backend().await;
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
             format_desc: None,
             db_name: "test".into(),
             sink_from_name: "test".into(),
@@ -414,11 +1093,395 @@ mod tests {
         let epoch1 = 233;
         let epoch2 = 234;
 
-        let mut all_vnode = (0..VirtualNode::COUNT).collect_vec();
-        all_vnode.shuffle(&mut rand::thread_rng());
-        let (first, second) = all_vnode.split_at(VirtualNode::COUNT / 2);
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
         let build_bitmap = |indexes: &[usize]| {
-            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT);
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = [vec![1u8, 2u8], vec![3u8, 4u8]];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
+            })
+        };
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let metadata = metadata.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let metadata = metadata.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockSinglePhaseCoordinator::new_coordinator(
+                                    0,
+                                    move |epoch, metadata_list, count: &mut usize| {
+                                        *count += 1;
+                                        let mut metadata_list =
+                                            metadata_list
+                                                .into_iter()
+                                                .map(|metadata| match metadata {
+                                                    SinkMetadata {
+                                                        metadata:
+                                                            Some(Metadata::Serialized(
+                                                                SerializedMetadata { metadata },
+                                                            )),
+                                                    } => metadata,
+                                                    _ => unreachable!(),
+                                                })
+                                                .collect_vec();
+                                        metadata_list.sort();
+                                        match *count {
+                                            1 => {
+                                                assert_eq!(epoch, epoch1);
+                                                assert_eq!(1, metadata_list.len());
+                                                assert_eq!(metadata[0], metadata_list[0]);
+                                            }
+                                            2 => {
+                                                assert_eq!(epoch, epoch2);
+                                                assert_eq!(1, metadata_list.len());
+                                                assert_eq!(metadata[1], metadata_list[0]);
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let mut client = build_client(vnode).await;
+
+        let aligned_epoch = client.align_initial_epoch(epoch1).await.unwrap();
+        assert_eq!(aligned_epoch, epoch1);
+
+        client
+            .commit(
+                epoch1,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata[0].clone(),
+                    })),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        client
+            .commit(
+                epoch2,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata[1].clone(),
+                    })),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_partial_commit() {
+        let db = prepare_db_backend().await;
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch = 233;
+
+        let mut all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        all_vnode.shuffle(&mut rand::rng());
+        let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 2);
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode1 = build_bitmap(first);
+        let vnode2 = build_bitmap(second);
+
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
+            })
+        };
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param,
+                                new_writer_rx,
+                                MockSinglePhaseCoordinator::new_coordinator(
+                                    (),
+                                    |_, _, _| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let (mut client1, client2) = join(build_client(vnode1), build_client(vnode2)).await;
+
+        // commit epoch
+        let mut commit_future = pin!(client1.commit(
+            epoch,
+            SinkMetadata {
+                metadata: Some(Metadata::Serialized(SerializedMetadata {
+                    metadata: vec![],
+                })),
+            },
+            None,
+        ));
+        assert!(
+            poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(client2);
+        assert!(commit_future.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fail_commit() {
+        let db = prepare_db_backend().await;
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch = 233;
+
+        let mut all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        all_vnode.shuffle(&mut rand::rng());
+        let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 2);
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode1 = build_bitmap(first);
+        let vnode2 = build_bitmap(second);
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
+            })
+        };
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        {
+                            async move {
+                                // validate the start request
+                                assert_eq!(param, expected_param);
+                                CoordinatorWorker::execute_coordinator(
+                                    db,
+                                    param,
+                                    new_writer_rx,
+                                    MockSinglePhaseCoordinator::new_coordinator((), |_, _, _| {
+                                        Err(SinkError::Coordinator(anyhow!("failed to commit")))
+                                    }),
+                                    subscriber.clone(),
+                                )
+                                .await;
+                            }
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let (mut client1, mut client2) = join(build_client(vnode1), build_client(vnode2)).await;
+
+        // commit epoch
+        let mut commit_future = pin!(client1.commit(
+            epoch,
+            SinkMetadata {
+                metadata: Some(Metadata::Serialized(SerializedMetadata {
+                    metadata: vec![],
+                })),
+            },
+            None,
+        ));
+        assert!(
+            poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let (result1, result2) = join(
+            commit_future,
+            client2.commit(
+                epoch,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: vec![],
+                    })),
+                },
+                None,
+            ),
+        )
+        .await;
+        assert!(result1.is_err());
+        assert!(result2.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_vnode_bitmap() {
+        let db = prepare_db_backend().await;
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch1 = 233;
+        let epoch2 = 234;
+        let epoch3 = 235;
+        let epoch4 = 236;
+
+        let mut all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        all_vnode.shuffle(&mut rand::rng());
+        let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 2);
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
             for i in indexes {
                 builder.set(*i, true);
             }
@@ -432,53 +1495,79 @@ mod tests {
             [vec![5u8, 6u8], vec![7u8, 8u8]],
         ];
 
+        let metadata_scale_out = [vec![9u8, 10u8], vec![11u8, 12u8], vec![13u8, 14u8]];
+        let metadata_scale_in = [vec![13u8, 14u8], vec![15u8, 16u8]];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
+            })
+        };
         let (manager, (_join_handle, _stop_tx)) =
             SinkCoordinatorManager::start_worker_with_spawn_worker({
-                let param = param.clone();
+                let expected_param = param.clone();
                 let metadata = metadata.clone();
-                move |first_request: NewSinkWriterRequest, new_writer_rx| {
-                    let param = param.clone();
+                let metadata_scale_out = metadata_scale_out.clone();
+                let metadata_scale_in = metadata_scale_in.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
                     let metadata = metadata.clone();
-                    tokio::spawn(async move {
-                        // validate the start request
-                        assert_eq!(first_request.param, param);
-                        CoordinatorWorker::execute_coordinator(
-                            first_request,
-                            new_writer_rx,
-                            MockCoordinator::new(0, |epoch, metadata_list, count: &mut usize| {
-                                *count += 1;
-                                let mut metadata_list = metadata_list
-                                    .into_iter()
-                                    .map(|metadata| match metadata {
-                                        SinkMetadata {
-                                            metadata:
-                                                Some(Metadata::Serialized(SerializedMetadata {
-                                                    metadata,
-                                                })),
-                                        } => metadata,
-                                        _ => unreachable!(),
-                                    })
-                                    .collect_vec();
-                                metadata_list.sort();
-                                match *count {
-                                    1 => {
-                                        assert_eq!(epoch, epoch1);
-                                        assert_eq!(2, metadata_list.len());
-                                        assert_eq!(metadata[0][0], metadata_list[0]);
-                                        assert_eq!(metadata[0][1], metadata_list[1]);
-                                    }
-                                    2 => {
-                                        assert_eq!(epoch, epoch2);
-                                        assert_eq!(2, metadata_list.len());
-                                        assert_eq!(metadata[1][0], metadata_list[0]);
-                                        assert_eq!(metadata[1][1], metadata_list[1]);
-                                    }
-                                    _ => unreachable!(),
-                                }
-                                Ok(())
-                            }),
-                        )
-                        .await;
+                    let metadata_scale_out = metadata_scale_out.clone();
+                    let metadata_scale_in = metadata_scale_in.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockSinglePhaseCoordinator::new_coordinator(
+                                    0,
+                                    move |epoch, metadata_list, count: &mut usize| {
+                                        *count += 1;
+                                        let mut metadata_list =
+                                            metadata_list
+                                                .into_iter()
+                                                .map(|metadata| match metadata {
+                                                    SinkMetadata {
+                                                        metadata:
+                                                            Some(Metadata::Serialized(
+                                                                SerializedMetadata { metadata },
+                                                            )),
+                                                    } => metadata,
+                                                    _ => unreachable!(),
+                                                })
+                                                .collect_vec();
+                                        metadata_list.sort();
+                                        let (expected_epoch, expected_metadata_list) = match *count
+                                        {
+                                            1 => (epoch1, metadata[0].as_slice()),
+                                            2 => (epoch2, metadata[1].as_slice()),
+                                            3 => (epoch3, metadata_scale_out.as_slice()),
+                                            4 => (epoch4, metadata_scale_in.as_slice()),
+                                            _ => unreachable!(),
+                                        };
+                                        assert_eq!(expected_epoch, epoch);
+                                        assert_eq!(expected_metadata_list, &metadata_list);
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
                     })
                 }
             });
@@ -494,33 +1583,42 @@ mod tests {
                 ))
             })
             .await
-            .unwrap()
         };
 
-        let mut build_client_future1 = pin!(build_client(vnode1));
-        assert!(
-            poll_fn(|cx| Poll::Ready(build_client_future1.as_mut().poll(cx)))
+        let ((mut client1, _), (mut client2, _)) =
+            try_join(build_client(vnode1), pin!(build_client(vnode2)))
                 .await
-                .is_pending()
-        );
-        let (mut client1, mut client2) =
-            join(build_client_future1, pin!(build_client(vnode2))).await;
+                .unwrap();
+
+        let (aligned_epoch1, aligned_epoch2) = try_join(
+            client1.align_initial_epoch(epoch1),
+            client2.align_initial_epoch(epoch1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(aligned_epoch1, epoch1);
+        assert_eq!(aligned_epoch2, epoch1);
 
         {
             // commit epoch1
-            let mut commit_future = pin!(client2
-                .commit(
-                    epoch1,
-                    SinkMetadata {
-                        metadata: Some(Metadata::Serialized(SerializedMetadata {
-                            metadata: metadata[0][1].clone(),
-                        })),
-                    },
-                )
-                .map(|result| result.unwrap()));
-            assert!(poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
-                .await
-                .is_pending());
+            let mut commit_future = pin!(
+                client2
+                    .commit(
+                        epoch1,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata[0][1].clone(),
+                            })),
+                        },
+                        None,
+                    )
+                    .map(|result| result.unwrap())
+            );
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
             join(
                 commit_future,
                 client1
@@ -531,62 +1629,377 @@ mod tests {
                                 metadata: metadata[0][0].clone(),
                             })),
                         },
+                        None,
                     )
                     .map(|result| result.unwrap()),
             )
             .await;
         }
 
-        // commit epoch2
-        let mut commit_future = pin!(client1
-            .commit(
-                epoch2,
+        let (vnode1, vnode2, vnode3) = {
+            let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 3);
+            let (second, third) = second.split_at(VirtualNode::COUNT_FOR_TEST / 3);
+            (
+                build_bitmap(first),
+                build_bitmap(second),
+                build_bitmap(third),
+            )
+        };
+
+        let mut build_client3_future = pin!(build_client(vnode3));
+        assert!(
+            poll_fn(|cx| Poll::Ready(build_client3_future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let mut client3;
+        {
+            {
+                // commit epoch2
+                let mut commit_future = pin!(
+                    client1
+                        .commit(
+                            epoch2,
+                            SinkMetadata {
+                                metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                    metadata: metadata[1][0].clone(),
+                                })),
+                            },
+                            None,
+                        )
+                        .map_err(Into::into)
+                );
+                assert!(
+                    poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                try_join(
+                    commit_future,
+                    client2.commit(
+                        epoch2,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata[1][1].clone(),
+                            })),
+                        },
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+
+            client3 = {
+                let (
+                    (client3, init_epoch),
+                    (update_vnode_bitmap_epoch1, update_vnode_bitmap_epoch2),
+                ) = try_join(
+                    build_client3_future,
+                    try_join(
+                        client1.update_vnode_bitmap(&vnode1),
+                        client2.update_vnode_bitmap(&vnode2),
+                    )
+                    .map_err(Into::into),
+                )
+                .await
+                .unwrap();
+                assert_eq!(init_epoch, Some(epoch2));
+                assert_eq!(update_vnode_bitmap_epoch1, epoch2);
+                assert_eq!(update_vnode_bitmap_epoch2, epoch2);
+                client3
+            };
+            let mut commit_future3 = pin!(client3.commit(
+                epoch3,
                 SinkMetadata {
                     metadata: Some(Metadata::Serialized(SerializedMetadata {
-                        metadata: metadata[1][0].clone(),
+                        metadata: metadata_scale_out[2].clone(),
                     })),
                 },
-            )
-            .map(|result| result.unwrap()));
-        assert!(poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
-            .await
-            .is_pending());
-        join(
-            commit_future,
-            client2
-                .commit(
-                    epoch2,
+                None,
+            ));
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future3.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let mut commit_future1 = pin!(client1.commit(
+                epoch3,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata_scale_out[0].clone(),
+                    })),
+                },
+                None,
+            ));
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future1.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future3.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            try_join(
+                client2.commit(
+                    epoch3,
                     SinkMetadata {
                         metadata: Some(Metadata::Serialized(SerializedMetadata {
-                            metadata: metadata[1][1].clone(),
+                            metadata: metadata_scale_out[1].clone(),
                         })),
                     },
+                    None,
+                ),
+                try_join(commit_future1, commit_future3),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (vnode2, vnode3) = {
+            let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 3);
+            (build_bitmap(first), build_bitmap(second))
+        };
+
+        {
+            let (_, (update_vnode_bitmap_epoch2, update_vnode_bitmap_epoch3)) = try_join(
+                client1.stop(),
+                try_join(
+                    client2.update_vnode_bitmap(&vnode2),
+                    client3.update_vnode_bitmap(&vnode3),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(update_vnode_bitmap_epoch2, epoch3);
+            assert_eq!(update_vnode_bitmap_epoch3, epoch3);
+        }
+
+        {
+            let mut commit_future = pin!(
+                client2
+                    .commit(
+                        epoch4,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata_scale_in[0].clone(),
+                            })),
+                        },
+                        None,
+                    )
+                    .map(|result| result.unwrap())
+            );
+            assert!(
+                poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            join(
+                commit_future,
+                client3
+                    .commit(
+                        epoch4,
+                        SinkMetadata {
+                            metadata: Some(Metadata::Serialized(SerializedMetadata {
+                                metadata: metadata_scale_in[1].clone(),
+                            })),
+                        },
+                        None,
+                    )
+                    .map(|result| result.unwrap()),
+            )
+            .await;
+        }
+    }
+
+    struct MockTwoPhaseCoordinator<
+        P: FnMut(
+            u64,
+            Vec<SinkMetadata>,
+            Option<PbSinkSchemaChange>,
+        ) -> Result<Option<Vec<u8>>, SinkError>,
+        CD: FnMut(u64, Vec<u8>) -> Result<(), SinkError>,
+        CS: FnMut(u64, PbSinkSchemaChange) -> Result<(), SinkError>,
+    > {
+        pre_commit: P,
+        commit_data: CD,
+        commit_schema_change: CS,
+    }
+
+    impl<
+        P: FnMut(
+                u64,
+                Vec<SinkMetadata>,
+                Option<PbSinkSchemaChange>,
+            ) -> Result<Option<Vec<u8>>, SinkError>
+            + Send
+            + 'static,
+        CD: FnMut(u64, Vec<u8>) -> Result<(), SinkError> + Send + 'static,
+        CS: FnMut(u64, PbSinkSchemaChange) -> Result<(), SinkError> + Send + 'static,
+    > MockTwoPhaseCoordinator<P, CD, CS>
+    {
+        fn new_coordinator(
+            pre_commit: P,
+            commit_data: CD,
+            commit_schema_change: CS,
+        ) -> SinkCommitCoordinator {
+            SinkCommitCoordinator::TwoPhase(Box::new(MockTwoPhaseCoordinator {
+                pre_commit,
+                commit_data,
+                commit_schema_change,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl<
+        P: FnMut(
+                u64,
+                Vec<SinkMetadata>,
+                Option<PbSinkSchemaChange>,
+            ) -> Result<Option<Vec<u8>>, SinkError>
+            + Send
+            + 'static,
+        CD: FnMut(u64, Vec<u8>) -> Result<(), SinkError> + Send + 'static,
+        CS: FnMut(u64, PbSinkSchemaChange) -> Result<(), SinkError> + Send + 'static,
+    > TwoPhaseCommitCoordinator for MockTwoPhaseCoordinator<P, CD, CS>
+    {
+        async fn init(&mut self) -> risingwave_connector::sink::Result<()> {
+            Ok(())
+        }
+
+        async fn pre_commit(
+            &mut self,
+            epoch: u64,
+            metadata: Vec<SinkMetadata>,
+            schema_change: Option<PbSinkSchemaChange>,
+        ) -> risingwave_connector::sink::Result<Option<Vec<u8>>> {
+            (self.pre_commit)(epoch, metadata, schema_change)
+        }
+
+        async fn commit_data(
+            &mut self,
+            epoch: u64,
+            commit_metadata: Vec<u8>,
+        ) -> risingwave_connector::sink::Result<()> {
+            (self.commit_data)(epoch, commit_metadata)
+        }
+
+        async fn commit_schema_change(
+            &mut self,
+            epoch: u64,
+            schema_change: PbSinkSchemaChange,
+        ) -> risingwave_connector::sink::Result<()> {
+            (self.commit_schema_change)(epoch, schema_change)
+        }
+
+        async fn abort(&mut self, _epoch: u64, _commit_metadata: Vec<u8>) {
+            tracing::debug!("abort called");
+        }
+    }
+
+    async fn prepare_db_backend() -> DatabaseConnection {
+        let db: DatabaseConnection = Database::connect("sqlite::memory:").await.unwrap();
+        let ddl = "
+            CREATE TABLE IF NOT EXISTS pending_sink_state (
+                sink_id i32 NOT NULL,
+                epoch i64 NOT NULL,
+                sink_state STRING NOT NULL,
+                metadata BLOB,
+                schema_change BLOB,
+                PRIMARY KEY (sink_id, epoch)
+            )
+        ";
+        db.execute(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            ddl.to_owned(),
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn list_rows(
+        db: &DatabaseConnection,
+    ) -> Vec<(
+        i32,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        Option<PbSinkSchemaChange>,
+    )> {
+        let sql =
+            "SELECT sink_id, epoch, sink_state, metadata, schema_change FROM pending_sink_state";
+        let rows = db
+            .query_all(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                sql.to_owned(),
+            ))
+            .await
+            .unwrap();
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.try_get("", "sink_id").unwrap(),
+                    row.try_get("", "epoch").unwrap(),
+                    row.try_get("", "sink_state").unwrap(),
+                    row.try_get("", "metadata").unwrap(),
+                    row.try_get::<Option<SinkSchemachange>>("", "schema_change")
+                        .unwrap()
+                        .map(|v| v.to_protobuf()),
                 )
-                .map(|result| result.unwrap()),
-        )
-        .await;
+            })
+            .collect()
+    }
+
+    async fn set_epoch_aborted(db: &DatabaseConnection, sink_id: SinkId, epoch: u64) {
+        let sql = format!(
+            "UPDATE pending_sink_state SET sink_state = 'ABORTED' WHERE sink_id = {} AND epoch = {}",
+            sink_id, epoch as i64
+        );
+        db.execute(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            sql,
+        ))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn test_single_writer() {
+    async fn test_init_response_skips_recovered_empty_pending_epoch() {
+        let db = prepare_db_backend().await;
+
         let param = SinkParam {
             sink_id: SinkId::from(1),
             sink_name: "test".into(),
             properties: Default::default(),
             columns: vec![],
-            downstream_pk: vec![],
+            downstream_pk: None,
             sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
             format_desc: None,
             db_name: "test".into(),
             sink_from_name: "test".into(),
         };
 
         let epoch1 = 233;
-        let epoch2 = 234;
 
-        let all_vnode = (0..VirtualNode::COUNT).collect_vec();
+        let sql = format!(
+            "INSERT INTO pending_sink_state (sink_id, epoch, sink_state) VALUES ({}, {}, 'PENDING')",
+            param.sink_id, epoch1
+        );
+        db.execute(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            sql,
+        ))
+        .await
+        .unwrap();
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
         let build_bitmap = |indexes: &[usize]| {
-            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT);
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
             for i in indexes {
                 builder.set(*i, true);
             }
@@ -594,53 +2007,321 @@ mod tests {
         };
         let vnode = build_bitmap(&all_vnode);
 
-        let metadata = [vec![1u8, 2u8], vec![3u8, 4u8]];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (epoch_sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(epoch_sender);
+                    Ok((epoch1, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let pre_commit_attempt = Arc::new(AtomicI32::new(0));
+        let commit_attempt = Arc::new(AtomicI32::new(0));
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let db = db.clone();
+                let pre_commit_attempt = pre_commit_attempt.clone();
+                let commit_attempt = commit_attempt.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    let pre_commit_attempt = pre_commit_attempt.clone();
+                    let commit_attempt = commit_attempt.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, _metadata_list, _schema_change| {
+                                        pre_commit_attempt.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                        Err(SinkError::Coordinator(anyhow!(
+                                            "pre_commit should not be called for a known pending epoch"
+                                        )))
+                                    },
+                                    move |_epoch, _commit_metadata| {
+                                        commit_attempt
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        Ok(())
+                                    },
+                                    move |_epoch, _schema_change| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let (_client, log_store_rewind_start_epoch) =
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(log_store_rewind_start_epoch, Some(epoch1));
+
+        for _ in 0..50 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let rows = list_rows(&db).await;
+            if rows[0].2 == "COMMITTED" {
+                break;
+            }
+        }
+
+        assert_eq!(
+            pre_commit_attempt.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(commit_attempt.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let rows = list_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, epoch1 as i64);
+        assert_eq!(rows[0].2, "COMMITTED");
+        assert_eq!(rows[0].3, None);
+    }
+
+    /// After a replace job finishes, recovery builds the coordinator from writers that already have
+    /// the new schema, while the schema change can still be pending in the meta store. The pending
+    /// change must be committed before any writer receives its start response, because writers
+    /// validate the sink table against their new schema once they start.
+    #[tokio::test]
+    async fn test_recovered_schema_change_committed_before_writer_start() {
+        let db = prepare_db_backend().await;
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch1 = 233;
+        let metadata = vec![1u8, 2u8];
+        let schema_change = PbSinkSchemaChange {
+            original_schema: vec![PbField {
+                data_type: Some(PbDataType {
+                    type_name: PbTypeName::Int32 as i32,
+                    ..Default::default()
+                }),
+                name: "col_v1".into(),
+            }],
+            op: Some(SinkSchemachangeOp::AddColumns(PbSinkAddColumnsOp {
+                fields: vec![PbField {
+                    data_type: Some(PbDataType {
+                        type_name: PbTypeName::Varchar as i32,
+                        ..Default::default()
+                    }),
+                    name: "new_col".into(),
+                }],
+            })),
+        };
+        crate::manager::exactly_once_util::persist_pre_commit_metadata(
+            &db,
+            param.sink_id,
+            epoch1,
+            Some(metadata.clone()),
+            Some(&schema_change),
+        )
+        .await
+        .unwrap();
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+        for i in all_vnode {
+            builder.set(i, true);
+        }
+        let vnode = builder.finish();
+
+        // Keep the sender alive so that the coordinator keeps waiting for new committed epochs.
+        let epoch_sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = Arc::new(move |_sink_id: SinkId| {
+            let (sender, receiver) = unbounded_channel();
+            let epoch_sender = epoch_sender.clone();
+            async move {
+                *epoch_sender.lock().await = Some(sender);
+                Ok((epoch1, receiver))
+            }
+            .boxed()
+        });
+
+        let commits = Arc::new(std::sync::Mutex::new(vec![]));
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let db = db.clone();
+                let commits = commits.clone();
+                move |param, new_writer_rx| {
+                    let db = db.clone();
+                    let metadata = metadata.clone();
+                    let schema_change = schema_change.clone();
+                    let data_commits = commits.clone();
+                    let schema_change_commits = commits.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param,
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, _metadata_list, _schema_change| {
+                                        Err(SinkError::Coordinator(anyhow!(
+                                            "pre_commit should not be called for a recovered pending epoch"
+                                        )))
+                                    },
+                                    move |epoch, commit_metadata| {
+                                        assert_eq!(epoch, epoch1);
+                                        assert_eq!(commit_metadata, metadata);
+                                        data_commits.lock().unwrap().push("data");
+                                        Ok(())
+                                    },
+                                    move |epoch, committed_schema_change| {
+                                        assert_eq!(epoch, epoch1);
+                                        assert_eq!(committed_schema_change, schema_change);
+                                        let mut commits = schema_change_commits.lock().unwrap();
+                                        // Fail the first attempt so that a writer started before
+                                        // the retry would observe an uncommitted schema change.
+                                        if !commits.contains(&"schema_change_failed") {
+                                            commits.push("schema_change_failed");
+                                            return Err(SinkError::Coordinator(anyhow!(
+                                                "injected schema change commit failure"
+                                            )));
+                                        }
+                                        commits.push("schema_change");
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let (_client, log_store_rewind_start_epoch) =
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(log_store_rewind_start_epoch, Some(epoch1));
+        assert_eq!(
+            *commits.lock().unwrap(),
+            vec!["data", "schema_change_failed", "data", "schema_change"]
+        );
+        let rows = list_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, epoch1 as i64);
+        assert_eq!(rows[0].2, "COMMITTED");
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_failed() {
+        let db = prepare_db_backend().await;
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch1 = 233;
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = vec![1u8, 2u8];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((epoch1, receiver))
+                }
+                .boxed()
+            })
+        };
 
         let (manager, (_join_handle, _stop_tx)) =
             SinkCoordinatorManager::start_worker_with_spawn_worker({
-                let param = param.clone();
-                let metadata = metadata.clone();
-                move |first_request: NewSinkWriterRequest, new_writer_rx| {
-                    let param = param.clone();
-                    let metadata = metadata.clone();
-                    tokio::spawn(async move {
-                        // validate the start request
-                        assert_eq!(first_request.param, param);
-                        CoordinatorWorker::execute_coordinator(
-                            first_request,
-                            new_writer_rx,
-                            MockCoordinator::new(0, |epoch, metadata_list, count: &mut usize| {
-                                *count += 1;
-                                let mut metadata_list = metadata_list
-                                    .into_iter()
-                                    .map(|metadata| match metadata {
-                                        SinkMetadata {
-                                            metadata:
-                                                Some(Metadata::Serialized(SerializedMetadata {
-                                                    metadata,
-                                                })),
-                                        } => metadata,
-                                        _ => unreachable!(),
-                                    })
-                                    .collect_vec();
-                                metadata_list.sort();
-                                match *count {
-                                    1 => {
-                                        assert_eq!(epoch, epoch1);
-                                        assert_eq!(1, metadata_list.len());
-                                        assert_eq!(metadata[0], metadata_list[0]);
-                                    }
-                                    2 => {
-                                        assert_eq!(epoch, epoch2);
-                                        assert_eq!(1, metadata_list.len());
-                                        assert_eq!(metadata[1], metadata_list[0]);
-                                    }
-                                    _ => unreachable!(),
-                                }
-                                Ok(())
-                            }),
-                        )
-                        .await;
+                let expected_param = param.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, _metadata_list, _schema_change| {
+                                        Err(SinkError::Coordinator(anyhow!("failed to pre commit")))
+                                    },
+                                    move |_epoch, _commit_metadata| unreachable!(),
+                                    move |_epoch, _schema_change| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
                     })
                 }
             });
@@ -657,56 +2338,418 @@ mod tests {
             })
             .await
             .unwrap()
+            .0
         };
 
         let mut client = build_client(vnode).await;
+
+        let aligned_epoch = client.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
+
+        let commit_result = client
+            .commit(
+                epoch1,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata.clone(),
+                    })),
+                },
+                None,
+            )
+            .await;
+        assert!(commit_result.is_err());
+
+        let rows = list_rows(&db).await;
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_empty_pre_commit_waiting_on_checkpoint() {
+        let db = prepare_db_backend().await;
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch0 = 232;
+        let epoch1 = 233;
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = vec![1u8, 2u8];
+
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((epoch0, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, metadata_list, _schema_change| {
+                                        assert_eq!(metadata_list.len(), 1);
+                                        Ok(None)
+                                    },
+                                    move |_epoch, _commit_metadata| unreachable!(),
+                                    move |_epoch, _schema_change| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let mut client = build_client(vnode).await;
+
+        let aligned_epoch = client.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
 
         client
             .commit(
                 epoch1,
                 SinkMetadata {
                     metadata: Some(Metadata::Serialized(SerializedMetadata {
-                        metadata: metadata[0].clone(),
+                        metadata: metadata.clone(),
                     })),
                 },
+                None,
             )
             .await
             .unwrap();
+
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "PENDING");
+            assert_eq!(rows[0].3, None);
+
+            let guard = sender.lock().await;
+            let sender = guard.as_ref().unwrap().clone();
+            sender.send(epoch1).unwrap();
+        }
+
+        // wait max 5 seconds for the commit to be processed
+        for _ in 0..50 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let rows = list_rows(&db).await;
+            if rows[0].2 == "COMMITTED" {
+                break;
+            }
+        }
+
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "COMMITTED");
+            assert_eq!(rows[0].3, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_retry_loop() {
+        let db = prepare_db_backend().await;
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch1 = 233;
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = vec![1u8, 2u8];
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((epoch1, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let commit_attempt = Arc::new(AtomicI32::new(0));
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let metadata = metadata.clone();
+                let db = db.clone();
+                let commit_attempt = commit_attempt.clone();
+                move |param, new_writer_rx| {
+                    let metadata = metadata.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    let commit_attempt = commit_attempt.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, metadata_list, _schema_change| {
+                                        let metadata =
+                                            Itertools::exactly_one(metadata_list.into_iter())
+                                                .unwrap();
+                                        Ok(match metadata.metadata {
+                                            Some(Metadata::Serialized(SerializedMetadata {
+                                                metadata,
+                                            })) => Some(metadata),
+                                            _ => unreachable!(),
+                                        })
+                                    },
+                                    move |_epoch, commit_metadata| {
+                                        assert_eq!(commit_metadata, metadata);
+                                        if commit_attempt
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                            < 2
+                                        {
+                                            Err(SinkError::Coordinator(anyhow!("failed to commit")))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    },
+                                    move |_epoch, _schema_change| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let mut client = build_client(vnode).await;
+
+        let aligned_epoch = client.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
 
         client
             .commit(
-                epoch2,
+                epoch1,
                 SinkMetadata {
                     metadata: Some(Metadata::Serialized(SerializedMetadata {
-                        metadata: metadata[1].clone(),
+                        metadata: metadata.clone(),
                     })),
                 },
+                None,
             )
             .await
             .unwrap();
+
+        // wait max 10 seconds for the commit to be processed
+        for _ in 0..100 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let rows = list_rows(&db).await;
+            if rows[0].2 == "COMMITTED" {
+                break;
+            }
+        }
+
+        assert_eq!(commit_attempt.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "COMMITTED");
+        }
     }
 
     #[tokio::test]
-    async fn test_drop_sink_while_init() {
-        let sink_id = SinkId::from(1);
+    async fn test_aborted() {
+        let db = prepare_db_backend().await;
+
         let param = SinkParam {
-            sink_id,
+            sink_id: SinkId::from(1),
             sink_name: "test".into(),
             properties: Default::default(),
             columns: vec![],
-            downstream_pk: vec![],
+            downstream_pk: None,
             sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
             format_desc: None,
             db_name: "test".into(),
             sink_from_name: "test".into(),
         };
 
-        let (manager, (_join_handle, _stop_tx)) = SinkCoordinatorManager::start_worker();
+        let epoch0 = 232;
+        let epoch1 = 233;
 
-        let mut build_client_future1 = pin!(CoordinatorStreamHandle::new_with_init_stream(
-            param.to_proto(),
-            Bitmap::zeros(VirtualNode::COUNT),
-            |rx| async {
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = vec![1u8, 2u8];
+
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((epoch0, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let metadata = metadata.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let metadata = metadata.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            // validate the start request
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, metadata_list, _schema_change| {
+                                        let metadata =
+                                            Itertools::exactly_one(metadata_list.into_iter())
+                                                .unwrap();
+                                        Ok(match metadata.metadata {
+                                            Some(Metadata::Serialized(SerializedMetadata {
+                                                metadata,
+                                            })) => Some(metadata),
+                                            _ => unreachable!(),
+                                        })
+                                    },
+                                    move |_epoch, commit_metadata| {
+                                        assert_eq!(commit_metadata, metadata);
+                                        Ok(())
+                                    },
+                                    move |_epoch, _schema_change| unreachable!(),
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
                 Ok(tonic::Response::new(
                     manager
                         .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
@@ -714,187 +2757,245 @@ mod tests {
                         .unwrap()
                         .boxed(),
                 ))
-            },
-        ));
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let mut client = build_client(vnode.clone()).await;
+
+        let aligned_epoch = client.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
+
+        client
+            .commit(
+                epoch1,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata.clone(),
+                    })),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        manager
+            .stop_sink_coordinators_for_jobs(vec![JobId::from(1)])
+            .await;
+
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "PENDING");
+
+            set_epoch_aborted(&db, SinkId::from(1), epoch1).await;
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "ABORTED");
+        }
+
+        let mut client = build_client(vnode).await;
+
+        let aligned_epoch = client.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
+
+        {
+            let rows = list_rows(&db).await;
+            assert!(rows.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flush_when_reschedule() {
+        let db = prepare_db_backend().await;
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: Default::default(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let epoch0 = 232;
+        let epoch1 = 233;
+
+        let all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode = build_bitmap(&all_vnode);
+
+        let metadata = vec![1u8, 2u8];
+        let schema_change = PbSinkSchemaChange {
+            original_schema: vec![PbField {
+                data_type: Some(PbDataType {
+                    type_name: PbTypeName::Int32 as i32,
+                    ..Default::default()
+                }),
+                name: "col_v1".into(),
+            }],
+            op: Some(SinkSchemachangeOp::AddColumns(PbSinkAddColumnsOp {
+                fields: vec![PbField {
+                    data_type: Some(PbDataType {
+                        type_name: PbTypeName::Varchar as i32,
+                        ..Default::default()
+                    }),
+                    name: "new_col".into(),
+                }],
+            })),
+        };
+
+        let sender = Arc::new(tokio::sync::Mutex::new(None));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
+            Arc::new(move |_sink_id: SinkId| {
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((epoch0, receiver))
+                }
+                .boxed()
+            })
+        };
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let metadata = metadata.clone();
+                let schema_change = schema_change.clone();
+                let db = db.clone();
+                move |param, new_writer_rx| {
+                    let metadata = metadata.clone();
+                    let schema_change_for_pre_commit = schema_change.clone();
+                    let schema_change_for_commit = schema_change.clone();
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockTwoPhaseCoordinator::new_coordinator(
+                                    move |_epoch, metadata_list, schema_change| {
+                                        assert_eq!(
+                                            schema_change,
+                                            Some(schema_change_for_pre_commit.clone())
+                                        );
+                                        let metadata =
+                                            Itertools::exactly_one(metadata_list.into_iter())
+                                                .unwrap();
+                                        Ok(match metadata.metadata {
+                                            Some(Metadata::Serialized(SerializedMetadata {
+                                                metadata,
+                                            })) => Some(metadata),
+                                            _ => unreachable!(),
+                                        })
+                                    },
+                                    move |_epoch, commit_metadata| {
+                                        assert_eq!(commit_metadata, metadata);
+                                        Ok(())
+                                    },
+                                    move |_epoch, schema_change| {
+                                        assert_eq!(schema_change, schema_change_for_commit.clone());
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+        };
+
+        let (mut client1, _) = build_client(vnode.clone()).await.unwrap();
+
+        let aligned_epoch = client1.align_initial_epoch(1).await.unwrap();
+        assert_eq!(aligned_epoch, 1);
+
+        client1
+            .commit(
+                epoch1,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: metadata.clone(),
+                    })),
+                },
+                Some(schema_change.clone()),
+            )
+            .await
+            .unwrap();
+
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "PENDING");
+            assert_eq!(rows[0].4, Some(schema_change.clone()));
+        }
+
+        let mut build_client2_future = pin!(build_client(vnode.clone()));
         assert!(
-            poll_fn(|cx| Poll::Ready(build_client_future1.as_mut().poll(cx)))
+            poll_fn(|cx| Poll::Ready(build_client2_future.as_mut().poll(cx)))
                 .await
                 .is_pending()
         );
-        manager.stop_sink_coordinator(sink_id).await;
 
-        assert!(build_client_future1.await.is_err());
-    }
+        client1.stop().await.unwrap();
 
-    #[tokio::test]
-    async fn test_partial_commit() {
-        let param = SinkParam {
-            sink_id: SinkId::from(1),
-            sink_name: "test".into(),
-            properties: Default::default(),
-            columns: vec![],
-            downstream_pk: vec![],
-            sink_type: SinkType::AppendOnly,
-            format_desc: None,
-            db_name: "test".into(),
-            sink_from_name: "test".into(),
-        };
+        assert!(
+            poll_fn(|cx| Poll::Ready(build_client2_future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
 
-        let epoch = 233;
+        {
+            let guard = sender.lock().await;
+            let sender = guard.as_ref().unwrap().clone();
+            sender.send(epoch1).unwrap();
+        }
 
-        let mut all_vnode = (0..VirtualNode::COUNT).collect_vec();
-        all_vnode.shuffle(&mut rand::thread_rng());
-        let (first, second) = all_vnode.split_at(VirtualNode::COUNT / 2);
-        let build_bitmap = |indexes: &[usize]| {
-            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT);
-            for i in indexes {
-                builder.set(*i, true);
-            }
-            builder.finish()
-        };
-        let vnode1 = build_bitmap(first);
-        let vnode2 = build_bitmap(second);
+        let (_, init_epoch) = build_client2_future.await.unwrap();
+        assert_eq!(init_epoch, Some(epoch1));
 
-        let (manager, (_join_handle, _stop_tx)) =
-            SinkCoordinatorManager::start_worker_with_spawn_worker({
-                let param = param.clone();
-                move |first_request: NewSinkWriterRequest, new_writer_rx| {
-                    let param = param.clone();
-                    tokio::spawn(async move {
-                        // validate the start request
-                        assert_eq!(first_request.param, param);
-                        CoordinatorWorker::execute_coordinator(
-                            first_request,
-                            new_writer_rx,
-                            MockCoordinator::new((), |_, _, _| unreachable!()),
-                        )
-                        .await;
-                    })
-                }
-            });
-
-        let build_client = |vnode| async {
-            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
-                Ok(tonic::Response::new(
-                    manager
-                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
-                        .await
-                        .unwrap()
-                        .boxed(),
-                ))
-            })
-            .await
-            .unwrap()
-        };
-
-        let (mut client1, client2) = join(build_client(vnode1), build_client(vnode2)).await;
-
-        // commit epoch
-        let mut commit_future = pin!(client1.commit(
-            epoch,
-            SinkMetadata {
-                metadata: Some(Metadata::Serialized(SerializedMetadata {
-                    metadata: vec![],
-                })),
-            },
-        ));
-        assert!(poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
-            .await
-            .is_pending());
-        drop(client2);
-        assert!(commit_future.await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_fail_commit() {
-        let param = SinkParam {
-            sink_id: SinkId::from(1),
-            sink_name: "test".into(),
-            properties: Default::default(),
-            columns: vec![],
-            downstream_pk: vec![],
-            sink_type: SinkType::AppendOnly,
-            format_desc: None,
-            db_name: "test".into(),
-            sink_from_name: "test".into(),
-        };
-
-        let epoch = 233;
-
-        let mut all_vnode = (0..VirtualNode::COUNT).collect_vec();
-        all_vnode.shuffle(&mut rand::thread_rng());
-        let (first, second) = all_vnode.split_at(VirtualNode::COUNT / 2);
-        let build_bitmap = |indexes: &[usize]| {
-            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT);
-            for i in indexes {
-                builder.set(*i, true);
-            }
-            builder.finish()
-        };
-        let vnode1 = build_bitmap(first);
-        let vnode2 = build_bitmap(second);
-
-        let (manager, (_join_handle, _stop_tx)) =
-            SinkCoordinatorManager::start_worker_with_spawn_worker({
-                let param = param.clone();
-                move |first_request: NewSinkWriterRequest, new_writer_rx| {
-                    let param = param.clone();
-                    tokio::spawn(async move {
-                        // validate the start request
-                        assert_eq!(first_request.param, param);
-                        CoordinatorWorker::execute_coordinator(
-                            first_request,
-                            new_writer_rx,
-                            MockCoordinator::new((), |_, _, _| {
-                                Err(SinkError::Coordinator(anyhow!("failed to commit")))
-                            }),
-                        )
-                        .await;
-                    })
-                }
-            });
-
-        let build_client = |vnode| async {
-            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
-                Ok(tonic::Response::new(
-                    manager
-                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
-                        .await
-                        .unwrap()
-                        .boxed(),
-                ))
-            })
-            .await
-            .unwrap()
-        };
-
-        let (mut client1, mut client2) = join(build_client(vnode1), build_client(vnode2)).await;
-
-        // commit epoch
-        let mut commit_future = pin!(client1.commit(
-            epoch,
-            SinkMetadata {
-                metadata: Some(Metadata::Serialized(SerializedMetadata {
-                    metadata: vec![],
-                })),
-            },
-        ));
-        assert!(poll_fn(|cx| Poll::Ready(commit_future.as_mut().poll(cx)))
-            .await
-            .is_pending());
-        let (result1, result2) = join(
-            commit_future,
-            client2.commit(
-                epoch,
-                SinkMetadata {
-                    metadata: Some(Metadata::Serialized(SerializedMetadata {
-                        metadata: vec![],
-                    })),
-                },
-            ),
-        )
-        .await;
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        {
+            let rows = list_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, epoch1 as i64);
+            assert_eq!(rows[0].2, "COMMITTED");
+            assert_eq!(rows[0].4, Some(schema_change.clone()));
+        }
     }
 }

@@ -21,35 +21,28 @@ while getopts 'p:' opt; do
 done
 shift $((OPTIND -1))
 
-download_and_prepare_rw "$profile" source
-
-echo "--- starting risingwave cluster"
-risedev ci-start ci-sink-test
+sink_test_env_setup "$profile"
 apt-get update -y && apt-get install -y redis-server
-sleep 1
+
+export PATH="$(pwd)/e2e_test/commands:${PATH}"
+export REDIS_HOST="redis-server"
+export REDIS_PORT="6379"
+export RISEDEV_REDIS_URL="redis://redis-server:6379/"
+export RISEDEV_REDIS_WITH_OPTIONS_COMMON="connector='redis',redis.url='${RISEDEV_REDIS_URL}'"
 
 echo "--- testing sinks"
 sqllogictest -p 4566 -d dev './e2e_test/sink/redis_sink.slt'
-sleep 1
-
-redis-cli -h redis-server -p 6379 get {\"v1\":1} >> ./query_result.txt
-redis-cli -h redis-server -p 6379 get V1:1 >> ./query_result.txt
-
-# check sink destination using shell
-if cat ./query_result.txt | tr '\n' '\0' | xargs -0 -n1 bash -c '[[ "$0" == "{\"v1\":1,\"v2\":1,\"v3\":1,\"v4\":1.100000023841858,\"v5\":1.2,\"v6\":\"test\",\"v7\":734869,\"v8\":\"2013-01-01T01:01:01.000000Z\",\"v9\":false}" || "$0" == "V2:1,V3:1" ]]'; then
-    echo "Redis sink check passed"
-else
-    cat ./query_result.txt
-  echo "The output is not as expected."
-  exit 1
-fi
 
 echo "--- testing cluster sinks"
-redis-server ./ci/redis-conf/redis-7000.conf --daemonize yes
-redis-server ./ci/redis-conf/redis-7001.conf --daemonize yes
-redis-server ./ci/redis-conf/redis-7002.conf --daemonize yes
+REDIS_CLUSTER_LOG_DIR=".risingwave/log"
+mkdir -p "$REDIS_CLUSTER_LOG_DIR"
+redis-server ./ci/redis-conf/redis-7000.conf --daemonize yes --logfile "$REDIS_CLUSTER_LOG_DIR/redis-7000.log"
+redis-server ./ci/redis-conf/redis-7001.conf --daemonize yes --logfile "$REDIS_CLUSTER_LOG_DIR/redis-7001.log"
+redis-server ./ci/redis-conf/redis-7002.conf --daemonize yes --logfile "$REDIS_CLUSTER_LOG_DIR/redis-7002.log"
 
 echo "yes" | redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002
+# Wait a bit for cluster_state to become ok before running SLT.
+sleep 2
 
 sqllogictest -p 4566 -d dev './e2e_test/sink/redis_cluster_sink.slt'
 

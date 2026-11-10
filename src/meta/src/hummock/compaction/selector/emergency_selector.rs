@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use risingwave_common::catalog::TableOption;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
-use super::{CompactionSelector, DynamicLevelSelectorCore, LocalSelectorStatistic};
+use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{EmergencyCompactionPicker, LocalPickerStatistic};
-use crate::hummock::compaction::{
-    create_compaction_task, CompactionDeveloperConfig, CompactionTask,
-};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task};
 
 #[derive(Default)]
 pub struct EmergencySelector {}
@@ -35,13 +27,17 @@ impl CompactionSelector for EmergencySelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        selector_stats: &mut LocalSelectorStatistic,
-        _table_id_to_options: HashMap<u32, TableOption>,
-        developer_config: Arc<CompactionDeveloperConfig>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            selector_stats,
+            developer_config,
+            in_progress_compactions,
+            ..
+        } = context;
         let dynamic_level_core = DynamicLevelSelectorCore::new(
             group.compaction_config.clone(),
             developer_config.clone(),
@@ -55,6 +51,14 @@ impl CompactionSelector for EmergencySelector {
 
         let mut stats = LocalPickerStatistic::default();
         if let Some(compaction_input) = picker.pick_compaction(levels, level_handlers, &mut stats) {
+            if !compaction_input.skip_target_range_conflict_check
+                && in_progress_compactions.has_conflict_with_input(&compaction_input)
+            {
+                stats.skip_by_overlapping += 1;
+                selector_stats.skip_picker.push((0, ctx.base_level, stats));
+                return None;
+            }
+
             compaction_input.add_pending_task(task_id, level_handlers);
 
             return Some(create_compaction_task(

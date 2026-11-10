@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lazy_cell)]
 use std::sync::LazyLock;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use risingwave_hummock_sdk::key::FullKey;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use risingwave_hummock_sdk::key::{FullKey, TABLE_PREFIX_LEN};
 use risingwave_storage::hummock::{
     Block, BlockBuilder, BlockBuilderOptions, BlockHolder, BlockIterator, CompressionAlgorithm,
 };
@@ -149,7 +148,13 @@ fn build_block_data(t: u32, i: u64) -> Bytes {
                 (k_ext, v_ext) = (&DATA_LEN_SET[ext_index].0, &DATA_LEN_SET[ext_index].1);
             }
 
-            builder.add_for_test(FullKey::decode(&key(tt, ii, k_ext)), &value(ii, v_ext));
+            let key = key(tt, ii, k_ext);
+            let full_key = FullKey::decode(&key);
+            builder.add(
+                full_key.user_key.table_id,
+                &key[TABLE_PREFIX_LEN..],
+                &value(ii, v_ext),
+            );
         }
     }
     Bytes::from(builder.build().to_vec())

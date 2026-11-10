@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -61,6 +61,11 @@ impl DockerServiceConfig for KafkaConfig {
             (
                 "KAFKA_INTER_BROKER_LISTENER_NAME".to_owned(),
                 "HOST".to_owned(),
+            ),
+            // https://docs.confluent.io/platform/current/installation/docker/config-reference.html#example-configurations
+            (
+                "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR".to_owned(),
+                "1".to_owned(),
             ),
             ("CLUSTER_ID".to_owned(), "RiseDevRiseDevRiseDev1".to_owned()),
         ]

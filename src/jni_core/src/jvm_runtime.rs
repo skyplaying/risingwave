@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,127 +14,127 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use fs_err as fs;
 use fs_err::PathExt;
 use jni::objects::{JObject, JString};
-use jni::strings::JNIString;
-use jni::{InitArgsBuilder, JNIEnv, JNIVersion, JavaVM, NativeMethod};
+use jni::{AttachGuard, InitArgsBuilder, JNIEnv, JNIVersion, JavaVM};
+use risingwave_common::global_jvm::{JVM_BUILDER, Jvm, JvmBuilder};
 use risingwave_common::util::resource_util::memory::system_memory_available_bytes;
 use thiserror_ext::AsReport;
 use tracing::error;
 
-use crate::call_method;
+use crate::opendal_schema_history::*;
+use crate::{call_method, call_static_method};
 
 /// Use 10% of compute total memory by default. Compute node uses 0.7 * system memory by default.
 const DEFAULT_MEMORY_PROPORTION: f64 = 0.07;
 
-pub static JVM: JavaVmWrapper = JavaVmWrapper;
-static INSTANCE: OnceLock<JavaVM> = OnceLock::new();
-
-pub struct JavaVmWrapper;
-
-impl JavaVmWrapper {
-    /// Get the initialized JVM instance. If JVM is not initialized, initialize it first.
-    /// If JVM cannot be initialized, return an error.
-    pub fn get_or_init(&self) -> anyhow::Result<&'static JavaVM> {
-        match INSTANCE.get_or_try_init(Self::inner_new) {
-            Ok(jvm) => Ok(jvm),
-            Err(e) => {
-                error!(error = %e.as_report(), "jvm not initialized properly");
-                Err(e.context("jvm not initialized properly"))
-            }
-        }
-    }
-
-    /// Get the initialized JVM instance. If JVM is not initialized, return None.
-    ///
-    /// Generally `get_or_init` should be preferred.
-    fn get(&self) -> Option<&'static JavaVM> {
-        INSTANCE.get()
-    }
-
-    fn locate_libs_path() -> anyhow::Result<PathBuf> {
-        let libs_path = if let Ok(libs_path) = std::env::var("CONNECTOR_LIBS_PATH") {
-            PathBuf::from(libs_path)
-        } else {
-            tracing::info!("environment variable CONNECTOR_LIBS_PATH is not specified, use default path `./libs` instead");
-            std::env::current_exe()
-                .and_then(|p| p.fs_err_canonicalize()) // resolve symlink of the current executable
-                .context("unable to get path of the executable")?
-                .parent()
-                .expect("not root")
-                .join("libs")
-        };
-
-        // No need to validate the path now, as it will be further checked when calling `fs::read_dir` later.
-        Ok(libs_path)
-    }
-
-    fn inner_new() -> anyhow::Result<JavaVM> {
-        let libs_path = Self::locate_libs_path().context("failed to locate connector libs")?;
-        tracing::info!(path = %libs_path.display(), "located connector libs");
-
-        let mut class_vec = vec![];
-
-        let entries = fs::read_dir(&libs_path).context("failed to read connector libs")?;
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.file_name().is_some() {
-                let path = fs::canonicalize(entry_path)
-                    .expect("invalid entry_path obtained from fs::read_dir");
-                class_vec.push(path.to_str().unwrap().to_string());
-            }
-        }
-
-        let jvm_heap_size = if let Ok(heap_size) = std::env::var("JVM_HEAP_SIZE") {
-            heap_size
-        } else {
-            format!(
-                "{}",
-                (system_memory_available_bytes() as f64 * DEFAULT_MEMORY_PROPORTION) as usize
-            )
-        };
-
-        // FIXME: passing custom arguments to the embedded jvm when compute node start
-        // Build the VM properties
-        let args_builder = InitArgsBuilder::new()
-            // Pass the JNI API version (default is 8)
-            .version(JNIVersion::V8)
-            .option("-Dis_embedded_connector=true")
-            .option(format!("-Djava.class.path={}", class_vec.join(":")))
-            .option("-Xms16m")
-            .option(format!("-Xmx{}", jvm_heap_size));
-
-        tracing::info!("JVM args: {:?}", args_builder);
-        let jvm_args = args_builder.build().context("invalid jvm args")?;
-
-        // Create a new VM
-        let jvm = match JavaVM::new(jvm_args) {
-            Err(err) => {
-                tracing::error!(error = ?err.as_report(), "fail to new JVM");
-                bail!("fail to new JVM");
-            }
-            Ok(jvm) => jvm,
-        };
-
-        tracing::info!("initialize JVM successfully");
-
-        register_native_method_for_jvm(&jvm).context("failed to register native method")?;
-
-        Ok(jvm)
-    }
+fn locate_libs_path() -> anyhow::Result<PathBuf> {
+    let libs_path = if let Ok(libs_path) = std::env::var("CONNECTOR_LIBS_PATH") {
+        PathBuf::from(libs_path)
+    } else {
+        tracing::info!(
+            "environment variable CONNECTOR_LIBS_PATH is not specified, use default path `./libs` instead"
+        );
+        std::env::current_exe()
+            .and_then(|p| p.fs_err_canonicalize()) // resolve symlink of the current executable
+            .context("unable to get path of the executable")?
+            .parent()
+            .expect("not root")
+            .join("libs")
+    };
+    Ok(libs_path)
 }
 
-pub fn register_native_method_for_jvm(jvm: &JavaVM) -> Result<(), jni::errors::Error> {
-    let mut env = jvm
-        .attach_current_thread()
-        .inspect_err(|e| tracing::error!(error = ?e.as_report(), "jvm attach thread error"))?;
+fn build_jvm_with_native_registration() -> anyhow::Result<JavaVM> {
+    let libs_path = locate_libs_path().context("failed to locate connector libs")?;
+    tracing::info!(path = %libs_path.display(), "located connector libs");
 
+    let mut class_vec = vec![];
+
+    let entries = fs::read_dir(&libs_path).context(if cfg!(debug_assertions) {
+        "failed to read connector libs; \
+        for RiseDev users, please check if ENABLE_BUILD_RW_CONNECTOR is set with `risedev configure`"
+    } else {
+        "failed to read connector libs, \
+        please check if env var CONNECTOR_LIBS_PATH is correctly configured"
+    })?;
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.file_name().is_some() {
+            let path = fs::canonicalize(entry_path)
+                .expect("invalid entry_path obtained from fs::read_dir");
+            class_vec.push(path.to_str().unwrap().to_owned());
+        }
+    }
+
+    let jvm_heap_size = if let Ok(heap_size) = std::env::var("JVM_HEAP_SIZE") {
+        heap_size
+    } else {
+        format!(
+            "{}",
+            (system_memory_available_bytes() as f64 * DEFAULT_MEMORY_PROPORTION) as usize
+        )
+    };
+
+    // FIXME: passing custom arguments to the embedded jvm when compute node start
+    // Build the VM properties
+    let mut args_builder = InitArgsBuilder::new()
+        // Pass the JNI API version (default is 8)
+        .version(JNIVersion::V8)
+        .option("-Dis_embedded_connector=true")
+        .option(format!("-Djava.class.path={}", class_vec.join(":")))
+        .option("--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED")
+        .option("-Xms16m")
+        .option(format!("-Xmx{}", jvm_heap_size));
+
+    // Exit the embedded JVM on uncaught `OutOfMemoryError` so that the host
+    // compute node process terminates and the cluster recovers via the standard
+    // recovery loop, matching native OOM behavior. Set `JVM_EXIT_ON_OOM=false`
+    // (or `0`) to opt out.
+    let exit_on_oom = std::env::var("JVM_EXIT_ON_OOM")
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | ""))
+        .unwrap_or(true);
+    if exit_on_oom {
+        args_builder = args_builder.option("-XX:+ExitOnOutOfMemoryError");
+    }
+
+    tracing::info!("JVM args: {:?}", args_builder);
+    let jvm_args = args_builder.build().context("invalid jvm args")?;
+
+    // Create a new VM
+    let jvm = match JavaVM::new(jvm_args) {
+        Err(err) => {
+            tracing::error!(error = ?err.as_report(), "fail to new JVM");
+            bail!("fail to new JVM");
+        }
+        Ok(jvm) => jvm,
+    };
+
+    tracing::info!("initialize JVM successfully");
+
+    let result: std::result::Result<(), jni::errors::Error> = try {
+        let mut env = jvm_env(&jvm)?;
+        register_java_binding_native_methods(&mut env)?;
+    };
+
+    result.context("failed to register native method")?;
+
+    Ok(jvm)
+}
+
+pub fn jvm_env(jvm: &JavaVM) -> Result<AttachGuard<'_>, jni::errors::Error> {
+    jvm.attach_current_thread()
+        .inspect_err(|e| tracing::error!(error = ?e.as_report(), "jvm attach thread error"))
+}
+
+pub fn register_java_binding_native_methods(
+    env: &mut JNIEnv<'_>,
+) -> Result<(), jni::errors::Error> {
     let binding_class = env
-        .find_class("com/risingwave/java/binding/Binding")
+        .find_class(gen_class_name!(com.risingwave.java.binding.Binding))
         .inspect_err(|e| tracing::error!(error = ?e.as_report(), "jvm find class error"))?;
     use crate::*;
     macro_rules! gen_native_method_array {
@@ -144,14 +144,8 @@ pub fn register_native_method_for_jvm(jvm: &JavaVM) -> Result<(), jni::errors::E
         ({$({ $func_name:ident, {$($ret:tt)+}, {$($args:tt)*} })*}) => {
             [
                 $(
-                    {
-                        let fn_ptr = paste::paste! {[<Java_com_risingwave_java_binding_Binding_ $func_name> ]} as *mut c_void;
-                        let sig = $crate::gen_jni_sig! { {$($ret)+}, {$($args)*}};
-                        NativeMethod {
-                            name: JNIString::from(stringify! {$func_name}),
-                            sig: JNIString::from(sig),
-                            fn_ptr,
-                        }
+                    $crate::gen_native_method_entry! {
+                        Java_com_risingwave_java_binding_Binding_, $func_name, {$($ret)+}, {$($args)*}
                     },
                 )*
             ]
@@ -169,23 +163,23 @@ pub fn register_native_method_for_jvm(jvm: &JavaVM) -> Result<(), jni::errors::E
 /// Load JVM memory statistics from the runtime. If JVM is not initialized or fail to initialize,
 /// return zero.
 pub fn load_jvm_memory_stats() -> (usize, usize) {
-    match JVM.get() {
+    match Jvm::get() {
         Some(jvm) => {
-            let result: Result<(usize, usize), jni::errors::Error> = try {
-                let mut env = jvm.attach_current_thread()?;
+            let result: Result<(usize, usize), anyhow::Error> = try {
+                execute_with_jni_env(jvm, |env| {
+                    let runtime_instance = crate::call_static_method!(
+                        env,
+                        {Runtime},
+                        {Runtime getRuntime()}
+                    )?;
 
-                let runtime_instance = crate::call_static_method!(
-                    env,
-                    {Runtime},
-                    {Runtime getRuntime()}
-                )?;
+                    let total_memory =
+                        call_method!(env, runtime_instance.as_ref(), {long totalMemory()})?;
+                    let free_memory =
+                        call_method!(env, runtime_instance.as_ref(), {long freeMemory()})?;
 
-                let total_memory =
-                    call_method!(env, runtime_instance.as_ref(), {long totalMemory()})?;
-                let free_memory =
-                    call_method!(env, runtime_instance.as_ref(), {long freeMemory()})?;
-
-                (total_memory as usize, (total_memory - free_memory) as usize)
+                    Ok((total_memory as usize, (total_memory - free_memory) as usize))
+                })?
             };
             match result {
                 Ok(ret) => ret,
@@ -200,25 +194,52 @@ pub fn load_jvm_memory_stats() -> (usize, usize) {
 }
 
 pub fn execute_with_jni_env<T>(
-    jvm: &JavaVM,
+    jvm: Jvm,
     f: impl FnOnce(&mut JNIEnv<'_>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let _guard = jvm
+    let mut env = jvm
         .attach_current_thread()
         .with_context(|| "Failed to attach current rust thread to jvm")?;
 
-    let mut env = jvm.get_env().with_context(|| "Failed to get jni env")?;
+    // set context class loader for the thread
+    // java.lang.Thread.currentThread()
+    //     .setContextClassLoader(java.lang.ClassLoader.getSystemClassLoader());
+
+    let thread = crate::call_static_method!(
+        env,
+        {Thread},
+        {Thread currentThread()}
+    )?;
+
+    let system_class_loader = crate::call_static_method!(
+        env,
+        {ClassLoader},
+        {ClassLoader getSystemClassLoader()}
+    )?;
+
+    crate::call_method!(
+        env,
+        thread,
+        {void setContextClassLoader(ClassLoader)},
+        &system_class_loader
+    )?;
 
     let ret = f(&mut env);
 
     match env.exception_check() {
         Ok(true) => {
+            let exception = env.exception_occurred().inspect_err(|e| {
+                tracing::warn!(error = %e.as_report(), "Failed to get jvm exception");
+            })?;
             env.exception_describe().inspect_err(|e| {
                 tracing::warn!(error = %e.as_report(), "Failed to describe jvm exception");
             })?;
             env.exception_clear().inspect_err(|e| {
                 tracing::warn!(error = %e.as_report(), "Exception occurred but failed to clear");
             })?;
+            let message = call_method!(env, exception, {String getMessage()})?;
+            let message = jobj_to_str(&mut env, message)?;
+            return Err(anyhow::anyhow!("Caught Java Exception: {}", message));
         }
         Ok(false) => {
             // No exception, do nothing
@@ -238,5 +259,38 @@ pub fn jobj_to_str(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> anyhow::Result<Str
     }
     let jstr = JString::from(obj);
     let java_str = env.get_string(&jstr)?;
-    Ok(java_str.to_str()?.to_string())
+    Ok(java_str.to_str()?.to_owned())
 }
+
+/// Dumps the JVM stack traces.
+///
+/// # Returns
+///
+/// - `Ok(None)` if JVM is not initialized.
+/// - `Ok(Some(String))` if JVM is initialized and stack traces are dumped.
+/// - `Err` if failed to dump stack traces.
+pub fn dump_jvm_stack_traces() -> anyhow::Result<Option<String>> {
+    match Jvm::get() {
+        None => Ok(None),
+        Some(jvm) => execute_with_jni_env(jvm, |env| {
+            let result = call_static_method!(
+                env,
+                {com.risingwave.connector.api.Monitor},
+                {String dumpStackTrace()}
+            )
+            .with_context(|| "Failed to call Java function")?;
+            let result = JString::from(result);
+            let result = env
+                .get_string(&result)
+                .with_context(|| "Failed to convert JString")?;
+            let result = result
+                .to_str()
+                .with_context(|| "Failed to convert JavaStr")?;
+            Ok(Some(result.to_owned()))
+        }),
+    }
+}
+
+/// Register the JVM initialization closure.
+#[linkme::distributed_slice(JVM_BUILDER)]
+static REGISTERED_JVM_BUILDER: JvmBuilder = build_jvm_with_native_registration;

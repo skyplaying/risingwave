@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use itertools::Itertools;
+use risingwave_common::acl::AclMode;
 use risingwave_common::catalog::{ColumnCatalog, Schema, TableVersionId};
 use risingwave_common::types::DataType;
 use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_pb::expr::expr_node::Type as ExprType;
+use risingwave_pb::plan_common::DefaultColumnDesc;
+use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
 use risingwave_sqlparser::ast::{Ident, ObjectName, Query, SelectItem};
 
-use super::statement::RewriteExprsRecursive;
 use super::BoundQuery;
+use super::statement::RewriteExprsRecursive;
 use crate::binder::{Binder, Clause};
 use crate::catalog::TableId;
 use crate::error::{ErrorCode, Result, RwError};
-use crate::expr::{ExprImpl, InputRef};
+use crate::expr::{Expr, ExprImpl, FunctionCall, InputRef};
+use crate::handler::privilege::ObjectCheckItem;
 use crate::user::UserId;
+use crate::utils::ordinal;
 
 #[derive(Debug, Clone)]
 pub struct BoundInsert {
@@ -101,14 +108,22 @@ impl Binder {
         source: Query,
         returning_items: Vec<SelectItem>,
     ) -> Result<BoundInsert> {
-        let (schema_name, table_name) = Self::resolve_schema_qualified_name(&self.db_name, name)?;
+        let (schema_name, table_name) = Self::resolve_schema_qualified_name(&self.db_name, &name)?;
         // bind insert table
         self.context.clause = Some(Clause::Insert);
-        self.bind_table(schema_name.as_deref(), &table_name, None)?;
+        let bound_table = self.bind_table_for_dml(schema_name.as_deref(), &table_name, true)?;
+        let table_catalog = &bound_table.table_catalog;
+        self.check_privilege(
+            ObjectCheckItem::new(
+                table_catalog.owner,
+                AclMode::Insert,
+                table_name.clone(),
+                table_catalog.id,
+            ),
+            table_catalog.database_id,
+        )?;
 
-        let table_catalog = self.resolve_dml_table(schema_name.as_deref(), &table_name, true)?;
-        let default_columns_from_catalog =
-            table_catalog.default_columns().collect::<BTreeMap<_, _>>();
+        let has_user_specified_columns = !cols_to_insert_by_user.is_empty();
         let table_id = table_catalog.id;
         let owner = table_catalog.owner;
         let table_version_id = table_catalog.version_id().expect("table must be versioned");
@@ -118,42 +133,69 @@ impl Binder {
             .filter(|c| !c.is_hidden())
             .cloned()
             .collect_vec();
-        let cols_to_insert_in_table = table_catalog.columns_to_insert().cloned().collect_vec();
+        let (cols_to_insert_in_table, row_id_index) = table_catalog.columns_to_insert();
+        let cols_to_insert_in_table = cols_to_insert_in_table
+            .map(|(column, _)| column.clone())
+            .collect_vec();
+        // Reorder default columns based on `cols_to_insert_in_table`.
+        let default_columns_from_catalog = cols_to_insert_in_table
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                if let Some(GeneratedOrDefaultColumn::DefaultColumn(DefaultColumnDesc {
+                    expr,
+                    ..
+                })) = col.column_desc.generated_or_default_column.as_ref()
+                {
+                    Some((
+                        idx,
+                        ExprImpl::from_expr_proto(expr.as_ref().unwrap())
+                            .expect("expr in default columns corrupted"),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>();
 
         let generated_column_names = table_catalog
             .generated_column_names()
             .collect::<HashSet<_>>();
-        for col in &cols_to_insert_by_user {
-            let query_col_name = col.real_value();
-            if generated_column_names.contains(query_col_name.as_str()) {
-                return Err(RwError::from(ErrorCode::BindError(format!(
-                    "cannot insert a non-DEFAULT value into column \"{0}\".  Column \"{0}\" is a generated column.",
-                    &query_col_name
-                ))));
+
+        let check_generated_insert_violation = |bound_column_nums: Option<usize>| -> Result<()> {
+            let generated_column_name = if let Some(column_num) = bound_column_nums {
+                table_catalog
+                    .first_generated_column()
+                    .and_then(|(index, column_name)| {
+                        (column_num > index).then_some(column_name.to_owned())
+                    })
+            } else {
+                cols_to_insert_by_user
+                    .iter()
+                    .map(|col| col.real_value())
+                    .find(|col_name| generated_column_names.contains(col_name.as_str()))
+            };
+
+            if let Some(column_name) = generated_column_name {
+                return Err(ErrorCode::InsertViolation(format!(
+                    "cannot insert a non-DEFAULT value into column \"{0}\"\n  DETAIL: Column \"{0}\" is a generated column.",
+                    column_name
+                ))
+                .into());
             }
-        }
-        if !generated_column_names.is_empty() && !returning_items.is_empty() {
-            return Err(RwError::from(ErrorCode::BindError(
-                "`RETURNING` clause is not supported for tables with generated columns".to_string(),
-            )));
+
+            Ok(())
+        };
+
+        if has_user_specified_columns {
+            check_generated_insert_violation(None)?;
         }
 
-        // TODO(yuhao): refine this if row_id is always the last column.
-        //
-        // `row_id_index` in insert operation should rule out generated column
-        let row_id_index = {
-            if let Some(row_id_index) = table_catalog.row_id_index {
-                let mut cnt = 0;
-                for col in table_catalog.columns().iter().take(row_id_index + 1) {
-                    if col.is_generated() {
-                        cnt += 1;
-                    }
-                }
-                Some(row_id_index - cnt)
-            } else {
-                None
-            }
-        };
+        if !generated_column_names.is_empty() && !returning_items.is_empty() {
+            return Err(RwError::from(ErrorCode::BindError(
+                "`RETURNING` clause is not supported for tables with generated columns".to_owned(),
+            )));
+        }
 
         let (returning_list, fields) = self.bind_returning_list(returning_items)?;
         let is_returning = !returning_list.is_empty();
@@ -163,9 +205,21 @@ impl Binder {
             &cols_to_insert_by_user,
             &table_name,
         )?;
+        // Collect the types of columns explicitly specified by the user.
         let expected_types: Vec<DataType> = col_indices_to_insert
             .iter()
             .map(|idx| cols_to_insert_in_table[*idx].data_type().clone())
+            .collect();
+
+        // Collect the nullable of columns explicitly specified by the user.
+        let nullables: Vec<(bool, &str)> = col_indices_to_insert
+            .iter()
+            .map(|idx| {
+                (
+                    cols_to_insert_in_table[*idx].nullable(),
+                    cols_to_insert_in_table[*idx].name(),
+                )
+            })
             .collect();
 
         // When the column types of `source` query do not match `expected_types`,
@@ -196,21 +250,32 @@ impl Binder {
         // afterwards.
         let bound_query;
         let cast_exprs;
+        let all_nullable = nullables.iter().all(|(nullable, _)| *nullable);
 
-        let bounded_column_nums = match source.as_simple_values() {
+        let bound_column_nums = match source.as_simple_values() {
             None => {
-                bound_query = self.bind_query(source)?;
+                bound_query = self.bind_query(&source)?;
+                if !has_user_specified_columns {
+                    check_generated_insert_violation(Some(bound_query.schema().len()))?;
+                }
                 let actual_types = bound_query.data_types();
-                cast_exprs = match expected_types == actual_types {
-                    true => vec![],
-                    false => Self::cast_on_insert(
-                        &expected_types,
-                        actual_types
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, t)| InputRef::new(i, t).into())
-                            .collect(),
-                    )?,
+                let type_match = expected_types == actual_types;
+                cast_exprs = if all_nullable && type_match {
+                    vec![]
+                } else {
+                    let mut cast_exprs = actual_types
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| InputRef::new(i, t).into())
+                        .collect();
+                    if !type_match {
+                        cast_exprs = Self::cast_on_insert(&expected_types, cast_exprs)?
+                    }
+                    if !all_nullable {
+                        cast_exprs =
+                            Self::check_not_null(&nullables, cast_exprs, table_name.as_str())?
+                    }
+                    cast_exprs
                 };
                 bound_query.schema().len()
             }
@@ -220,21 +285,33 @@ impl Binder {
                     .first()
                     .expect("values list should not be empty")
                     .len();
-                let values = self.bind_values(values.clone(), Some(expected_types))?;
+                if !has_user_specified_columns {
+                    check_generated_insert_violation(Some(values_len))?;
+                }
+                let mut values = self.bind_values(values, Some(&expected_types))?;
+                // let mut bound_values = values.clone();
+
+                if !all_nullable {
+                    values.rows = values
+                        .rows
+                        .into_iter()
+                        .map(|vec| Self::check_not_null(&nullables, vec, table_name.as_str()))
+                        .try_collect()?;
+                }
+
                 bound_query = BoundQuery::with_values(values);
                 cast_exprs = vec![];
                 values_len
             }
         };
 
-        let has_user_specified_columns = !cols_to_insert_by_user.is_empty();
         let num_target_cols = if has_user_specified_columns {
             cols_to_insert_by_user.len()
         } else {
             cols_to_insert_in_table.len()
         };
 
-        let (err_msg, default_column_indices) = match num_target_cols.cmp(&bounded_column_nums) {
+        let (err_msg, default_column_indices) = match num_target_cols.cmp(&bound_column_nums) {
             std::cmp::Ordering::Equal => (None, default_column_indices),
             std::cmp::Ordering::Greater => {
                 if has_user_specified_columns {
@@ -248,7 +325,7 @@ impl Binder {
                     //      insert into t values (7)
                     // this kind of usage is fine, null values will be provided
                     // implicitly.
-                    (None, col_indices_to_insert.split_off(bounded_column_nums))
+                    (None, col_indices_to_insert.split_off(bound_column_nums))
                 }
             }
             std::cmp::Ordering::Less => {
@@ -262,21 +339,34 @@ impl Binder {
             }
         };
         if let Some(msg) = err_msg {
-            return Err(RwError::from(ErrorCode::BindError(msg.to_string())));
+            return Err(RwError::from(ErrorCode::BindError(msg.to_owned())));
         }
 
         let default_columns = default_column_indices
             .into_iter()
             .map(|i| {
-                (
-                    i,
-                    default_columns_from_catalog
-                        .get(&i)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            ExprImpl::literal_null(cols_to_insert_in_table[i].data_type().clone())
-                        }),
-                )
+                let column = &cols_to_insert_in_table[i];
+                let expr = default_columns_from_catalog
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_else(|| ExprImpl::literal_null(column.data_type().clone()));
+
+                let expr = if column.nullable() {
+                    expr
+                } else {
+                    FunctionCall::new_unchecked(
+                        ExprType::CheckNotNull,
+                        vec![
+                            expr,
+                            ExprImpl::literal_varchar(column.name().to_owned()),
+                            ExprImpl::literal_varchar(table_name.clone()),
+                        ],
+                        column.data_type().clone(),
+                    )
+                    .into()
+                };
+
+                (i, expr)
             })
             .collect_vec();
 
@@ -303,19 +393,66 @@ impl Binder {
 
     /// Cast a list of `exprs` to corresponding `expected_types` IN ASSIGNMENT CONTEXT. Make sure
     /// you understand the difference of implicit, assignment and explicit cast before reusing it.
-
     pub(super) fn cast_on_insert(
-        expected_types: &Vec<DataType>,
+        expected_types: &[DataType],
         exprs: Vec<ExprImpl>,
     ) -> Result<Vec<ExprImpl>> {
-        let expr_num = exprs.len();
         let msg = match expected_types.len().cmp(&exprs.len()) {
             std::cmp::Ordering::Less => "INSERT has more expressions than target columns",
             _ => {
+                let expr_len = exprs.len();
                 return exprs
                     .into_iter()
-                    .zip_eq_fast(expected_types.iter().take(expr_num))
-                    .map(|(e, t)| e.cast_assign(t.clone()).map_err(Into::into))
+                    .zip_eq_fast(expected_types.iter().take(expr_len))
+                    .enumerate()
+                    .map(|(i, (e, t))| {
+                        let res = e.cast_assign(t);
+                        if expr_len > 1 {
+                            res.with_context(|| {
+                                format!("failed to cast the {} column", ordinal(i + 1))
+                            })
+                            .map_err(Into::into)
+                        } else {
+                            res.map_err(Into::into)
+                        }
+                    })
+                    .try_collect();
+            }
+        };
+        Err(ErrorCode::BindError(msg.into()).into())
+    }
+
+    /// Add not null check for the columns that are not nullable.
+    pub(super) fn check_not_null(
+        nullables: &Vec<(bool, &str)>,
+        exprs: Vec<ExprImpl>,
+        table_name: &str,
+    ) -> Result<Vec<ExprImpl>> {
+        let msg = match nullables.len().cmp(&exprs.len()) {
+            std::cmp::Ordering::Less => "INSERT has more expressions than target columns",
+            _ => {
+                let expr_len = exprs.len();
+                return exprs
+                    .into_iter()
+                    .zip_eq_fast(nullables.iter().take(expr_len))
+                    .map(|(expr, (nullable, col_name))| {
+                        if !nullable {
+                            let return_type = expr.return_type();
+                            let check_not_null = FunctionCall::new_unchecked(
+                                ExprType::CheckNotNull,
+                                vec![
+                                    expr,
+                                    ExprImpl::literal_varchar((*col_name).to_owned()),
+                                    ExprImpl::literal_varchar(table_name.to_owned()),
+                                ],
+                                return_type,
+                            );
+                            // let res = expr.cast_assign(t.clone());
+                            Ok(check_not_null.into())
+                        } else {
+                            Ok(expr)
+                        }
+                    })
                     .try_collect();
             }
         };
@@ -323,11 +460,25 @@ impl Binder {
     }
 }
 
-/// Returned indices have the same length as `cols_to_insert_in_table`.
-/// The first elements have the same order as `cols_to_insert_by_user`.
-/// The rest are what's not specified by the user.
+/// # Parameters
+/// - `cols_to_insert_in_table`: the list of columns that are visible and non-generated
 ///
-/// Also checks there are no duplicate nor unknown columns provided by the user.
+/// - `cols_to_insert_by_user`:
+///   The list of column identifiers explicitly specified by the user
+///   in the INSERT statement.
+///
+/// - `table_name`: The name of the target table.
+///
+/// # Return
+/// - `(col_indices_to_insert, default_column_indices)`
+///
+///   - `col_indices_to_insert`:
+///     Column indices corresponding to user-specified columns in the INSERT statement,
+///     preserving the user-defined order.
+///
+///   - `default_column_indices`:
+///     Column indices of remaining columns in the target table that are not explicitly
+///     provided by the user and should be filled with DEFAULT values.
 fn get_col_indices_to_insert(
     cols_to_insert_in_table: &[ColumnCatalog],
     cols_to_insert_by_user: &[Ident],
@@ -339,47 +490,42 @@ fn get_col_indices_to_insert(
 
     let mut col_indices_to_insert: Vec<usize> = Vec::new();
 
-    let mut col_name_to_idx: HashMap<String, usize> = HashMap::new();
-    for (col_idx, col) in cols_to_insert_in_table.iter().enumerate() {
-        col_name_to_idx.insert(col.name().to_string(), col_idx);
-    }
+    // Build a map from column name to column index in the table catalog
+    let col_name_to_idx: HashMap<String, usize> = cols_to_insert_in_table
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| (col.name().to_owned(), idx))
+        .collect();
 
+    let mut seen = HashSet::with_capacity(cols_to_insert_by_user.len());
     for col_name in cols_to_insert_by_user {
-        let col_name = &col_name.real_value();
-        match col_name_to_idx.get_mut(col_name) {
-            Some(value_ref) => {
-                if *value_ref == usize::MAX {
-                    return Err(RwError::from(ErrorCode::BindError(
-                        "Column specified more than once".to_string(),
-                    )));
-                }
-                col_indices_to_insert.push(*value_ref);
-                *value_ref = usize::MAX; // mark this column name, for duplicate
-                                         // detection
-            }
-            None => {
-                // Invalid column name found
-                return Err(RwError::from(ErrorCode::BindError(format!(
-                    "Column {} not found in table {}",
-                    col_name, table_name
-                ))));
-            }
+        let col_name = col_name.real_value();
+        if !seen.insert(col_name.clone()) {
+            return Err(RwError::from(ErrorCode::BindError(
+                "Column specified more than once".to_owned(),
+            )));
         }
+
+        let idx = col_name_to_idx.get(&col_name).ok_or_else(|| {
+            RwError::from(ErrorCode::BindError(format!(
+                "Column {} not found in table {}",
+                col_name, table_name
+            )))
+        })?;
+
+        col_indices_to_insert.push(*idx);
     }
 
     // columns that are in the target table but not in the provided target columns
     let default_column_indices = if col_indices_to_insert.len() != cols_to_insert_in_table.len() {
-        let mut cols = vec![];
-        for col in cols_to_insert_in_table {
-            if let Some(col_to_insert_idx) = col_name_to_idx.get(col.name()) {
-                if *col_to_insert_idx != usize::MAX {
-                    cols.push(*col_to_insert_idx);
-                }
-            } else {
-                unreachable!();
-            }
-        }
-        cols
+        cols_to_insert_in_table
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let column_name = col.name();
+                (!seen.contains(column_name)).then_some(idx)
+            })
+            .collect()
     } else {
         vec![]
     };

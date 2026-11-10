@@ -11,37 +11,38 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use core::fmt::Debug;
-use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _};
+use core::fmt::Debug;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use anyhow::{Context as _, anyhow};
 use risingwave_common::array::{Op, RowRef, StreamChunk};
 use risingwave_common::catalog::Schema;
+use risingwave_common::id::ActorId;
 use risingwave_common::row::Row;
-use risingwave_common::session_config::sink_decouple::SinkDecouple;
 use risingwave_common::types::{DataType, ScalarRefImpl};
-use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::ConnectionError;
-use serde_derive::Deserialize;
+use rumqttc::v5::mqttbytes::QoS;
+use serde::Deserialize;
 use serde_with::serde_as;
 use thiserror_ext::AsReport;
 use with_options::WithOptions;
 
-use super::catalog::{SinkEncode, SinkFormat, SinkFormatDesc};
+use super::SinkWriterParam;
+use super::catalog::{SinkEncode, SinkFormat, SinkFormatDesc, SinkId};
 use super::encoder::{
-    DateHandlingMode, JsonEncoder, ProtoEncoder, ProtoHeader, RowEncoder, SerTo, TimeHandlingMode,
-    TimestampHandlingMode, TimestamptzHandlingMode,
+    DateHandlingMode, JsonEncoder, JsonbHandlingMode, ProtoEncoder, ProtoHeader, RowEncoder, SerTo,
+    TimeHandlingMode, TimestampHandlingMode, TimestamptzHandlingMode,
 };
 use super::writer::AsyncTruncateSinkWriterExt;
-use super::{DummySinkCommitCoordinator, SinkWriterParam};
 use crate::connector_common::MqttCommon;
 use crate::deserialize_bool_from_string;
-use crate::sink::catalog::desc::SinkDesc;
+use crate::enforce_secret::EnforceSecret;
 use crate::sink::log_store::DeliveryFutureManagerAddFuture;
 use crate::sink::writer::{AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter};
-use crate::sink::{Result, Sink, SinkError, SinkParam, SINK_TYPE_APPEND_ONLY};
+use crate::sink::{Result, SINK_TYPE_APPEND_ONLY, Sink, SinkError, SinkParam};
 
 pub const MQTT_SINK: &str = "mqtt";
 
@@ -64,6 +65,17 @@ pub struct MqttConfig {
     // if set, will use a field value as the topic name, if topic is also set it will be used as a fallback
     #[serde(rename = "topic.field")]
     pub topic_field: Option<String>,
+
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::HashMap<String, String>,
+}
+
+crate::impl_sink_unknown_fields!(MqttConfig);
+
+impl EnforceSecret for MqttConfig {
+    fn enforce_one(prop: &str) -> crate::error::ConnectorResult<()> {
+        MqttCommon::enforce_one(prop)
+    }
 }
 
 pub enum RowEncoderWrapper {
@@ -116,6 +128,17 @@ pub struct MqttSink {
     name: String,
 }
 
+impl EnforceSecret for MqttSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            MqttConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
+
 // sink write
 pub struct MqttSinkWriter {
     pub config: MqttConfig,
@@ -128,12 +151,12 @@ pub struct MqttSinkWriter {
 
 /// Basic data types for use with the mqtt interface
 impl MqttConfig {
-    pub fn from_hashmap(values: HashMap<String, String>) -> Result<Self> {
+    pub fn from_btreemap(values: BTreeMap<String, String>) -> Result<Self> {
         let config = serde_json::from_value::<MqttConfig>(serde_json::to_value(values).unwrap())
             .map_err(|e| SinkError::Config(anyhow!(e)))?;
         if config.r#type != SINK_TYPE_APPEND_ONLY {
             Err(SinkError::Config(anyhow!(
-                "Mqtt sink only support append-only mode"
+                "MQTT sink only supports append-only mode"
             )))
         } else {
             Ok(config)
@@ -146,7 +169,7 @@ impl TryFrom<SinkParam> for MqttSink {
 
     fn try_from(param: SinkParam) -> std::result::Result<Self, Self::Error> {
         let schema = param.schema();
-        let config = MqttConfig::from_hashmap(param.properties)?;
+        let config = MqttConfig::from_btreemap(param.properties)?;
         Ok(Self {
             config,
             schema,
@@ -160,23 +183,16 @@ impl TryFrom<SinkParam> for MqttSink {
 }
 
 impl Sink for MqttSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<MqttSinkWriter>;
 
     const SINK_NAME: &'static str = MQTT_SINK;
 
-    fn is_sink_decouple(desc: &SinkDesc, user_specified: &SinkDecouple) -> Result<bool> {
-        match user_specified {
-            SinkDecouple::Default => Ok(desc.sink_type.is_append_only()),
-            SinkDecouple::Disable => Ok(false),
-            SinkDecouple::Enable => Ok(true),
-        }
-    }
+    crate::impl_validate_sink_unknown_fields!();
 
     async fn validate(&self) -> Result<()> {
         if !self.is_append_only {
             return Err(SinkError::Mqtt(anyhow!(
-                "Mqtt sink only support append-only mode"
+                "MQTT sink only supports append-only mode"
             )));
         }
 
@@ -188,7 +204,7 @@ impl Sink for MqttSink {
             )));
         }
 
-        let _client = (self.config.common.build_client(0, 0))
+        let _client = (self.config.common.build_client(0.into(), 0))
             .context("validate mqtt sink error")
             .map_err(SinkError::Mqtt)?;
 
@@ -201,7 +217,8 @@ impl Sink for MqttSink {
             self.schema.clone(),
             &self.format_desc,
             &self.name,
-            writer_param.executor_id,
+            writer_param.sink_id,
+            writer_param.actor_id,
         )
         .await?
         .into_log_sinker(usize::MAX))
@@ -214,7 +231,8 @@ impl MqttSinkWriter {
         schema: Schema,
         format_desc: &SinkFormatDesc,
         name: &str,
-        id: u64,
+        sink_id: SinkId,
+        actor_id: ActorId,
     ) -> Result<Self> {
         let mut topic_index_path = vec![];
         if let Some(field) = &config.topic_field {
@@ -222,16 +240,17 @@ impl MqttSinkWriter {
         }
 
         let timestamptz_mode = TimestamptzHandlingMode::from_options(&format_desc.options)?;
-
+        let jsonb_handling_mode = JsonbHandlingMode::from_options(&format_desc.options)?;
         let encoder = match format_desc.format {
             SinkFormat::AppendOnly => match format_desc.encode {
                 SinkEncode::Json => RowEncoderWrapper::Json(JsonEncoder::new(
                     schema.clone(),
                     None,
-                    DateHandlingMode::FromCe,
+                    DateHandlingMode::from_options(&format_desc.options)?,
                     TimestampHandlingMode::Milli,
                     timestamptz_mode,
                     TimeHandlingMode::Milli,
+                    jsonb_handling_mode,
                 )),
                 SinkEncode::Protobuf => {
                     let (descriptor, sid) = crate::schema::protobuf::fetch_descriptor(
@@ -256,20 +275,20 @@ impl MqttSinkWriter {
                     return Err(SinkError::Config(anyhow!(
                         "mqtt sink encode unsupported: {:?}",
                         format_desc.encode,
-                    )))
+                    )));
                 }
             },
             _ => {
                 return Err(SinkError::Config(anyhow!(
-                    "Mqtt sink only support append-only mode"
-                )))
+                    "MQTT sink only supports append-only mode"
+                )));
             }
         };
         let qos = config.common.qos();
 
         let (client, mut eventloop) = config
             .common
-            .build_client(0, id)
+            .build_client(actor_id, sink_id.as_raw_id())
             .map_err(|e| SinkError::Mqtt(anyhow!(e)))?;
 
         let stopped = Arc::new(AtomicBool::new(false));
@@ -288,8 +307,11 @@ impl MqttSinkWriter {
                             continue;
                         }
                         err => {
-                            tracing::error!("Failed to poll mqtt eventloop: {}", err.as_report());
-                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            tracing::error!(
+                                "failed to poll the MQTT event loop: {}",
+                                err.as_report()
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
                     },
                 }
@@ -354,7 +376,7 @@ impl MqttSinkPayloadWriter {
             ) {
                 Some(s) => s,
                 None => {
-                    tracing::error!("topic field not found in row, skipping: {:?}", row);
+                    tracing::error!("topic field not found in row; skipping row: {:?}", row);
                     return Ok(());
                 }
             };

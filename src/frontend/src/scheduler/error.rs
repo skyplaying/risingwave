@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,7 +43,9 @@ pub enum SchedulerError {
     #[error("Query cancelled: {0}")]
     QueryCancelled(String),
 
-    #[error("Reject query: the {0} query number reaches the limit: {1}")]
+    #[error(
+        "Reject query: the {0} query number reaches the limit: {1}. Use `SHOW PROCESSLIST` to check for hanging queries and cancel them if needed."
+    )]
     QueryReachLimit(QueryMode, u64),
 
     #[error(transparent)]

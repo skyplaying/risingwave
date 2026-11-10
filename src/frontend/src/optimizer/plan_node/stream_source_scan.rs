@@ -14,25 +14,22 @@
 
 use std::rc::Rc;
 
-use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::Field;
 use risingwave_common::types::DataType;
-use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::OrderType;
-use risingwave_connector::parser::additional_columns::source_add_partition_offset_cols;
-use risingwave_pb::stream_plan::stream_node::{NodeBody, PbNodeBody};
 use risingwave_pb::stream_plan::PbStreamNode;
+use risingwave_pb::stream_plan::stream_node::{NodeBody, PbNodeBody};
 
 use super::stream::prelude::*;
 use super::utils::TableCatalogBuilder;
 use super::{PlanBase, PlanRef};
 use crate::catalog::source_catalog::SourceCatalog;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::utils::{childless_record, Distill};
-use crate::optimizer::plan_node::{generic, ExprRewritable, StreamNode};
-use crate::optimizer::property::Distribution;
+use crate::optimizer::plan_node::utils::{Distill, childless_record};
+use crate::optimizer::plan_node::{ExprRewritable, StreamNode, generic};
+use crate::optimizer::property::{Distribution, MonotonicityMap, WatermarkColumns};
 use crate::scheduler::SchedulerResult;
 use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::{Explain, TableCatalog};
@@ -49,33 +46,20 @@ pub struct StreamSourceScan {
     core: generic::Source,
 }
 
-impl_plan_tree_node_for_leaf! { StreamSourceScan }
+impl_plan_tree_node_for_leaf! { Stream, StreamSourceScan }
 
 impl StreamSourceScan {
-    pub fn new(mut core: generic::Source) -> Self {
-        // XXX: do we need to include partition and offset cols here? It's needed by Backfill's input, but maybe not output?
-        // But the source's "schema" contains the hidden columns.
-        if let Some(source_catalog) = &core.catalog
-            && source_catalog.info.is_shared()
-        {
-            let (columns_exist, additional_columns) = source_add_partition_offset_cols(
-                &core.column_catalog,
-                &source_catalog.connector_name(),
-            );
-            for (existed, mut c) in columns_exist.into_iter().zip_eq_fast(additional_columns) {
-                c.is_hidden = true;
-                if !existed {
-                    core.column_catalog.push(c);
-                }
-            }
-        }
+    pub const BACKFILL_PROGRESS_COLUMN_NAME: &str = "backfill_progress";
+    pub const PARTITION_ID_COLUMN_NAME: &str = "partition_id";
 
+    pub fn new(core: generic::Source) -> Self {
         let base = PlanBase::new_stream_with_core(
             &core,
             Distribution::SomeShard,
-            core.catalog.as_ref().map_or(true, |s| s.append_only),
+            core.stream_kind(),
             false,
-            FixedBitSet::with_capacity(core.column_catalog.len()),
+            WatermarkColumns::new(),
+            MonotonicityMap::new(),
         );
 
         Self { base, core }
@@ -103,15 +87,11 @@ impl StreamSourceScan {
 
         let key = Field {
             data_type: DataType::Varchar,
-            name: "partition_id".to_string(),
-            sub_fields: vec![],
-            type_name: "".to_string(),
+            name: Self::PARTITION_ID_COLUMN_NAME.to_owned(),
         };
         let value = Field {
             data_type: DataType::Jsonb,
-            name: "backfill_progress".to_string(),
-            sub_fields: vec![],
-            type_name: "".to_string(),
+            name: Self::BACKFILL_PROGRESS_COLUMN_NAME.to_owned(),
         };
 
         let ordered_col_idx = builder.add_column(&key);
@@ -140,6 +120,7 @@ impl StreamSourceScan {
             .collect_vec();
 
         let source_catalog = self.source_catalog();
+        let (with_properties, secret_refs) = source_catalog.with_properties.clone().into_parts();
         let backfill = SourceBackfillNode {
             upstream_source_id: source_catalog.id,
             source_name: source_catalog.name.clone(),
@@ -156,8 +137,9 @@ impl StreamSourceScan {
                 .iter()
                 .map(|c| c.to_protobuf())
                 .collect_vec(),
-            with_properties: source_catalog.with_properties.clone().into_iter().collect(),
-            rate_limit: self.base.ctx().overwrite_options().streaming_rate_limit,
+            with_properties,
+            rate_limit: self.base.ctx().overwrite_options().backfill_rate_limit,
+            secret_refs,
         };
 
         let fields = self.schema().to_prost();
@@ -174,11 +156,11 @@ impl StreamSourceScan {
                     ..Default::default()
                 },
             ],
-            node_body: Some(PbNodeBody::SourceBackfill(backfill)),
+            node_body: Some(PbNodeBody::SourceBackfill(Box::new(backfill))),
             stream_key,
-            operator_id: self.base.id().0 as u64,
+            operator_id: self.base.id().to_stream_node_operator_id(),
             identity: self.distill_to_string(),
-            append_only: self.append_only(),
+            stream_kind: self.stream_kind().to_protobuf() as i32,
         })
     }
 }
@@ -195,12 +177,14 @@ impl Distill for StreamSourceScan {
     }
 }
 
-impl ExprRewritable for StreamSourceScan {}
+impl ExprRewritable<Stream> for StreamSourceScan {}
 
 impl ExprVisitable for StreamSourceScan {}
 
 impl StreamNode for StreamSourceScan {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> NodeBody {
-        unreachable!("stream source scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead.")
+        unreachable!(
+            "stream source scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead."
+        )
     }
 }

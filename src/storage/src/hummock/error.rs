@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use risingwave_object_store::object::ObjectError;
+use risingwave_pb::id::TableId;
 use thiserror::Error;
 use thiserror_ext::AsReport;
 use tokio::sync::oneshot::error::RecvError;
 
 // TODO(error-handling): should prefer use error types than strings.
-#[derive(Error, thiserror_ext::ReportDebug, thiserror_ext::Box)]
+#[derive(Error, thiserror_ext::ReportDebug, thiserror_ext::Arc)]
 #[thiserror_ext(newtype(name = HummockError, backtrace))]
 pub enum HummockErrorInner {
     #[error("Magic number mismatch: expected {expected}, found: {found}")]
@@ -45,10 +46,22 @@ pub enum HummockErrorInner {
     SharedBufferError(String),
     #[error("Wait epoch error: {0}")]
     WaitEpoch(String),
+    #[error("Next epoch error: {0}")]
+    NextEpoch(String),
+    #[error("Change log retention miss: table {table_id}, epoch {epoch}")]
+    ChangeLogRetentionMiss { table_id: TableId, epoch: u64 },
+    #[error("Time-travel version expired: table {table_id}, epoch {epoch}")]
+    TimeTravelVersionExpired { table_id: TableId, epoch: u64 },
+    #[error(
+        "Committed epoch mismatch: table {table_id}, committed_epoch {committed_epoch}, read_epoch {read_epoch}"
+    )]
+    CommittedEpochMismatch {
+        table_id: TableId,
+        committed_epoch: u64,
+        read_epoch: u64,
+    },
     #[error("Barrier read is unavailable for now. Likely the cluster is recovering")]
     ReadCurrentEpoch,
-    #[error("Expired Epoch: watermark {safe_epoch}, epoch {epoch}")]
-    ExpiredEpoch { safe_epoch: u64, epoch: u64 },
     #[error("CompactionExecutor error: {0}")]
     CompactionExecutor(String),
     #[error("FileCache error: {0}")]
@@ -62,7 +75,7 @@ pub enum HummockErrorInner {
     #[error("Read backup error: {0}")]
     ReadBackupError(String),
     #[error("Foyer error: {0}")]
-    FoyerError(anyhow::Error),
+    FoyerError(#[from] foyer::Error),
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -104,16 +117,33 @@ impl HummockError {
         HummockErrorInner::WaitEpoch(error.to_string()).into()
     }
 
+    pub fn next_epoch(error: impl ToString) -> HummockError {
+        HummockErrorInner::NextEpoch(error.to_string()).into()
+    }
+
+    pub fn change_log_retention_miss(table_id: TableId, epoch: u64) -> HummockError {
+        HummockErrorInner::ChangeLogRetentionMiss { table_id, epoch }.into()
+    }
+
+    pub fn time_travel_version_expired(table_id: TableId, epoch: u64) -> HummockError {
+        HummockErrorInner::TimeTravelVersionExpired { table_id, epoch }.into()
+    }
+
+    pub fn committed_epoch_mismatch(
+        table_id: TableId,
+        committed_epoch: u64,
+        read_epoch: u64,
+    ) -> HummockError {
+        HummockErrorInner::CommittedEpochMismatch {
+            table_id,
+            committed_epoch,
+            read_epoch,
+        }
+        .into()
+    }
+
     pub fn read_current_epoch() -> HummockError {
         HummockErrorInner::ReadCurrentEpoch.into()
-    }
-
-    pub fn expired_epoch(safe_epoch: u64, epoch: u64) -> HummockError {
-        HummockErrorInner::ExpiredEpoch { safe_epoch, epoch }.into()
-    }
-
-    pub fn is_expired_epoch(&self) -> bool {
-        matches!(self.inner(), HummockErrorInner::ExpiredEpoch { .. })
     }
 
     pub fn is_meta_error(&self) -> bool {
@@ -148,7 +178,7 @@ impl HummockError {
         HummockErrorInner::ReadBackupError(error.to_string()).into()
     }
 
-    pub fn foyer_error(error: anyhow::Error) -> HummockError {
+    pub fn foyer_error(error: foyer::Error) -> HummockError {
         HummockErrorInner::FoyerError(error).into()
     }
 

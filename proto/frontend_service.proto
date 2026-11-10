@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package frontend_service;
+
+import "ddl_service.proto";
+
+option java_package = "com.risingwave.proto";
+option optimize_for = SPEED;
+
+message GetTableReplacePlanRequest {
+  uint32 database_id = 1;
+  uint32 table_id = 2;
+  ddl_service.TableSchemaChange cdc_table_change = 3;
+}
+
+message GetTableReplacePlanResponse {
+  ddl_service.ReplaceJobPlan replace_plan = 1;
+}
+
+message GetRunningSqlsRequest {}
+
+message GetRunningSqlsResponse {
+  repeated RunningSql running_sqls = 1;
+}
+
+message RunningSql {
+  int32 process_id = 1;
+  string user_name = 2;
+  string peer_addr = 3;
+  string database = 4;
+  optional uint64 elapsed_millis = 5;
+  optional string sql = 6;
+}
+
+message GetAllCursorsRequest {}
+
+message GetAllCursorsResponse {
+  repeated AllCursors all_cursors = 1;
+}
+
+message AllCursors {
+  int32 session_id = 1;
+  string user_name = 2;
+  string peer_addr = 3;
+  string database = 4;
+  repeated string cursor_names = 5;
+}
+
+message GetAllSubCursorsRequest {}
+
+message GetAllSubCursorsResponse {
+  repeated SubscriptionCursor subscription_cursors = 1;
+}
+
+message SubscriptionCursor {
+  int32 session_id = 1;
+  string user_name = 2;
+  string peer_addr = 3;
+  string database = 4;
+  repeated string states = 5;
+  repeated uint64 idle_durations = 6;
+  repeated string subscription_names = 7;
+  repeated string cursor_names = 8;
+}
+
+message CancelRunningSqlRequest {
+  int32 process_id = 1;
+}
+
+message CancelRunningSqlResponse {}
+
+service FrontendService {
+  rpc GetTableReplacePlan(GetTableReplacePlanRequest) returns (GetTableReplacePlanResponse);
+  rpc GetRunningSqls(GetRunningSqlsRequest) returns (GetRunningSqlsResponse);
+  rpc GetAllCursors(GetAllCursorsRequest) returns (GetAllCursorsResponse);
+  rpc GetAllSubCursors(GetAllSubCursorsRequest) returns (GetAllSubCursorsResponse);
+  rpc CancelRunningSql(CancelRunningSqlRequest) returns (CancelRunningSqlResponse);
+}

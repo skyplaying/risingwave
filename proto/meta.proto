@@ -6,6 +6,7 @@ import "backup_service.proto";
 import "catalog.proto";
 import "common.proto";
 import "hummock.proto";
+import "secret.proto";
 import "source.proto";
 import "stream_plan.proto";
 import "user.proto";
@@ -25,14 +26,9 @@ service TelemetryInfoService {
 }
 
 message HeartbeatRequest {
-  message ExtraInfo {
-    oneof info {
-      uint64 hummock_gc_watermark = 1;
-    }
-  }
   uint32 node_id = 1;
-  // Lightweight info piggybacked by heartbeat request.
-  repeated ExtraInfo info = 2;
+  reserved 2;
+  reserved "resource";
 }
 
 message HeartbeatResponse {
@@ -43,7 +39,9 @@ service HeartbeatService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
-// Fragments of a Streaming Job
+// Fragments of a Streaming Job.
+// It's for all kinds of streaming jobs, and ideally should be called `StreamingJobFragments`.
+// It's not the same as a storage table correlated with a `TableCatalog`.
 message TableFragments {
   // The state of the fragments of this table
   enum State {
@@ -57,18 +55,11 @@ message TableFragments {
   }
   // Runtime information of an actor
   message ActorStatus {
-    // Current state of actor
-    enum ActorState {
-      UNSPECIFIED = 0;
-      // Initial state after creation
-      INACTIVE = 1;
-      // Running normally
-      RUNNING = 2;
-    }
-    // Current on which parallel unit
-    common.ParallelUnit parallel_unit = 1;
-    // Current state
-    ActorState state = 2;
+    // Current on which worker
+    common.ActorLocation location = 1;
+    // Field 2 for actor state has been reserved for backward compatibility.
+    reserved 2;
+    reserved "state";
   }
   message Fragment {
     enum FragmentDistributionType {
@@ -81,34 +72,64 @@ message TableFragments {
     uint32 fragment_type_mask = 2;
     FragmentDistributionType distribution_type = 3;
     repeated stream_plan.StreamActor actors = 4;
+
+    // NOTE: vnode_mapping is deprecated, we will generate the vnode_mapping by actors' bitmaps
     // Vnode mapping (which should be set in upstream dispatcher) of the fragment.
     // This field is always set to `Some`. For singleton, the parallel unit for all vnodes will be the same.
-    common.ParallelUnitMapping vnode_mapping = 5;
+    reserved 5;
+    reserved "vnode_mapping";
+
     repeated uint32 state_table_ids = 6;
     // Note that this can be derived backwards from the upstream actors of the Actor held by the Fragment,
     // but in some scenarios (e.g. Scaling) it will lead to a lot of duplicate code,
     // so we pre-generate and store it here, this member will only be initialized when creating the Fragment
     // and modified when creating the mv-on-mv
     repeated uint32 upstream_fragment_ids = 7;
+
+    // Total vnode count of the fragment (then all internal tables).
+    // Duplicated from the length of the vnode bitmap in any actor of the fragment.
+    //
+    // Can be unset if the fragment is created in older versions where variable vnode count is not
+    // supported, in which case a default value of 256 (or 1 for singleton) should be used.
+    // Use `VnodeCountCompat::vnode_count` to access it.
+    optional uint32 maybe_vnode_count = 8;
+
+    stream_plan.StreamNode nodes = 9;
   }
+  // The id of the streaming job.
   uint32 table_id = 1;
   State state = 2;
   map<uint32, Fragment> fragments = 3;
   map<uint32, ActorStatus> actor_status = 4;
-  map<uint32, source.ConnectorSplits> actor_splits = 5;
+
+  reserved 5;
+  reserved "actor_splits";
 
   stream_plan.StreamContext ctx = 6;
-  TableParallelism parallelism = 7;
-}
 
-/// Parallel unit mapping with fragment id, used for notification.
-message FragmentParallelUnitMapping {
-  uint32 fragment_id = 1;
-  common.ParallelUnitMapping mapping = 2;
-}
+  reserved 7;
+  reserved "parallelism";
+  // The max parallelism specified when the streaming job was created, i.e., expected vnode count.
+  //
+  // The reason for persisting this value is mainly to check if a parallelism change (via `ALTER
+  // .. SET PARALLELISM`) is valid, so that the behavior can be consistent with the creation of
+  // the streaming job.
+  //
+  // Note that the actual vnode count, denoted by `vnode_count` in `fragments`, may be different
+  // from this value (see `StreamFragmentGraph.max_parallelism` for more details.). As a result,
+  // checking the parallelism change with this value can be inaccurate in some cases. However,
+  // when generating resizing plans, we still take the `vnode_count` of each fragment into account.
+  //
+  // Can be unset if the fragment is created in older versions where variable vnode count is not
+  // supported, in which case a default value of 256 should be used.
+  optional uint32 max_parallelism = 10;
 
-message FragmentParallelUnitMappings {
-  repeated FragmentParallelUnitMapping mappings = 1;
+  // Actors of a materialize view, sink, or table can only be scheduled on nodes with matching node_label.
+  string node_label = 8;
+
+  // If this is a materialized view: True if backfill is done, else false.
+  // If this is a regular table: Always true.
+  bool backfill_done = 9;
 }
 
 /// Worker slot mapping with fragment id, used for notification.
@@ -128,41 +149,39 @@ message ActorLocation {
 }
 
 message MigrationPlan {
+  // NOTE: parallel_unit_migration_plan is deprecated, using worker_slot_migration_plan instead
   // map<parallel_unit_id, parallel_unit>, the plan indicates that the actors will be migrated from old parallel unit to the new one.
-  map<uint32, common.ParallelUnit> parallel_unit_migration_plan = 1;
+  reserved 1;
+  reserved "parallel_unit_migration_plan";
+
+  // map<src_worker_slot_id, dst_worker_slot_id>, the plan indicates that the actors will be migrated from old worker_slot to the new one.
+  map<uint64, uint64> worker_slot_migration_plan = 2;
 }
 
 message FlushRequest {
-  bool checkpoint = 1;
+  uint32 database_id = 1;
 }
 
 message FlushResponse {
   common.Status status = 1;
-  hummock.HummockSnapshot snapshot = 2;
-}
-
-// The reason why the data sources in the cluster are paused.
-enum PausedReason {
-  PAUSED_REASON_UNSPECIFIED = 0;
-  // The cluster is paused due to configuration change, e.g. altering table schema and scaling.
-  PAUSED_REASON_CONFIG_CHANGE = 1;
-  // The cluster is paused due to manual operation, e.g. `risectl` command or the
-  // `pause_on_next_bootstrap` system variable.
-  PAUSED_REASON_MANUAL = 2;
+  uint64 hummock_version_id = 2;
 }
 
 message PauseRequest {}
 
-message PauseResponse {
-  optional PausedReason prev = 1;
-  optional PausedReason curr = 2;
-}
+message PauseResponse {}
 
 message ResumeRequest {}
 
-message ResumeResponse {
-  optional PausedReason prev = 1;
-  optional PausedReason curr = 2;
+message ResumeResponse {}
+
+message RefreshRequest {
+  uint32 table_id = 1;
+  uint32 associated_source_id = 2;
+}
+
+message RefreshResponse {
+  common.Status status = 1;
 }
 
 message CancelCreatingJobsRequest {
@@ -212,30 +231,93 @@ message ListTableFragmentsResponse {
   map<uint32, TableFragmentInfo> table_fragments = 1;
 }
 
-message ListTableFragmentStatesRequest {}
+message GetFragmentByIdRequest {
+  uint32 fragment_id = 1;
+}
 
-message ListTableFragmentStatesResponse {
-  message TableFragmentState {
+message GetFragmentByIdResponse {
+  FragmentDistribution distribution = 1;
+}
+
+message GetFragmentVnodesRequest {
+  uint32 fragment_id = 1;
+}
+
+message GetFragmentVnodesResponse {
+  message ActorVnodes {
+    uint32 actor_id = 1;
+    repeated uint32 vnode_indices = 2;
+  }
+  repeated ActorVnodes actor_vnodes = 1;
+}
+
+message GetActorVnodesRequest {
+  uint32 actor_id = 1;
+}
+
+message GetActorVnodesResponse {
+  repeated uint32 vnode_indices = 1;
+}
+
+message ListStreamingJobStatesRequest {}
+
+message ListStreamingJobStatesResponse {
+  message StreamingJobState {
     uint32 table_id = 1;
     TableFragments.State state = 2;
     TableParallelism parallelism = 3;
+    uint32 max_parallelism = 4;
+    string name = 5;
+    string resource_group = 6;
+    string config_override = 9;
+    uint32 database_id = 7;
+    uint32 schema_id = 8;
+    optional string adaptive_parallelism_strategy = 10;
   }
-  repeated TableFragmentState states = 1;
+  repeated StreamingJobState states = 1;
 }
 
-message ListFragmentDistributionRequest {}
+message ListFragmentDistributionRequest {
+  optional bool include_node = 1;
+}
+
+message FragmentDistribution {
+  uint32 fragment_id = 1;
+  uint32 table_id = 2;
+  TableFragments.Fragment.FragmentDistributionType distribution_type = 3;
+  repeated uint32 state_table_ids = 4;
+  repeated uint32 upstream_fragment_ids = 5;
+  uint32 fragment_type_mask = 6;
+  uint32 parallelism = 7;
+  uint32 vnode_count = 8;
+  stream_plan.StreamNode node = 9;
+  string parallelism_policy = 10;
+}
 
 message ListFragmentDistributionResponse {
-  message FragmentDistribution {
-    uint32 fragment_id = 1;
-    uint32 table_id = 2;
-    TableFragments.Fragment.FragmentDistributionType distribution_type = 3;
-    repeated uint32 state_table_ids = 4;
-    repeated uint32 upstream_fragment_ids = 5;
-    uint32 fragment_type_mask = 6;
-    uint32 parallelism = 7;
-  }
   repeated FragmentDistribution distributions = 1;
+}
+
+// List fragments containing stream scans, and corresponding
+// to a streaming job in creation.
+message ListCreatingFragmentDistributionRequest {
+  optional bool include_node = 1;
+}
+
+// List fragments containing stream scans, and corresponding
+// to a streaming job in creation.
+message ListCreatingFragmentDistributionResponse {
+  repeated FragmentDistribution distributions = 1;
+}
+
+message ListSinkLogStoreTablesRequest {}
+
+message ListSinkLogStoreTablesResponse {
+  message SinkLogStoreTable {
+    uint32 sink_id = 1;
+    uint32 internal_table_id = 2;
+  }
+  repeated SinkLogStoreTable tables = 1;
 }
 
 message ListActorStatesRequest {}
@@ -244,33 +326,54 @@ message ListActorStatesResponse {
   message ActorState {
     uint32 actor_id = 1;
     uint32 fragment_id = 2;
-    uint32 parallel_unit_id = 3;
-    TableFragments.ActorStatus.ActorState state = 4;
+    reserved 3;
+    reserved "parallel_unit_id";
+    reserved 4;
+    reserved "state";
+    uint32 worker_id = 5;
   }
   repeated ActorState states = 1;
 }
 
-message ListObjectDependenciesRequest {}
+message ListActorSplitsRequest {}
 
-message ListObjectDependenciesResponse {
-  message ObjectDependencies {
-    uint32 object_id = 1;
-    uint32 referenced_object_id = 2;
+message ListActorSplitsResponse {
+  enum FragmentType {
+    UNSPECIFIED = 0;
+    NON_SHARED_SOURCE = 1;
+    SHARED_SOURCE = 2;
+    SHARED_SOURCE_BACKFILL = 3;
   }
-  repeated ObjectDependencies dependencies = 1;
+  message ActorSplit {
+    uint32 actor_id = 1;
+    uint32 fragment_id = 2;
+    uint32 source_id = 3;
+    string split_id = 4;
+    FragmentType fragment_type = 5;
+  }
+  repeated ActorSplit actor_splits = 1;
+}
+
+message ObjectDependency {
+  uint32 object_id = 1;
+  uint32 referenced_object_id = 2;
+  common.ObjectType referenced_object_type = 3;
 }
 
 enum ThrottleTarget {
   THROTTLE_TARGET_UNSPECIFIED = 0;
   SOURCE = 1;
   MV = 2;
-  TABLE_WITH_SOURCE = 3;
+  TABLE = 3;
+  SINK = 4;
+  FRAGMENT = 5;
 }
 
 message ApplyThrottleRequest {
-  ThrottleTarget kind = 1;
-  uint32 id = 2;
-  optional uint32 rate = 3;
+  ThrottleTarget throttle_target = 1;
+  common.ThrottleType throttle_type = 2;
+  uint32 id = 3;
+  optional uint32 rate = 4;
 }
 
 message ApplyThrottleResponse {
@@ -281,41 +384,159 @@ message RecoverRequest {}
 
 message RecoverResponse {}
 
+message AlterConnectorPropsRequest {
+  message AlterIcebergTableIds {
+    uint32 source_id = 1;
+    uint32 sink_id = 2;
+  }
+  enum AlterConnectorPropsObject {
+    UNSPECIFIED = 0;
+    SOURCE = 1;
+    SINK = 2;
+    CONNECTION = 3;
+    ICEBERG_TABLE = 4;
+  }
+
+  uint32 object_id = 1;
+  map<string, string> changed_props = 2;
+  map<string, secret.SecretRef> changed_secret_refs = 3;
+  optional uint32 connector_conn_ref = 4;
+  AlterConnectorPropsObject object_type = 5;
+  oneof extra_options {
+    AlterIcebergTableIds alter_iceberg_table_ids = 6;
+  }
+}
+
+message AlterConnectorPropsResponse {}
+
+// Options for controlling the safe property update workflow
+message PropertyUpdateOptions {
+  // If true, reset split assignments after updating properties
+  // This causes splits to be re-discovered from upstream
+  bool reset_splits = 1;
+}
+
+// Request for orchestrated source property update with pause/resume
+message AlterSourcePropertiesSafeRequest {
+  uint32 source_id = 1;
+  map<string, string> changed_props = 2;
+  map<string, secret.SecretRef> changed_secret_refs = 3;
+  PropertyUpdateOptions options = 4;
+}
+
+message AlterSourcePropertiesSafeResponse {}
+
+// Request to reset source split assignments (UNSAFE - admin only)
+message ResetSourceSplitsRequest {
+  uint32 source_id = 1;
+}
+
+message ResetSourceSplitsResponse {}
+
+// Request to inject specific offsets into source splits (UNSAFE - admin only)
+message InjectSourceOffsetsRequest {
+  uint32 source_id = 1;
+  // Split ID -> offset (JSON-encoded based on connector type)
+  map<string, string> split_offsets = 2;
+}
+
+message InjectSourceOffsetsResponse {
+  repeated string applied_split_ids = 1;
+}
+
+message ListCdcProgressRequest {}
+
+message ListCdcProgressResponse {
+  message CdcProgress {
+    uint64 split_total_count = 1;
+    uint64 split_backfilled_count = 2;
+    uint64 split_completed_count = 3;
+  }
+  map<uint32, CdcProgress> cdc_progress = 1;
+}
+
+message ListRefreshTableStatesRequest {}
+
+message ListRefreshTableStatesResponse {
+  message RefreshTableState {
+    uint32 table_id = 1;
+    string current_status = 2;
+    optional string last_trigger_time = 3;
+    optional int64 trigger_interval_secs = 4;
+    optional string last_success_time = 5;
+  }
+  repeated RefreshTableState states = 1;
+}
+
+message ListIcebergCompactionStatusRequest {}
+
+message ListIcebergCompactionStatusResponse {
+  message IcebergCompactionStatus {
+    uint32 sink_id = 1;
+    string task_type = 2;
+    uint64 trigger_interval_sec = 3;
+    uint64 trigger_snapshot_count = 4;
+    string schedule_state = 5;
+    optional uint64 next_compaction_after_sec = 6;
+    // V1 approximates pending snapshot backlog with in-memory sink commit backlog.
+    optional uint64 pending_snapshot_count = 7;
+    bool is_triggerable = 8;
+    // Compaction health below is kept in meta memory and resets when meta restarts.
+    // Timestamps are Unix epoch milliseconds.
+    optional int64 last_success_at_ms = 9;
+    optional int64 last_failure_at_ms = 10;
+    optional string last_error = 11;
+    uint32 consecutive_failures = 12;
+    // Commit-time gap between the latest observed snapshot and the snapshot consumed
+    // by the last completed compaction.
+    optional uint64 compaction_lag_sec = 13;
+  }
+  repeated IcebergCompactionStatus statuses = 1;
+}
+
 service StreamManagerService {
   rpc Flush(FlushRequest) returns (FlushResponse);
   rpc Pause(PauseRequest) returns (PauseResponse);
   rpc Resume(ResumeRequest) returns (ResumeResponse);
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
   rpc CancelCreatingJobs(CancelCreatingJobsRequest) returns (CancelCreatingJobsResponse);
   rpc ListTableFragments(ListTableFragmentsRequest) returns (ListTableFragmentsResponse);
-  rpc ListTableFragmentStates(ListTableFragmentStatesRequest) returns (ListTableFragmentStatesResponse);
+  rpc ListStreamingJobStates(ListStreamingJobStatesRequest) returns (ListStreamingJobStatesResponse);
   rpc ListFragmentDistribution(ListFragmentDistributionRequest) returns (ListFragmentDistributionResponse);
+  rpc ListCreatingFragmentDistribution(ListCreatingFragmentDistributionRequest) returns (ListCreatingFragmentDistributionResponse);
+  rpc ListSinkLogStoreTables(ListSinkLogStoreTablesRequest) returns (ListSinkLogStoreTablesResponse);
   rpc ListActorStates(ListActorStatesRequest) returns (ListActorStatesResponse);
-  rpc ListObjectDependencies(ListObjectDependenciesRequest) returns (ListObjectDependenciesResponse);
+  rpc ListActorSplits(ListActorSplitsRequest) returns (ListActorSplitsResponse);
   rpc ApplyThrottle(ApplyThrottleRequest) returns (ApplyThrottleResponse);
   rpc Recover(RecoverRequest) returns (RecoverResponse);
+  rpc ListRateLimits(ListRateLimitsRequest) returns (ListRateLimitsResponse);
+  rpc AlterConnectorProps(AlterConnectorPropsRequest) returns (AlterConnectorPropsResponse);
+  rpc AlterSourcePropertiesSafe(AlterSourcePropertiesSafeRequest) returns (AlterSourcePropertiesSafeResponse);
+  rpc ResetSourceSplits(ResetSourceSplitsRequest) returns (ResetSourceSplitsResponse);
+  rpc InjectSourceOffsets(InjectSourceOffsetsRequest) returns (InjectSourceOffsetsResponse);
+  rpc GetFragmentById(GetFragmentByIdRequest) returns (GetFragmentByIdResponse);
+  rpc GetFragmentVnodes(GetFragmentVnodesRequest) returns (GetFragmentVnodesResponse);
+  rpc GetActorVnodes(GetActorVnodesRequest) returns (GetActorVnodesResponse);
+  rpc SetSyncLogStoreAligned(SetSyncLogStoreAlignedRequest) returns (SetSyncLogStoreAlignedResponse);
+  rpc ListCdcProgress(ListCdcProgressRequest) returns (ListCdcProgressResponse);
+  rpc ListUnmigratedTables(ListUnmigratedTablesRequest) returns (ListUnmigratedTablesResponse);
+  rpc ListRefreshTableStates(ListRefreshTableStatesRequest) returns (ListRefreshTableStatesResponse);
+  rpc ListIcebergCompactionStatus(ListIcebergCompactionStatusRequest) returns (ListIcebergCompactionStatusResponse);
 }
 
 // Below for cluster service.
-
 message AddWorkerNodeRequest {
-  message Property {
-    uint64 worker_node_parallelism = 1;
-    bool is_streaming = 2;
-    bool is_serving = 3;
-    bool is_unschedulable = 4;
-  }
   common.WorkerType worker_type = 1;
   common.HostAddress host = 2;
   reserved 3;
-  Property property = 4;
+  reserved 4;
   common.WorkerNode.Resource resource = 5;
+  common.WorkerNode.Property property = 6;
 }
 
 message AddWorkerNodeResponse {
-  reserved 3;
-  reserved "system_params";
-  common.Status status = 1;
   optional uint32 node_id = 2;
+  string cluster_id = 4;
 }
 
 message ActivateWorkerNodeRequest {
@@ -335,22 +556,6 @@ message DeleteWorkerNodeResponse {
   common.Status status = 1;
 }
 
-// Mark CN as schedulable or as unschedulable
-message UpdateWorkerNodeSchedulabilityRequest {
-  enum Schedulability {
-    UNSPECIFIED = 0;
-    SCHEDULABLE = 1;
-    UNSCHEDULABLE = 2;
-  }
-
-  repeated uint32 worker_ids = 1;
-  Schedulability schedulability = 2;
-}
-
-message UpdateWorkerNodeSchedulabilityResponse {
-  common.Status status = 1;
-}
-
 message ListAllNodesRequest {
   optional common.WorkerType worker_type = 1;
   // Whether to include nodes still starting
@@ -362,12 +567,32 @@ message ListAllNodesResponse {
   repeated common.WorkerNode nodes = 2;
 }
 
+message GetClusterRecoveryStatusRequest {}
+
+enum RecoveryStatus {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_STARTING = 1;
+  STATUS_RECOVERING = 2;
+  STATUS_RUNNING = 3;
+}
+
+message GetClusterRecoveryStatusResponse {
+  RecoveryStatus status = 1;
+}
+
+message GetMetaStoreInfoRequest {}
+
+message GetMetaStoreInfoResponse {
+  string meta_store_endpoint = 1;
+}
+
 service ClusterService {
   rpc AddWorkerNode(AddWorkerNodeRequest) returns (AddWorkerNodeResponse);
   rpc ActivateWorkerNode(ActivateWorkerNodeRequest) returns (ActivateWorkerNodeResponse);
   rpc DeleteWorkerNode(DeleteWorkerNodeRequest) returns (DeleteWorkerNodeResponse);
-  rpc UpdateWorkerNodeSchedulability(UpdateWorkerNodeSchedulabilityRequest) returns (UpdateWorkerNodeSchedulabilityResponse);
   rpc ListAllNodes(ListAllNodesRequest) returns (ListAllNodesResponse);
+  rpc GetClusterRecoveryStatus(GetClusterRecoveryStatusRequest) returns (GetClusterRecoveryStatusResponse);
+  rpc GetMetaStoreInfo(GetMetaStoreInfoRequest) returns (GetMetaStoreInfoResponse);
 }
 
 enum SubscribeType {
@@ -408,8 +633,10 @@ message MetaSnapshot {
   reserved "parallel_unit_mappings";
   GetSessionParamsResponse session_params = 20;
   repeated catalog.Secret secrets = 23;
+  reserved 24;
+  reserved "compute_node_total_cpu_count";
+  common.ClusterResource cluster_resource = 25;
   repeated common.WorkerNode nodes = 10;
-  hummock.HummockSnapshot hummock_snapshot = 11;
   hummock.HummockVersion hummock_version = 12;
   backup_service.MetaBackupManifestId meta_backup_manifest_id = 14;
   hummock.WriteLimits hummock_write_limits = 16;
@@ -419,23 +646,31 @@ message MetaSnapshot {
   // for streaming
   repeated FragmentWorkerSlotMapping streaming_worker_slot_mappings = 21;
   repeated FragmentWorkerSlotMapping serving_worker_slot_mappings = 22;
+  repeated ObjectDependency object_dependencies = 26;
+  TableRefillRuntimeConfig table_refill_runtime_config = 27;
 
   SnapshotVersion version = 13;
 }
 
-message Relation {
-  oneof relation_info {
-    catalog.Table table = 1;
-    catalog.Source source = 2;
-    catalog.Sink sink = 3;
+message Object {
+  oneof object_info {
+    catalog.Database database = 1;
+    catalog.Schema schema = 2;
+    catalog.Table table = 3;
     catalog.Index index = 4;
-    catalog.View view = 5;
-    catalog.Subscription subscription = 6;
+    catalog.Source source = 5;
+    catalog.Sink sink = 6;
+    catalog.View view = 7;
+    catalog.Function function = 8;
+    catalog.Connection connection = 9;
+    catalog.Subscription subscription = 10;
+    catalog.Secret secret = 11;
   }
 }
 
-message RelationGroup {
-  repeated Relation relations = 1;
+message ObjectGroup {
+  repeated Object objects = 1;
+  repeated ObjectDependency dependencies = 2;
 }
 
 message Recovery {}
@@ -450,7 +685,10 @@ message SubscribeResponse {
   }
   common.Status status = 1;
   Operation operation = 2;
+
+  // Catalog version
   uint64 version = 3;
+
   oneof info {
     catalog.Database database = 4;
     catalog.Schema schema = 5;
@@ -458,24 +696,68 @@ message SubscribeResponse {
     user.UserInfo user = 11;
     SetSessionParamRequest session_param = 26;
     common.WorkerNode node = 13;
-    hummock.HummockSnapshot hummock_snapshot = 14;
     hummock.HummockVersionDeltas hummock_version_deltas = 15;
     MetaSnapshot snapshot = 16;
     backup_service.MetaBackupManifestId meta_backup_manifest_id = 17;
     SystemParams system_params = 19;
     hummock.WriteLimits hummock_write_limits = 20;
-    RelationGroup relation_group = 21;
+    ObjectGroup object_group = 21;
     catalog.Connection connection = 22;
     hummock.HummockVersionStats hummock_stats = 24;
     Recovery recovery = 25;
     FragmentWorkerSlotMapping streaming_worker_slot_mapping = 27;
     FragmentWorkerSlotMappings serving_worker_slot_mappings = 28;
     catalog.Secret secret = 29;
+    common.ClusterResource cluster_resource = 31;
+    TableRefillRuntimeConfig table_refill_runtime_config = 32;
   }
   reserved 12;
   reserved "parallel_unit_mapping";
   reserved 23;
   reserved "serving_parallel_unit_mappings";
+  reserved 30;
+  reserved "compute_node_total_cpu_count";
+}
+
+message TableRefillRuntimeConfig {
+  TableCacheRefillPolicies table_cache_refill_policies = 1;
+  ServingTableVnodeMappings serving_table_vnode_mappings = 2;
+  uint64 version = 3;
+}
+
+message ServingTableVnodeMappings {
+  repeated ServingTableVnodeMapping mappings = 1;
+  message ServingTableVnodeMapping {
+    uint32 table_id = 1;
+    common.Buffer bitmap = 2;
+  }
+}
+
+message TableCacheRefillPolicies {
+  // Contains explicit result-table overrides only.
+  repeated TableCacheRefillPolicy table_policies = 1;
+  // Contains explicit internal-table overrides only.
+  repeated TableCacheRefillPolicy internal_table_policies = 2;
+
+  message TableCacheRefillPolicy {
+    uint32 table_id = 1;
+    CacheRefillPolicy policy = 2;
+
+    enum CacheRefillPolicy {
+      /// Unspecified policy, use global default configuration.
+      UNSPECIFIED = 0;
+      /// Enable normal cache refill for the table.
+      ENABLED = 1;
+      /// Disable cache refill for the table.
+      DISABLED = 2;
+      /// Enable cache refill optimized for streaming workloads for this table.
+      STREAMING = 3;
+      /// Enable cache refill optimized for serving workloads for this table.
+      SERVING = 4;
+      /// Enable cache refill optimized for both streaming and serving workloads for this table.
+      BOTH = 5;
+    }
+  }
 }
 
 service NotificationService {
@@ -487,21 +769,25 @@ message GetClusterInfoRequest {}
 message GetClusterInfoResponse {
   repeated common.WorkerNode worker_nodes = 1;
   repeated TableFragments table_fragments = 2;
+  // `Source` and `SourceBackfill` are handled together here.
   map<uint32, source.ConnectorSplits> actor_splits = 3;
   map<uint32, catalog.Source> source_infos = 4;
   uint64 revision = 5;
 }
 
-message Reschedule {
-  repeated uint32 added_parallel_units = 1;
-  repeated uint32 removed_parallel_units = 2;
+// For each fragment that needs to be rescheduled, there will be a WorkerReschedule,
+// indicating on which workers the actors of this fragment need to be changed and by how many.
+message WorkerReschedule {
+  // worker_id -> actor_diff
+  map<uint32, int32> worker_actor_diff = 1;
 }
 
 message RescheduleRequest {
-  // reschedule plan for each fragment
-  map<uint32, Reschedule> reschedules = 1;
+  reserved "reschedules";
+  reserved 1;
   uint64 revision = 2;
   bool resolve_no_shuffle_upstream = 3;
+  map<uint32, WorkerReschedule> worker_reschedules = 4;
 }
 
 message RescheduleResponse {
@@ -529,40 +815,38 @@ message TableParallelism {
   }
 }
 
-message GetReschedulePlanRequest {
-  uint64 revision = 1;
+// Changes a streaming job in place by overwriting its node_label.
+// This may cause the re-scheduling of the streaming job actors.
+message UpdateStreamingJobNodeLabelsRequest {
+  // Id of the materialized view, table, or sink which we want to update
+  uint32 id = 1;
 
-  message WorkerChanges {
-    repeated uint32 include_worker_ids = 1;
-    repeated uint32 exclude_worker_ids = 2;
-    optional uint32 target_parallelism = 3;
-    optional uint32 target_parallelism_per_worker = 4;
-  }
-
-  message StableResizePolicy {
-    map<uint32, WorkerChanges> fragment_worker_changes = 1;
-  }
-
-  oneof policy {
-    // The StableResizePolicy will generate a stable ReschedulePlan, without altering the distribution on WorkerId that's not involved.
-    // Note that this "Stable" doesn't refer to the "determinacy" of the algorithm.
-    // Multiple repeated calls may yield different ReschedulePlan results.
-    StableResizePolicy stable_resize_policy = 2;
-  }
+  // replace the node_label of the streaming job with a given id with below value
+  string node_label = 2;
 }
 
-message GetReschedulePlanResponse {
-  uint64 revision = 1;
-  // reschedule plan for each fragment
-  map<uint32, Reschedule> reschedules = 2;
-  // todo, refactor needed
-  bool success = 3;
+// We do not need to add an explicit status field here, we can just use the RPC status
+message UpdateStreamingJobNodeLabelsResponse {}
+
+message GetServerlessStreamingJobsStatusRequest {}
+
+// Descriptions of MVs and sinks
+message GetServerlessStreamingJobsStatusResponse {
+  message Status {
+    uint32 table_id = 1;
+    string node_label = 2;
+    bool backfill_done = 3;
+  }
+
+  repeated Status streaming_job_statuses = 1;
 }
 
+// This is used by `risectl`
 service ScaleService {
   rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
   rpc Reschedule(RescheduleRequest) returns (RescheduleResponse);
-  rpc GetReschedulePlan(GetReschedulePlanRequest) returns (GetReschedulePlanResponse);
+  rpc UpdateStreamingJobNodeLabels(UpdateStreamingJobNodeLabelsRequest) returns (UpdateStreamingJobNodeLabelsResponse);
+  rpc GetServerlessStreamingJobsStatus(GetServerlessStreamingJobsStatusRequest) returns (GetServerlessStreamingJobsStatusResponse);
 }
 
 message MembersRequest {}
@@ -590,7 +874,9 @@ message SystemParams {
   optional uint64 checkpoint_frequency = 2;
   optional uint32 sstable_size_mb = 3;
   optional uint32 block_size_kb = 4;
-  optional double bloom_false_positive = 5;
+  // Deprecated. Bloom filter is no longer a supported SST filter implementation; the field is
+  // kept for backward compatibility and no longer controls whether SST filters are emitted.
+  optional double bloom_false_positive = 5 [deprecated = true];
   optional string state_store = 6;
   optional string data_directory = 7;
   optional string backup_storage_url = 8;
@@ -602,6 +888,12 @@ message SystemParams {
   optional bool pause_on_next_bootstrap = 13;
   optional string wasm_storage_url = 14 [deprecated = true];
   optional bool enable_tracing = 15;
+  optional bool use_new_object_prefix_strategy = 16;
+  optional string license_key = 17;
+  optional uint64 time_travel_retention_ms = 18;
+  optional string adaptive_parallelism_strategy = 19;
+  optional bool per_database_isolation = 20;
+  optional bool enforce_secret = 21;
 }
 
 message GetSystemParamsRequest {}
@@ -620,9 +912,17 @@ message SetSystemParamResponse {
   optional SystemParams params = 1;
 }
 
+message ClearFileCacheRequest {
+  bool clear_meta_cache = 1;
+  bool clear_data_cache = 2;
+}
+
+message ClearFileCacheResponse {}
+
 service SystemParamsService {
   rpc GetSystemParams(GetSystemParamsRequest) returns (GetSystemParamsResponse);
   rpc SetSystemParam(SetSystemParamRequest) returns (SetSystemParamResponse);
+  rpc ClearFileCache(ClearFileCacheRequest) returns (ClearFileCacheResponse);
 }
 
 message GetSessionParamsRequest {}
@@ -656,8 +956,20 @@ message GetServingVnodeMappingsResponse {
   repeated FragmentWorkerSlotMapping worker_slot_mappings = 3;
 }
 
+message WarmUpTableCacheRequest {
+  uint32 table_id = 1;
+  // Maximum number of vnodes scanned concurrently on each compute node.
+  uint32 concurrency = 2;
+}
+
+message WarmUpTableCacheResponse {
+  uint64 key_count = 1;
+  uint32 worker_count = 2;
+}
+
 service ServingService {
   rpc GetServingVnodeMappings(GetServingVnodeMappingsRequest) returns (GetServingVnodeMappingsResponse);
+  rpc WarmUpTableCache(WarmUpTableCacheRequest) returns (WarmUpTableCacheResponse);
 }
 
 message EventLog {
@@ -684,6 +996,7 @@ message EventLog {
     double duration_sec = 3;
     string command = 4;
     string barrier_kind = 5;
+    uint32 database_id = 6;
   }
   message EventInjectBarrierFail {
     uint64 prev_epoch = 1;
@@ -691,8 +1004,8 @@ message EventLog {
     string error = 3;
   }
   message EventCollectBarrierFail {
-    uint64 prev_epoch = 1;
-    uint64 cur_epoch = 2;
+    reserved 1, 2;
+    reserved "prev_epoch", "cur_epoch";
     string error = 3;
   }
   message EventWorkerNodePanic {
@@ -700,6 +1013,51 @@ message EventLog {
     common.WorkerType worker_type = 2;
     common.HostAddress host_addr = 3;
     string panic_info = 4;
+  }
+  message EventAutoSchemaChangeFail {
+    uint32 table_id = 1;
+    string table_name = 2;
+    string cdc_table_id = 3;
+    string upstream_ddl = 4;
+    string fail_info = 5;
+  }
+  message EventSinkFail {
+    uint32 sink_id = 1;
+    string sink_name = 2;
+    string connector = 3;
+    string error = 4;
+  }
+  message EventRecovery {
+    message GlobalRecoveryStart {
+      string reason = 1;
+    }
+    message GlobalRecoverySuccess {
+      string reason = 1;
+      float duration_secs = 2;
+      repeated uint32 running_database_ids = 3;
+      repeated uint32 recovering_database_ids = 4;
+    }
+    message GlobalRecoveryFailure {
+      string reason = 1;
+      string error = 2;
+    }
+    message DatabaseRecoveryStart {
+      uint32 database_id = 1;
+    }
+    message DatabaseRecoveryFailure {
+      uint32 database_id = 1;
+    }
+    message DatabaseRecoverySuccess {
+      uint32 database_id = 1;
+    }
+    oneof recovery_event {
+      GlobalRecoveryStart global_start = 1;
+      GlobalRecoverySuccess global_success = 2;
+      GlobalRecoveryFailure global_failure = 3;
+      DatabaseRecoveryStart database_start = 4;
+      DatabaseRecoveryFailure database_failure = 5;
+      DatabaseRecoverySuccess database_success = 6;
+    }
   }
   // Event logs identifier, which should be populated by event log service.
   optional string unique_id = 1;
@@ -713,6 +1071,9 @@ message EventLog {
     EventInjectBarrierFail inject_barrier_fail = 7;
     EventCollectBarrierFail collect_barrier_fail = 8;
     EventLog.EventWorkerNodePanic worker_node_panic = 9;
+    EventLog.EventAutoSchemaChangeFail auto_schema_change_fail = 10;
+    EventLog.EventSinkFail sink_fail = 11;
+    EventRecovery recovery = 12;
   }
 }
 
@@ -726,6 +1087,8 @@ message AddEventLogRequest {
   // A subset of EventLog.event that can be added by non meta node.
   oneof event {
     EventLog.EventWorkerNodePanic worker_node_panic = 1;
+    EventLog.EventSinkFail sink_fail = 2;
+    EventLog.EventAutoSchemaChangeFail auto_schema_change_fail = 3;
   }
 }
 
@@ -734,4 +1097,101 @@ message AddEventLogResponse {}
 service EventLogService {
   rpc ListEventLog(ListEventLogRequest) returns (ListEventLogResponse);
   rpc AddEventLog(AddEventLogRequest) returns (AddEventLogResponse);
+}
+
+message ActorIds {
+  repeated uint32 ids = 1;
+}
+
+message FragmentIdToActorIdMap {
+  map<uint32, ActorIds> map = 1;
+}
+
+/// Provides all the ids: relation_id, fragment_id, actor_id
+/// in an hierarchical format.
+/// relation_id -> [fragment_id]
+/// fragment_id -> [actor_id]
+message RelationIdInfos {
+  // relation_id -> FragmentIdToActorIdMap
+  map<uint32, FragmentIdToActorIdMap> map = 1;
+}
+
+message FragmentToRelationMap {
+  /// fragment_id -> relation_id mapping for all fragments
+  map<uint32, uint32> fragment_to_relation_map = 1;
+}
+
+message ActorCountPerParallelism {
+  message WorkerActorCount {
+    uint64 actor_count = 1;
+    uint64 parallelism = 2;
+  }
+  map<uint32, WorkerActorCount> worker_id_to_actor_count = 1;
+  uint64 hard_limit = 2;
+  uint64 soft_limit = 3;
+}
+
+message ClusterLimit {
+  oneof limit {
+    ActorCountPerParallelism actor_count = 1;
+    // TODO: limit DDL using compaction pending bytes
+  }
+}
+
+message GetClusterLimitsRequest {}
+
+message GetClusterLimitsResponse {
+  repeated ClusterLimit active_limits = 1;
+}
+
+service ClusterLimitService {
+  rpc GetClusterLimits(GetClusterLimitsRequest) returns (GetClusterLimitsResponse);
+}
+
+message ListRateLimitsRequest {}
+
+message ListRateLimitsResponse {
+  message RateLimitInfo {
+    uint32 fragment_id = 1;
+    uint32 job_id = 2;
+    uint32 fragment_type_mask = 3;
+    uint32 rate_limit = 4;
+    string node_name = 5;
+  }
+  repeated RateLimitInfo rate_limits = 1;
+}
+
+service HostedIcebergCatalogService {
+  rpc ListIcebergTables(ListIcebergTablesRequest) returns (ListIcebergTablesResponse);
+}
+
+message ListIcebergTablesRequest {}
+
+message ListIcebergTablesResponse {
+  message IcebergTable {
+    string catalog_name = 1;
+    string table_namespace = 2;
+    string table_name = 3;
+    optional string metadata_location = 4;
+    optional string previous_metadata_location = 5;
+    optional string iceberg_type = 6;
+  }
+  repeated IcebergTable iceberg_tables = 1;
+}
+
+message SetSyncLogStoreAlignedRequest {
+  uint32 job_id = 1;
+  bool aligned = 2;
+}
+
+message SetSyncLogStoreAlignedResponse {}
+
+message ListUnmigratedTablesRequest {}
+
+message ListUnmigratedTablesResponse {
+  message UnmigratedTable {
+    uint32 table_id = 1;
+    string table_name = 2;
+  }
+  repeated UnmigratedTable tables = 1;
 }

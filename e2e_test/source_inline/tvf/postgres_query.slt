@@ -1,0 +1,155 @@
+control substitution on
+
+system ok
+PGDATABASE=source_test createdb
+
+system ok
+PGDATABASE=source_test psql -c "
+CREATE TABLE test (
+    id bigint primary key,
+    v1 bool,
+    v2 smallint,
+    v3 integer,
+    v4 bigint,
+    v5 real,
+    v6 double precision,
+    v7 numeric,
+    v8 date,
+    v9 time,
+    v10 timestamp,
+    v11 timestamptz,
+    v12 text,
+    v13 varchar,
+    v14 interval,
+    v15 jsonb,
+    v16 bytea
+);"
+
+system ok
+PGDATABASE=source_test psql -c "
+INSERT INTO test SELECT generate_series(1, 100), true, 1, 1, 1, 1.0, 1.0, 1.0, '2021-01-01', '00:00:00', '2021-01-01 00:00:00', '2021-01-01 00:00:00 pst', 'text', 'varchar', '1 day', '{}', '\x01';
+"
+
+statement ok
+create source postgres_cdc_source with (
+  ${RISEDEV_POSTGRES_WITH_OPTIONS_COMMON},
+  username = '$PGUSER',
+  password = '$PGPASSWORD',
+  database.name = 'source_test'
+);
+
+
+# upstream requires ssl connection for `ssl_user`
+query I
+select * from postgres_query('$PGHOST', '$PGPORT', 'ssl_user', 'ssl_password', 'source_test', 'select 1;');
+----
+1
+
+query II retry 4 backoff 1s
+select * from postgres_query('$PGHOST', '$PGPORT', '$PGUSER', '$PGPASSWORD', 'source_test', 'select * from test where id > 90;');
+----
+91 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+92 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+93 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+94 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+95 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+96 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+97 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+98 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+99 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+100 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+
+query II
+select * from postgres_query('postgres_cdc_source', 'select * from test where id > 90;');
+----
+91 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+92 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+93 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+94 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+95 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+96 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+97 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+98 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+99 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+100 t 1 1 1 1 1 1.0 2021-01-01 00:00:00 2021-01-01 00:00:00 2021-01-01 08:00:00+00:00 text varchar 1 day {} \x01
+
+# postgres_query(source_name, query) requires SELECT privilege on that source.
+statement ok
+create user new_user;
+
+system ok
+psql \
+  -X \
+  -h "$SLT_HOST" \
+  -p "$SLT_PORT" \
+  -U new_user \
+  -d "$SLT_DB" \
+  -v ON_ERROR_STOP=1 \
+  2>&1 \
+  <<'SQL' |
+SELECT *
+FROM postgres_query('postgres_cdc_source', 'select id from test limit 1');
+SQL
+grep -Fq 'permission denied for source "postgres_cdc_source": "SELECT"'
+
+statement ok
+drop user new_user;
+
+# --- schema-qualified CDC source lookup ---
+# Regression coverage for the 2-arg form when the CDC source lives outside the
+# default search_path. Prior to the fix, both the qualified and the bare form
+# below returned "source not found".
+
+statement ok
+create schema tvf_schema;
+
+statement ok
+create source tvf_schema.postgres_cdc_source_ns with (
+  ${RISEDEV_POSTGRES_WITH_OPTIONS_COMMON},
+  username = '$PGUSER',
+  password = '$PGPASSWORD',
+  database.name = 'source_test'
+);
+
+query II
+select id from postgres_query('tvf_schema.postgres_cdc_source_ns', 'select id from test where id = 1;');
+----
+1
+
+query II
+select id from postgres_query('"tvf_schema"."postgres_cdc_source_ns"', 'select id from test where id = 1;');
+----
+1
+
+statement ok
+set search_path to tvf_schema, public;
+
+query II
+select id from postgres_query('postgres_cdc_source_ns', 'select id from test where id = 1;');
+----
+1
+
+control substitution off
+
+statement ok
+set search_path to "$user", public;
+
+control substitution on
+
+statement error source not found: postgres_cdc_source_ns
+select id from postgres_query('postgres_cdc_source_ns', 'select id from test where id = 1;');
+
+statement error source not found: not_a_source
+select id from postgres_query('tvf_schema.not_a_source', 'select id from test where id = 1;');
+
+statement error postgres_query
+select id from postgres_query('some.deep.name.that.is.too.long', 'select id from test where id = 1;');
+
+statement ok
+drop source tvf_schema.postgres_cdc_source_ns;
+
+statement ok
+drop schema tvf_schema;
+
+statement ok
+drop source postgres_cdc_source;

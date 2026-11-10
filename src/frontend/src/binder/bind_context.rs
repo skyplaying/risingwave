@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,32 +17,43 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use either::Either;
 use parse_display::Display;
-use risingwave_common::catalog::{Field, Schema};
+use risingwave_common::catalog::Field;
 use risingwave_common::types::DataType;
-use risingwave_sqlparser::ast::TableAlias;
+use risingwave_sqlparser::ast::{TableAlias, WindowSpec};
 
+use crate::binder::Relation;
 use crate::error::{ErrorCode, Result};
+use crate::expr::{ExprImpl, ScopeId};
 
 type LiteResult<T> = std::result::Result<T, ErrorCode>;
 
-use super::statement::RewriteExprsRecursive;
-use super::BoundSetExpr;
-use crate::binder::{BoundQuery, ShareId, COLUMN_GROUP_PREFIX};
+use crate::binder::{BoundQuery, COLUMN_GROUP_PREFIX, ShareId};
 
 #[derive(Debug, Clone)]
 pub struct ColumnBinding {
     pub table_name: String,
+    pub schema_name: Option<String>,
+    /// if the table has table alias, `table_alias` store the original table name
+    pub table_alias: Option<String>,
     pub index: usize,
     pub is_hidden: bool,
     pub field: Field,
 }
 
 impl ColumnBinding {
-    pub fn new(table_name: String, index: usize, is_hidden: bool, field: Field) -> Self {
+    pub fn new(
+        table_name: String,
+        schema_name: Option<String>,
+        table_alias: Option<String>,
+        index: usize,
+        is_hidden: bool,
+        field: Field,
+    ) -> Self {
         ColumnBinding {
             table_name,
+            schema_name,
+            table_alias,
             index,
             is_hidden,
             field,
@@ -71,59 +82,16 @@ pub struct LateralBindContext {
     pub context: BindContext,
 }
 
-/// For recursive CTE, we may need to store it in `cte_to_relation` first,
-/// and then bind it *step by step*.
-///
-/// note: the below sql example is to illustrate when we get the
-/// corresponding binding state when handling a recursive CTE like this.
-///
-/// ```sql
-/// WITH RECURSIVE t(n) AS (
-/// # -------------^ => Init
-///     VALUES (1)
-///   UNION ALL
-///     SELECT n + 1 FROM t WHERE n < 100
-/// # --------------------^ => BaseResolved (after binding the base term, this relation will be bound to `Relation::BackCteRef`)
-/// )
-/// SELECT sum(n) FROM t;
-/// # -----------------^ => Bound (we know exactly what the entire `RecursiveUnion` looks like, and this relation will be bound to `Relation::Share`)
-/// ```
-#[derive(Default, Debug, Clone)]
-pub enum BindingCteState {
-    /// We know nothing about the CTE before resolving the body.
-    #[default]
-    Init,
-    /// We know the schema form after the base term resolved.
-    BaseResolved { base: BoundSetExpr },
-    /// We get the whole bound result of the (recursive) CTE.
-    Bound {
-        query: Either<BoundQuery, RecursiveUnion>,
-    },
-}
-
-/// the entire `RecursiveUnion` represents a *bound* recursive cte.
-/// reference: <https://github.com/risingwavelabs/risingwave/pull/15522/files#r1524367781>
 #[derive(Debug, Clone)]
-pub struct RecursiveUnion {
-    /// currently this *must* be true,
-    /// otherwise binding will fail.
-    pub all: bool,
-    /// lhs part of the `UNION ALL` operator
-    pub base: Box<BoundSetExpr>,
-    /// rhs part of the `UNION ALL` operator
-    pub recursive: Box<BoundSetExpr>,
-    /// the aligned schema for this union
-    /// will be the *same* schema as recursive's
-    /// this is just for a better readability
-    pub schema: Schema,
-}
+pub enum BindingCteState {
+    /// We get the whole bound result of the CTE.
+    Bound { query: BoundQuery },
 
-impl RewriteExprsRecursive for RecursiveUnion {
-    fn rewrite_exprs_recursive(&mut self, rewriter: &mut impl crate::expr::ExprRewriter) {
-        // rewrite `base` and `recursive` separately
-        self.base.rewrite_exprs_recursive(rewriter);
-        self.recursive.rewrite_exprs_recursive(rewriter);
-    }
+    ChangeLog {
+        table: Relation,
+        key_indices: Option<Vec<usize>>,
+        distribution_key_indices: Option<Vec<usize>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -139,8 +107,8 @@ pub struct BindContext {
     pub columns: Vec<ColumnBinding>,
     // Mapping column name to indices in `columns`.
     pub indices_of: HashMap<String, Vec<usize>>,
-    // Mapping table name to [begin, end) of its columns.
-    pub range_of: HashMap<String, (usize, usize)>,
+    // Mapping (schema name, table name) to [begin, end) of its columns.
+    pub range_of: HashMap<(Option<String>, String), (usize, usize)>,
     // `clause` identifies in what clause we are binding.
     pub clause: Option<Clause>,
     // The `BindContext`'s data on its column groups
@@ -148,8 +116,19 @@ pub struct BindContext {
     /// Map the cte's name to its binding state.
     /// The `ShareId` in `BindingCte` of the value is used to help the planner identify the share plan.
     pub cte_to_relation: HashMap<String, Rc<RefCell<BindingCte>>>,
+    /// Exposed relation names of CTE references in the current FROM scope.
+    pub cte_relation_names: HashSet<String>,
     /// Current lambda functions's arguments
     pub lambda_args: Option<HashMap<String, (usize, DataType)>>,
+    /// Whether the security invoker is set, currently only used for views.
+    pub disable_security_invoker: bool,
+    /// Named window definitions from the `WINDOW` clause
+    pub named_windows: HashMap<String, WindowSpec>,
+    /// Bound arguments for the current SQL UDF, if any.
+    // TODO: use enum for named or positional arguments
+    pub sql_udf_arguments: Option<HashMap<String, ExprImpl>>,
+    /// Identifies this context as the owner of correlated references to its columns.
+    pub scope: ScopeId,
 }
 
 /// Holds the context for the `BindContext`'s `ColumnGroup`s.
@@ -181,14 +160,15 @@ pub struct ColumnGroup {
 impl BindContext {
     pub fn get_column_binding_index(
         &self,
+        schema_name: &Option<String>,
         table_name: &Option<String>,
         column_name: &String,
     ) -> LiteResult<usize> {
-        match &self.get_column_binding_indices(table_name, column_name)?[..] {
+        match &self.get_column_binding_indices(schema_name, table_name, column_name)?[..] {
             [] => unreachable!(),
             [idx] => Ok(*idx),
-            _ => Err(ErrorCode::InternalError(format!(
-                "Ambiguous column name: {}",
+            _ => Err(ErrorCode::InvalidReference(format!(
+                "column reference \"{}\" is ambiguous",
                 column_name
             ))),
         }
@@ -199,6 +179,7 @@ impl BindContext {
     /// handled in downstream as a `COALESCE` expression
     pub fn get_column_binding_indices(
         &self,
+        schema_name: &Option<String>,
         table_name: &Option<String>,
         column_name: &String,
     ) -> LiteResult<Vec<usize>> {
@@ -209,13 +190,37 @@ impl BindContext {
                         format!("Could not parse {:?} as virtual table name `{COLUMN_GROUP_PREFIX}[group_id]`", table_name)))?;
                     self.get_indices_with_group_id(group_id, column_name)
                 } else {
-                    Ok(vec![
-                        self.get_index_with_table_name(column_name, table_name)?
-                    ])
+                    Ok(vec![self.get_index_with_table_name(
+                        column_name,
+                        table_name,
+                        schema_name,
+                    )?])
                 }
             }
             None => self.get_unqualified_indices(column_name),
         }
+    }
+
+    pub fn get_table_alias(
+        &self,
+        schema_name: &String,
+        table_name: &String,
+        column_name: &String,
+    ) -> LiteResult<Option<usize>> {
+        let column_indexes = self
+            .indices_of
+            .get(column_name)
+            .ok_or_else(|| ErrorCode::ItemNotFound(format!("Invalid column: {}", column_name)))?;
+        for index in column_indexes {
+            let column = &self.columns[*index];
+            if let (Some(schema), Some(table_alias)) = (&column.schema_name, &column.table_alias)
+                && schema == schema_name
+                && table_alias == table_name
+            {
+                return Ok(Some(*index));
+            }
+        }
+        Ok(None)
     }
 
     fn get_indices_with_group_id(
@@ -223,10 +228,23 @@ impl BindContext {
         group_id: u32,
         column_name: &String,
     ) -> LiteResult<Vec<usize>> {
-        let group = self.column_group_context.groups.get(&group_id).unwrap();
-        if let Some(name) = &group.column_name {
-            debug_assert_eq!(name, column_name);
-        }
+        // The group-id qualifier is also reachable from a quoted user identifier, so a missing
+        // group or a group of another column is "not found" rather than an internal invariant.
+        let Some(group) = self
+            .column_group_context
+            .groups
+            .get(&group_id)
+            .filter(|group| {
+                group
+                    .column_name
+                    .as_ref()
+                    .is_none_or(|name| name == column_name)
+            })
+        else {
+            return Err(ErrorCode::ItemNotFound(format!(
+                "Invalid column: {column_name}"
+            )));
+        };
         if let Some(non_nullable) = &group.non_nullable_column {
             Ok(vec![*non_nullable])
         } else {
@@ -252,17 +270,63 @@ impl BindContext {
                         return Ok(vec![*non_nullable]);
                     } else {
                         // These will be converted to a `COALESCE(col1, col2, ..., coln)`
-                        return Ok(columns.to_vec());
+                        return Ok(columns.clone());
                     }
                 }
             }
-            Err(ErrorCode::InternalError(format!(
-                "Ambiguous column name: {}",
+            Err(ErrorCode::InvalidReference(format!(
+                "column reference \"{}\" is ambiguous",
                 column_name
             )))
         } else {
-            Ok(columns.to_vec())
+            Ok(columns.clone())
         }
+    }
+
+    pub fn check_catalog_name(&self, exposed_relation_name: &str) -> Result<()> {
+        if self.cte_relation_names.contains(exposed_relation_name) {
+            return Err(ErrorCode::DuplicateRelationName(format!(
+                "table name \"{}\" specified more than once",
+                exposed_relation_name
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn add_cte_name(&mut self, exposed_relation_name: String) {
+        self.cte_relation_names.insert(exposed_relation_name);
+    }
+
+    fn has_relation_name(&self, relation_name: &str) -> bool {
+        self.range_of
+            .keys()
+            .any(|(_, existing_name)| existing_name == relation_name)
+    }
+
+    pub fn check_relation_name_conflict(&self, relation_name: &str) -> Result<()> {
+        if self.has_relation_name(relation_name) {
+            return Err(ErrorCode::DuplicateRelationName(format!(
+                "table name \"{}\" specified more than once",
+                relation_name
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    fn check_cte_relation_name_conflict(&self, other: &Self) -> Result<()> {
+        // `self` may bind a CTE in a separate context, while `other` already has a catalog
+        // relation with the same exposed name.
+        for cte_relation_name in &self.cte_relation_names {
+            other.check_relation_name_conflict(cte_relation_name)?;
+        }
+        // `other` may bind a CTE in a separate context, while `self` already has a catalog
+        // relation with the same exposed name.
+        for cte_relation_name in &other.cte_relation_names {
+            self.check_relation_name_conflict(cte_relation_name)?;
+        }
+        Ok(())
     }
 
     /// Identifies two columns as being in the same group. Additionally, possibly provides one of
@@ -337,23 +401,102 @@ impl BindContext {
         }
     }
 
+    /// Resolve a qualified column reference (`table.column` or `schema.table.column`)
+    /// to one concrete column index in the current bind scope.
+    ///
+    /// This function intentionally uses a two-step strategy:
+    /// 1. Resolve relation first (`resolve_relation_range`), including ambiguity checks.
+    /// 2. Resolve column inside that unique relation range (`resolve_column_in_range`).
     fn get_index_with_table_name(
         &self,
         column_name: &String,
         table_name: &String,
+        schema_name: &Option<String>,
     ) -> LiteResult<usize> {
-        let column_indexes = self
+        let chosen_range = self.resolve_relation_range(table_name, schema_name)?;
+        self.resolve_column_in_range(column_name, table_name, chosen_range)
+    }
+
+    /// Resolve the relation range for a `table_name` in the current bind scope.
+    ///
+    /// Alias matches are prioritized over base relation name matches.
+    pub(super) fn resolve_relation_range(
+        &self,
+        table_name: &String,
+        schema_name: &Option<String>,
+    ) -> LiteResult<(usize, usize)> {
+        let mut alias_ranges = Vec::new();
+        let mut base_ranges = Vec::new();
+
+        for ((rel_schema, rel_name), range) in &self.range_of {
+            if rel_name != table_name
+                || !schema_name
+                    .as_deref()
+                    .is_none_or(|s| rel_schema.as_deref() == Some(s))
+            {
+                continue;
+            }
+
+            // Empty ranges have no column binding from which to read `table_alias`. Explicit
+            // aliases are stored without a schema in `range_of`.
+            let is_alias = if range.0 == range.1 {
+                rel_schema.is_none()
+            } else {
+                self.columns[range.0].table_alias.is_some()
+            };
+            if is_alias {
+                alias_ranges.push(*range);
+            } else {
+                base_ranges.push(*range);
+            }
+        }
+
+        let chosen_ranges = if alias_ranges.is_empty() {
+            base_ranges
+        } else {
+            alias_ranges
+        };
+
+        match chosen_ranges.as_slice() {
+            [] => Err(ErrorCode::ItemNotFound(format!(
+                "missing FROM-clause entry for table \"{}\"",
+                table_name
+            ))),
+            [range] => Ok(*range),
+            _ => Err(ErrorCode::InvalidReference(format!(
+                "table reference \"{}\" is ambiguous",
+                table_name
+            ))),
+        }
+    }
+
+    /// Resolve `column_name` inside a pre-resolved relation range.
+    fn resolve_column_in_range(
+        &self,
+        column_name: &String,
+        table_name: &String,
+        range: (usize, usize),
+    ) -> LiteResult<usize> {
+        let idxs = self
             .indices_of
             .get(column_name)
             .ok_or_else(|| ErrorCode::ItemNotFound(format!("Invalid column: {}", column_name)))?;
-        match column_indexes
+
+        let matched: Vec<_> = idxs
             .iter()
-            .find(|column_index| self.columns[**column_index].table_name == *table_name)
-        {
-            Some(column_index) => Ok(*column_index),
-            None => Err(ErrorCode::ItemNotFound(format!(
+            .copied()
+            .filter(|index| (range.0..range.1).contains(index))
+            .collect();
+
+        match matched.as_slice() {
+            [] => Err(ErrorCode::ItemNotFound(format!(
                 "missing FROM-clause entry for table \"{}\"",
                 table_name
+            ))),
+            [column_index] => Ok(*column_index),
+            _ => Err(ErrorCode::InvalidReference(format!(
+                "column reference \"{}\" is ambiguous",
+                column_name
             ))),
         }
     }
@@ -361,6 +504,8 @@ impl BindContext {
     /// Merges two `BindContext`s which are adjacent. For instance, the `BindContext` of two
     /// adjacent cross-joined tables.
     pub fn merge_context(&mut self, other: Self) -> Result<()> {
+        self.check_cte_relation_name_conflict(&other)?;
+
         let begin = self.columns.len();
         self.columns.extend(other.columns.into_iter().map(|mut c| {
             c.index += begin;
@@ -375,7 +520,7 @@ impl BindContext {
                 Entry::Occupied(e) => {
                     return Err(ErrorCode::InternalError(format!(
                         "Duplicated table name while merging adjacent contexts: {}",
-                        e.key()
+                        e.key().1
                     ))
                     .into());
                 }
@@ -384,6 +529,7 @@ impl BindContext {
                 }
             }
         }
+        self.cte_relation_names.extend(other.cte_relation_names);
         // To merge the column_group_contexts, we just need to offset RHS
         // with the next_group_id of LHS.
         let ColumnGroupContext {

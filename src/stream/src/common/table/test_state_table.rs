@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,32 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::ops::Bound::{self, *};
+use std::sync::Arc;
 
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use risingwave_common::array::{Op, StreamChunk};
-use risingwave_common::buffer::Bitmap;
+use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
+use risingwave_common::config::StreamingConfig;
+use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::{self, OwnedRow};
-use risingwave_common::types::{DataType, Scalar, Timestamptz};
-use risingwave_common::util::epoch::{test_epoch, EpochPair};
+use risingwave_common::types::{DataType, ScalarImpl};
+use risingwave_common::util::epoch::{EpochExt, EpochPair, test_epoch};
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_common::util::value_encoding::BasicSerde;
 use risingwave_hummock_test::test_utils::prepare_hummock_test_env;
-use risingwave_rpc_client::HummockMetaClient;
 use risingwave_storage::hummock::HummockStorage;
 use risingwave_storage::store::PrefetchOptions;
-use risingwave_storage::table::DEFAULT_VNODE;
-use risingwave_storage::StateStore;
+use risingwave_storage::table::SINGLETON_VNODE;
 
-use crate::common::table::state_table::{
-    ReplicatedStateTable, StateTable, WatermarkCacheStateTable,
+use crate::common::table::state_table::{ReplicatedStateTable, StateTable};
+use crate::common::table::test_utils::{
+    gen_pbtable, gen_pbtable_with_dist_key, gen_pbtable_with_value_indices,
 };
-use crate::common::table::test_utils::{gen_prost_table, gen_prost_table_with_value_indices};
 
 #[tokio::test]
 async fn test_state_table_update_insert() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let column_descs = vec![
@@ -49,7 +51,7 @@ async fn test_state_table_update_insert() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -63,7 +65,10 @@ async fn test_state_table_update_insert() {
             .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(6_i32.into()),
@@ -80,7 +85,10 @@ async fn test_state_table_update_insert() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     state_table.delete(OwnedRow::new(vec![
         Some(6_i32.into()),
@@ -136,7 +144,10 @@ async fn test_state_table_update_insert() {
     );
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     let row6_commit = state_table
         .get_row(&OwnedRow::new(vec![Some(6_i32.into())]))
@@ -173,7 +184,10 @@ async fn test_state_table_update_insert() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     // one epoch: delete (1, 2, 3, 4), insert (5, 6, 7, None), delete(5, 6, 7, None)
     state_table.delete(OwnedRow::new(vec![
@@ -202,7 +216,10 @@ async fn test_state_table_update_insert() {
     assert_eq!(row1, None);
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     let row1_commit = state_table
         .get_row(&OwnedRow::new(vec![Some(1_i32.into())]))
@@ -213,7 +230,7 @@ async fn test_state_table_update_insert() {
 
 #[tokio::test]
 async fn test_state_table_iter_with_prefix() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     // let pk_columns = vec![0, 1]; leave a message to indicate pk columns
@@ -227,7 +244,7 @@ async fn test_state_table_iter_with_prefix() {
     ];
     let pk_index = vec![0_usize, 1_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -241,7 +258,10 @@ async fn test_state_table_iter_with_prefix() {
             .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -267,7 +287,10 @@ async fn test_state_table_iter_with_prefix() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -341,8 +364,69 @@ async fn test_state_table_iter_with_prefix() {
 }
 
 #[tokio::test]
+async fn test_state_table_rev_iter_with_range() {
+    const TEST_TABLE_ID: TableId = TableId::new(7777);
+    let test_env = prepare_hummock_test_env().await;
+
+    let column_descs = vec![
+        ColumnDesc::unnamed(ColumnId::from(0), DataType::Varchar),
+        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+    ];
+    let order_types = vec![OrderType::ascending()];
+    let pk_index = vec![0_usize];
+    let table = gen_pbtable(TEST_TABLE_ID, column_descs, order_types, pk_index, 0);
+
+    test_env.register_table(table.clone()).await;
+    let mut state_table =
+        StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
+            .await;
+
+    let base_epoch = test_env
+        .manager
+        .on_current_version(|version| version.table_committed_epoch(table.id).unwrap())
+        .await;
+    let mut epoch = EpochPair::new(base_epoch.next_epoch(), base_epoch);
+
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
+
+    state_table.insert(OwnedRow::new(vec![Some("A".into()), Some(1_i32.into())]));
+    state_table.insert(OwnedRow::new(vec![Some("B".into()), Some(2_i32.into())]));
+    state_table.insert(OwnedRow::new(vec![Some("C".into()), Some(3_i32.into())]));
+
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+
+    let scan_range = (
+        Bound::Included(OwnedRow::new(vec![Some("A".into())])),
+        Bound::Included(OwnedRow::new(vec![Some("C".into())])),
+    );
+    let iter = state_table
+        .rev_iter_with_prefix(row::empty(), &scan_range, PrefetchOptions::default())
+        .await
+        .unwrap();
+    pin_mut!(iter);
+
+    let expect_rows = [
+        OwnedRow::new(vec![Some("C".into()), Some(3_i32.into())]),
+        OwnedRow::new(vec![Some("B".into()), Some(2_i32.into())]),
+        OwnedRow::new(vec![Some("A".into()), Some(1_i32.into())]),
+    ];
+    for expected in expect_rows {
+        let row = iter.next().await.unwrap().unwrap();
+        assert_eq!(row.as_ref(), &expected);
+    }
+    assert!(iter.next().await.is_none());
+}
+
+#[tokio::test]
 async fn test_state_table_iter_with_pk_range() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     // let pk_columns = vec![0, 1]; leave a message to indicate pk columns
@@ -356,7 +440,7 @@ async fn test_state_table_iter_with_pk_range() {
     ];
     let pk_index = vec![0_usize, 1_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -370,7 +454,10 @@ async fn test_state_table_iter_with_pk_range() {
             .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -396,7 +483,10 @@ async fn test_state_table_iter_with_pk_range() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -419,7 +509,7 @@ async fn test_state_table_iter_with_pk_range() {
         std::ops::Bound::Included(OwnedRow::new(vec![Some(4_i32.into())])),
     );
     let iter = state_table
-        .iter_with_vnode(DEFAULT_VNODE, &pk_range, Default::default())
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
         .await
         .unwrap();
     pin_mut!(iter);
@@ -444,7 +534,7 @@ async fn test_state_table_iter_with_pk_range() {
         std::ops::Bound::<row::Empty>::Unbounded,
     );
     let iter = state_table
-        .iter_with_vnode(DEFAULT_VNODE, &pk_range, Default::default())
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
         .await
         .unwrap();
     pin_mut!(iter);
@@ -479,7 +569,7 @@ async fn test_state_table_iter_with_pk_range() {
 #[tokio::test]
 #[should_panic]
 async fn test_mem_table_assertion() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let column_descs = vec![
@@ -490,7 +580,7 @@ async fn test_mem_table_assertion() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -503,7 +593,10 @@ async fn test_mem_table_assertion() {
         StateTable::from_table_catalog(&table, test_env.storage.clone(), None).await;
 
     let epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
         Some(11_i32.into()),
@@ -519,7 +612,7 @@ async fn test_mem_table_assertion() {
 
 #[tokio::test]
 async fn test_state_table_iter_with_value_indices() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let order_types = vec![OrderType::ascending(), OrderType::descending()];
@@ -531,7 +624,7 @@ async fn test_state_table_iter_with_value_indices() {
     ];
     let pk_index = vec![0_usize, 1_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table_with_value_indices(
+    let table = gen_pbtable_with_value_indices(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -546,7 +639,10 @@ async fn test_state_table_iter_with_value_indices() {
             .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -601,7 +697,10 @@ async fn test_state_table_iter_with_value_indices() {
     }
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     // write [3, 33, 333], [4, 44, 444], [5, 55, 555], [7, 77, 777], [8, 88, 888]into mem_table,
     // [3, 33, 3333], [6, 66, 666], [9, 99, 999] exists in
@@ -686,7 +785,7 @@ async fn test_state_table_iter_with_value_indices() {
 
 #[tokio::test]
 async fn test_state_table_iter_with_shuffle_value_indices() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let order_types = vec![OrderType::ascending(), OrderType::descending()];
@@ -698,7 +797,7 @@ async fn test_state_table_iter_with_shuffle_value_indices() {
     ];
     let pk_index = vec![0_usize, 1_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table_with_value_indices(
+    let table = gen_pbtable_with_value_indices(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -713,7 +812,10 @@ async fn test_state_table_iter_with_shuffle_value_indices() {
             .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -789,7 +891,10 @@ async fn test_state_table_iter_with_shuffle_value_indices() {
     }
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     // write [3, 33, 333], [4, 44, 444], [5, 55, 555], [7, 77, 777], [8, 88, 888]into mem_table,
     // [3, 33, 3333], [6, 66, 666], [9, 99, 999] exists in
@@ -922,7 +1027,7 @@ async fn test_state_table_iter_with_shuffle_value_indices() {
 
 #[tokio::test]
 async fn test_state_table_write_chunk() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let column_descs = vec![
@@ -940,7 +1045,7 @@ async fn test_state_table_write_chunk() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -954,7 +1059,10 @@ async fn test_state_table_write_chunk() {
             .await;
 
     let epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     let chunk = StreamChunk::from_rows(
         &[
@@ -1025,7 +1133,7 @@ async fn test_state_table_write_chunk() {
         .collect::<Vec<_>>()
         .await
         .into_iter()
-        .map(|row| row.unwrap().into_owned_row())
+        .map(|row| row.unwrap())
         .collect();
 
     assert_eq!(rows.len(), 2);
@@ -1051,7 +1159,7 @@ async fn test_state_table_write_chunk() {
 
 #[tokio::test]
 async fn test_state_table_write_chunk_visibility() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let column_descs = vec![
@@ -1069,7 +1177,7 @@ async fn test_state_table_write_chunk_visibility() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -1083,7 +1191,10 @@ async fn test_state_table_write_chunk_visibility() {
             .await;
 
     let epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     let chunk = StreamChunk::from_rows(
         &[
@@ -1139,7 +1250,7 @@ async fn test_state_table_write_chunk_visibility() {
         .collect::<Vec<_>>()
         .await
         .into_iter()
-        .map(|row| row.unwrap().into_owned_row())
+        .map(|row| row.unwrap())
         .collect();
 
     assert_eq!(rows.len(), 3);
@@ -1174,7 +1285,7 @@ async fn test_state_table_write_chunk_visibility() {
 
 #[tokio::test]
 async fn test_state_table_write_chunk_value_indices() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let column_descs = vec![
@@ -1192,7 +1303,7 @@ async fn test_state_table_write_chunk_value_indices() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table_with_value_indices(
+    let table = gen_pbtable_with_value_indices(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -1207,7 +1318,10 @@ async fn test_state_table_write_chunk_value_indices() {
             .await;
 
     let epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     let chunk = StreamChunk::from_rows(
         &[
@@ -1251,7 +1365,7 @@ async fn test_state_table_write_chunk_value_indices() {
         .collect::<Vec<_>>()
         .await
         .into_iter()
-        .map(|row| row.unwrap().into_owned_row())
+        .map(|row| row.unwrap())
         .collect();
 
     assert_eq!(rows.len(), 3);
@@ -1269,574 +1383,9 @@ async fn test_state_table_write_chunk_value_indices() {
     );
 }
 
-async fn check_may_exist<S>(
-    state_table: &StateTable<S>,
-    existent_prefix: Vec<i32>,
-    non_existent_prefix: Vec<i32>,
-) where
-    S: StateStore,
-{
-    for prefix in existent_prefix {
-        let pk_prefix = OwnedRow::new(vec![Some(prefix.into())]);
-        assert!(state_table.may_exist(&pk_prefix).await.unwrap());
-    }
-    for prefix in non_existent_prefix {
-        let pk_prefix = OwnedRow::new(vec![Some(prefix.into())]);
-        assert!(!state_table.may_exist(&pk_prefix).await.unwrap());
-    }
-}
-
-#[tokio::test]
-async fn test_state_table_may_exist() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
-    let test_env = prepare_hummock_test_env().await;
-
-    // let pk_columns = vec![0, 1]; leave a message to indicate pk columns
-    let order_types = vec![OrderType::ascending(), OrderType::descending()];
-
-    let column_ids = [ColumnId::from(0), ColumnId::from(1), ColumnId::from(2)];
-    let column_descs = vec![
-        ColumnDesc::unnamed(column_ids[0], DataType::Int32),
-        ColumnDesc::unnamed(column_ids[1], DataType::Int32),
-        ColumnDesc::unnamed(column_ids[2], DataType::Int32),
-    ];
-    let pk_index = vec![0_usize, 1_usize];
-    let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
-        TEST_TABLE_ID,
-        column_descs,
-        order_types,
-        pk_index,
-        read_prefix_len_hint,
-    );
-
-    test_env.register_table(table.clone()).await;
-    let mut state_table =
-        StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
-            .await;
-
-    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(11_i32.into()),
-        Some(111_i32.into()),
-    ]));
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(22_i32.into()),
-        Some(222_i32.into()),
-    ]));
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(4_i32.into()),
-        Some(44_i32.into()),
-        Some(444_i32.into()),
-    ]));
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(55_i32.into()),
-        Some(555_i32.into()),
-    ]));
-
-    // test may_exist with data only in memtable (e1)
-    check_may_exist(&state_table, vec![1, 4], vec![2, 3, 6, 12]).await;
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    let e1 = epoch.prev;
-
-    // test may_exist with data only in immutable memtable (e1)
-    check_may_exist(&state_table, vec![1, 4], vec![2, 3, 6, 12]).await;
-
-    let e1_res = test_env.storage.seal_and_sync_epoch(e1).await.unwrap();
-
-    // test may_exist with data only in uncommitted ssts (e1)
-    check_may_exist(&state_table, vec![1, 4], vec![2, 3, 6, 12]).await;
-
-    test_env.meta_client.commit_epoch(e1, e1_res).await.unwrap();
-    test_env.storage.try_wait_epoch_for_test(e1).await;
-
-    // test may_exist with data only in committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 4], vec![2, 3, 6, 12]).await;
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(33_i32.into()),
-        Some(333_i32.into()),
-    ]));
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(55_i32.into()),
-        Some(5555_i32.into()),
-    ]));
-    state_table.insert(OwnedRow::new(vec![
-        Some(6_i32.into()),
-        Some(66_i32.into()),
-        Some(666_i32.into()),
-    ]));
-
-    // test may_exist with data in memtable (e2), committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 4, 6], vec![2, 3, 12]).await;
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    let e2 = epoch.prev;
-
-    // test may_exist with data in immutable memtable (e2), committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 4, 6], vec![2, 3, 12]).await;
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(44_i32.into()),
-        Some(444_i32.into()),
-    ]));
-    state_table.insert(OwnedRow::new(vec![
-        Some(3_i32.into()),
-        Some(1_i32.into()),
-        Some(111_i32.into()),
-    ]));
-
-    // test may_exist with data in memtable (e3), immutable memtable (e2), committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![2, 12]).await;
-
-    let e2_res = test_env.storage.seal_and_sync_epoch(e2).await.unwrap();
-
-    // test may_exist with data in memtable (e3), uncommitted ssts (e2), committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![2, 12]).await;
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    let e3 = epoch.prev;
-
-    // test may_exist with data in immutable memtable (e3), uncommitted ssts (e2), committed
-    // ssts (e1)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![2, 12]).await;
-
-    state_table.insert(OwnedRow::new(vec![
-        Some(1_i32.into()),
-        Some(55_i32.into()),
-        Some(555_i32.into()),
-    ]));
-    state_table.insert(OwnedRow::new(vec![
-        Some(2_i32.into()),
-        Some(1_i32.into()),
-        Some(111_i32.into()),
-    ]));
-
-    // test may_exist with data in memtable (e4), immutable memtable (e3), uncommitted ssts
-    // (e2), committed ssts (e1)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![12]).await;
-
-    test_env.meta_client.commit_epoch(e2, e2_res).await.unwrap();
-    test_env.storage.try_wait_epoch_for_test(e2).await;
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    let e4 = epoch.prev;
-
-    let e3_res = test_env.storage.seal_and_sync_epoch(e3).await.unwrap();
-    let e4_res = test_env.storage.seal_and_sync_epoch(e4).await.unwrap();
-
-    // test may_exist with data in uncommitted ssts (e3, e4), committed ssts (e1, e2, e3, e4)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![12]).await;
-
-    test_env.meta_client.commit_epoch(e3, e3_res).await.unwrap();
-    test_env.storage.try_wait_epoch_for_test(e3).await;
-
-    test_env.meta_client.commit_epoch(e4, e4_res).await.unwrap();
-    test_env.storage.try_wait_epoch_for_test(e4).await;
-
-    // test may_exist with data in committed ssts (e1, e2, e3, e4)
-    check_may_exist(&state_table, vec![1, 3, 4, 6], vec![12]).await;
-}
-
-// After NULL watermark col values are inserted & deleted, they should not appear in the state table
-// cache. Test for apply_batch.
-#[tokio::test]
-async fn test_state_table_watermark_cache_ignore_null() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
-    let test_env = prepare_hummock_test_env().await;
-
-    let column_descs = vec![
-        ColumnDesc::unnamed(ColumnId::from(0), DataType::Timestamptz),
-        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int64),
-    ];
-    let data_types = column_descs
-        .iter()
-        .map(|c| c.data_type.clone())
-        .collect::<Vec<_>>();
-
-    let order_types = vec![OrderType::ascending(), OrderType::descending()];
-    let pk_index = vec![0_usize, 1_usize];
-    let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
-        TEST_TABLE_ID,
-        column_descs,
-        order_types,
-        pk_index,
-        read_prefix_len_hint,
-    );
-
-    test_env.register_table(table.clone()).await;
-    let mut state_table =
-        WatermarkCacheStateTable::from_table_catalog(&table, test_env.storage.clone(), None).await;
-
-    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
-
-    let rows = vec![
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(1000).unwrap().to_scalar_value()),
-                Some(456i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(4000).unwrap().to_scalar_value()),
-                Some(4888i64.into()),
-            ]),
-        ),
-        (Op::Insert, OwnedRow::new(vec![None, Some(4888i64.into())])),
-        (Op::Insert, OwnedRow::new(vec![None, Some(1000i64.into())])),
-    ];
-
-    let chunk = StreamChunk::from_rows(&rows, &data_types);
-
-    state_table.write_chunk(chunk);
-    let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Unbounded, Unbounded);
-    let inserted_rows: Vec<_> = state_table
-        .iter_with_prefix(row::empty(), sub_range, PrefetchOptions::default())
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .map(|row| row.unwrap().into_owned_row())
-        .collect();
-
-    assert_eq!(inserted_rows.len(), 4);
-    assert_eq!(inserted_rows[0], rows[0].1);
-    assert_eq!(inserted_rows[1], rows[1].1);
-    assert_eq!(inserted_rows[2], rows[2].1);
-    assert_eq!(inserted_rows[3], rows[3].1);
-    let cache = state_table.get_watermark_cache();
-    // Before the first barrier, watermark cache won't be filled.
-    assert_eq!(cache.len(), 0);
-
-    let watermark = Timestamptz::from_secs(2500).unwrap().to_scalar_value();
-    state_table.update_watermark(watermark, true);
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 1);
-    assert_eq!(
-        cache.lowest_key().unwrap(),
-        Timestamptz::from_secs(4000)
-            .unwrap()
-            .to_scalar_value()
-            .as_scalar_ref_impl()
-    );
-
-    let rows = vec![
-        (Op::Delete, OwnedRow::new(vec![None, Some(4888i64.into())])),
-        // Watermark Partition here later.
-        (Op::Delete, OwnedRow::new(vec![None, Some(1000i64.into())])),
-    ];
-
-    let chunk = StreamChunk::from_rows(&rows, &data_types);
-    state_table.write_chunk(chunk);
-
-    // Cache contents should not be impacted.
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 1);
-    assert_eq!(
-        cache.lowest_key().unwrap(),
-        Timestamptz::from_secs(4000)
-            .unwrap()
-            .to_scalar_value()
-            .as_scalar_ref_impl()
-    );
-}
-
-// Commit state table to init cache.
-// Insert a chunk which:
-// 1. Insert some values into state table.
-// 2. Delete some values from the state table.
-// 3. Insert some values into the state table.
-// At each step, check the cache invariants.
-// Commit state table to trigger watermark state cleaning.
-// Bump watermark, watermark value should partition the state table.
-// Check the partitioned values (larger than watermark) should be retained in cache.
-#[tokio::test]
-async fn test_state_table_watermark_cache_write_chunk() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
-    let test_env = prepare_hummock_test_env().await;
-
-    let column_descs = vec![
-        ColumnDesc::unnamed(ColumnId::from(0), DataType::Timestamptz),
-        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int64),
-    ];
-    let data_types = column_descs
-        .iter()
-        .map(|c| c.data_type.clone())
-        .collect::<Vec<_>>();
-
-    let order_types = vec![OrderType::ascending(), OrderType::descending()];
-    let pk_index = vec![0_usize, 1_usize];
-    let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
-        TEST_TABLE_ID,
-        column_descs,
-        order_types,
-        pk_index,
-        read_prefix_len_hint,
-    );
-
-    test_env.register_table(table.clone()).await;
-    let mut state_table =
-        WatermarkCacheStateTable::from_table_catalog(&table, test_env.storage.clone(), None).await;
-
-    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
-
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 0);
-
-    let watermark = Timestamptz::from_secs(0).unwrap().to_scalar_value();
-    state_table.update_watermark(watermark, true);
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-
-    let inserts_1 = vec![
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(1000).unwrap().to_scalar_value()),
-                Some(456i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(2000).unwrap().to_scalar_value()),
-                Some(4888i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(3000).unwrap().to_scalar_value()),
-                Some(1000i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(4000).unwrap().to_scalar_value()),
-                Some(4888i64.into()),
-            ]),
-        ),
-    ];
-
-    let chunk = StreamChunk::from_rows(&inserts_1, &data_types);
-    state_table.write_chunk(chunk);
-
-    // We know the row_count of state table if row count matches.
-    // So new rows inserted can be inserted into the cache.
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 4);
-
-    let deletes_1 = vec![
-        (
-            Op::Delete,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(1000).unwrap().to_scalar_value()),
-                Some(456i64.into()),
-            ]),
-        ),
-        (
-            Op::Delete,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(2000).unwrap().to_scalar_value()),
-                Some(4888i64.into()),
-            ]),
-        ),
-        (
-            Op::Delete,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(3000).unwrap().to_scalar_value()),
-                Some(1000i64.into()),
-            ]),
-        ),
-        // Leave 4000 in the state_table.
-    ];
-
-    let chunk = StreamChunk::from_rows(&deletes_1, &data_types);
-    state_table.write_chunk(chunk);
-
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 1);
-    assert_eq!(cache.get_table_row_count().unwrap(), 1);
-
-    let inserts_2 = vec![
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(5000).unwrap().to_scalar_value()),
-                Some(456i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(6000).unwrap().to_scalar_value()),
-                Some(4888i64.into()),
-            ]),
-        ),
-        (
-            Op::Insert,
-            OwnedRow::new(vec![
-                Some(Timestamptz::from_secs(7000).unwrap().to_scalar_value()),
-                Some(1000i64.into()),
-            ]),
-        ),
-    ];
-
-    let chunk = StreamChunk::from_rows(&inserts_2, &data_types);
-    state_table.write_chunk(chunk);
-
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 4);
-    assert_eq!(cache.get_table_row_count().unwrap(), 4);
-
-    // Should not cleanup anything.
-    let watermark = Timestamptz::from_secs(2500).unwrap().to_scalar_value();
-    state_table.update_watermark(watermark, true);
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-
-    // After sync, we should scan all rows into watermark cache.
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 4);
-    assert_eq!(
-        cache.lowest_key().unwrap(),
-        Timestamptz::from_secs(4000)
-            .unwrap()
-            .to_scalar_value()
-            .as_scalar_ref_impl()
-    )
-}
-
-// Insert some values into the state table.
-// Bump watermark, watermark value should partition the state table.
-// Commit state table to trigger watermark state cleaning.
-// Check the partitioned values (larger than watermark) should be retained in cache.
-#[tokio::test]
-async fn test_state_table_watermark_cache_refill() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
-    let test_env = prepare_hummock_test_env().await;
-
-    let column_descs = vec![
-        ColumnDesc::unnamed(ColumnId::from(0), DataType::Timestamptz),
-        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int64),
-    ];
-    let _data_types = column_descs
-        .iter()
-        .map(|c| c.data_type.clone())
-        .collect::<Vec<_>>();
-
-    let order_types = vec![OrderType::ascending(), OrderType::descending()];
-    let pk_index = vec![0_usize, 1_usize];
-    let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
-        TEST_TABLE_ID,
-        column_descs,
-        order_types,
-        pk_index,
-        read_prefix_len_hint,
-    );
-
-    test_env.register_table(table.clone()).await;
-    let mut state_table =
-        WatermarkCacheStateTable::from_table_catalog(&table, test_env.storage.clone(), None).await;
-
-    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
-
-    let rows = vec![
-        OwnedRow::new(vec![
-            Some(Timestamptz::from_secs(1000).unwrap().to_scalar_value()),
-            Some(456i64.into()),
-        ]),
-        OwnedRow::new(vec![
-            Some(Timestamptz::from_secs(2000).unwrap().to_scalar_value()),
-            Some(4888i64.into()),
-        ]),
-        // Watermark Partition here later.
-        OwnedRow::new(vec![
-            Some(Timestamptz::from_secs(3000).unwrap().to_scalar_value()),
-            Some(1000i64.into()),
-        ]),
-        OwnedRow::new(vec![
-            Some(Timestamptz::from_secs(4000).unwrap().to_scalar_value()),
-            Some(4888i64.into()),
-        ]),
-    ];
-
-    for row in &rows {
-        state_table.insert(row);
-    }
-    let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Unbounded, Unbounded);
-    let inserted_rows: Vec<_> = state_table
-        .iter_with_prefix(row::empty(), sub_range, PrefetchOptions::default())
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .map(|row| row.unwrap().into_owned_row())
-        .collect();
-
-    assert_eq!(inserted_rows.len(), 4);
-    assert_eq!(inserted_rows[0], rows[0]);
-    assert_eq!(inserted_rows[1], rows[1]);
-    assert_eq!(inserted_rows[2], rows[2]);
-    assert_eq!(inserted_rows[3], rows[3]);
-    let cache = state_table.get_watermark_cache();
-    // Before the first barrier, watermark cache won't be filled.
-    assert_eq!(cache.len(), 0);
-
-    let watermark = Timestamptz::from_secs(2500).unwrap().to_scalar_value();
-    state_table.update_watermark(watermark, true);
-
-    epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-
-    // After the first barrier, watermark cache won't be filled.
-    let cache = state_table.get_watermark_cache();
-    assert_eq!(cache.len(), 2);
-    assert_eq!(
-        cache.lowest_key().unwrap(),
-        Timestamptz::from_secs(3000)
-            .unwrap()
-            .to_scalar_value()
-            .as_scalar_ref_impl()
-    )
-}
-
 #[tokio::test]
 async fn test_state_table_iter_prefix_and_sub_range() {
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let test_env = prepare_hummock_test_env().await;
 
     let order_types = vec![OrderType::ascending(), OrderType::ascending()];
@@ -1848,7 +1397,7 @@ async fn test_state_table_iter_prefix_and_sub_range() {
     ];
     let pk_index = vec![0_usize, 1_usize];
     let read_prefix_len_hint = 0;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -1861,7 +1410,10 @@ async fn test_state_table_iter_prefix_and_sub_range() {
         StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
             .await;
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -1886,7 +1438,10 @@ async fn test_state_table_iter_prefix_and_sub_range() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
 
     let pk_prefix = OwnedRow::new(vec![Some(1_i32.into())]);
 
@@ -2018,7 +1573,7 @@ async fn test_state_table_iter_prefix_and_sub_range() {
 async fn test_replicated_state_table_replication() {
     type TestReplicatedStateTable = ReplicatedStateTable<HummockStorage, BasicSerde>;
     // Define the base table to replicate
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
     let order_types = vec![OrderType::ascending()];
     let column_ids = [ColumnId::from(0), ColumnId::from(1), ColumnId::from(2)];
     let column_descs = vec![
@@ -2028,7 +1583,7 @@ async fn test_replicated_state_table_replication() {
     ];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -2046,8 +1601,8 @@ async fn test_replicated_state_table_replication() {
 
     // Create a replicated state table
     let output_column_ids = vec![ColumnId::from(2), ColumnId::from(0)];
-    let mut replicated_state_table =
-        TestReplicatedStateTable::from_table_catalog_with_output_column_ids(
+    let mut replicated_state_table: TestReplicatedStateTable =
+        TestReplicatedStateTable::new_replicated(
             &table,
             test_env.storage.clone(),
             None,
@@ -2056,8 +1611,10 @@ async fn test_replicated_state_table_replication() {
         .await;
 
     let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
-    state_table.init_epoch(epoch);
-    replicated_state_table.init_epoch(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
 
     // Insert first record into base state table
     state_table.insert(OwnedRow::new(vec![
@@ -2067,9 +1624,12 @@ async fn test_replicated_state_table_replication() {
     ]));
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    replicated_state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
     test_env.commit_epoch(epoch.prev).await;
+    replicated_state_table.init_epoch(epoch).await.unwrap();
 
     {
         let range_bounds: (Bound<OwnedRow>, Bound<OwnedRow>) = (
@@ -2077,11 +1637,11 @@ async fn test_replicated_state_table_replication() {
             std::ops::Bound::Included(OwnedRow::new(vec![Some(2_i32.into())])),
         );
         let iter = state_table
-            .iter_with_vnode(DEFAULT_VNODE, &range_bounds, Default::default())
+            .iter_with_vnode(SINGLETON_VNODE, &range_bounds, Default::default())
             .await
             .unwrap();
         let replicated_iter = replicated_state_table
-            .iter_with_vnode_and_output_indices(DEFAULT_VNODE, &range_bounds, Default::default())
+            .iter_with_vnode(SINGLETON_VNODE, &range_bounds, Default::default())
             .await
             .unwrap();
         pin_mut!(iter);
@@ -2127,8 +1687,11 @@ async fn test_replicated_state_table_replication() {
     replicated_state_table.write_chunk(replicate_chunk);
 
     epoch.inc_for_test();
-    state_table.commit(epoch).await.unwrap();
-    replicated_state_table.commit(epoch).await.unwrap();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+    replicated_state_table.commit_for_test(epoch).await.unwrap();
 
     {
         let range_bounds: (Bound<OwnedRow>, Bound<OwnedRow>) = (
@@ -2137,7 +1700,7 @@ async fn test_replicated_state_table_replication() {
         );
 
         let iter = state_table
-            .iter_with_vnode(DEFAULT_VNODE, &range_bounds, Default::default())
+            .iter_with_vnode(SINGLETON_VNODE, &range_bounds, Default::default())
             .await
             .unwrap();
 
@@ -2146,7 +1709,7 @@ async fn test_replicated_state_table_replication() {
             std::ops::Bound::Unbounded,
         );
         let replicated_iter = replicated_state_table
-            .iter_with_vnode_and_output_indices(DEFAULT_VNODE, &range_bounds, Default::default())
+            .iter_with_vnode(SINGLETON_VNODE, &range_bounds, Default::default())
             .await
             .unwrap();
         pin_mut!(iter);
@@ -2177,7 +1740,7 @@ async fn test_replicated_state_table_replication() {
         let range_bounds: (Bound<OwnedRow>, Bound<OwnedRow>) =
             (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
         let replicated_iter = replicated_state_table
-            .iter_with_vnode_and_output_indices(DEFAULT_VNODE, &range_bounds, Default::default())
+            .iter_with_vnode(SINGLETON_VNODE, &range_bounds, Default::default())
             .await
             .unwrap();
         pin_mut!(replicated_iter);
@@ -2192,6 +1755,976 @@ async fn test_replicated_state_table_replication() {
         assert_eq!(
             &OwnedRow::new(vec![Some(222_i32.into()), Some(2_i32.into()),]),
             res.as_ref()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_non_pk_prefix_watermark_read() {
+    // Define the base table to replicate
+    const TEST_TABLE_ID: TableId = TableId::new(233);
+    let order_types = vec![OrderType::ascending(), OrderType::ascending()];
+    let column_ids = [ColumnId::from(0), ColumnId::from(1), ColumnId::from(2)];
+    let column_descs = vec![
+        ColumnDesc::unnamed(column_ids[0], DataType::Int32),
+        ColumnDesc::unnamed(column_ids[1], DataType::Int32),
+        ColumnDesc::unnamed(column_ids[2], DataType::Int32),
+    ];
+    let pk_indices = vec![0_usize, 1_usize];
+    let read_prefix_len_hint = 1;
+    let mut table = gen_pbtable(
+        TEST_TABLE_ID,
+        column_descs,
+        order_types,
+        pk_indices,
+        read_prefix_len_hint,
+    );
+
+    // non-pk-prefix watermark
+    let watermark_col_idx = 1;
+    table.watermark_indices = vec![watermark_col_idx];
+    #[expect(deprecated)]
+    table.clean_watermark_index_in_pk = Some(1);
+    table.clean_watermark_indices = vec![watermark_col_idx as u32]; // Column index, not PK index
+    let test_env = prepare_hummock_test_env().await;
+    test_env.register_table(table.clone()).await;
+
+    // Create the base state table
+    let mut state_table: crate::common::table::state_table::StateTableInner<HummockStorage> =
+        StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
+            .await;
+
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
+
+    // Insert first record into base state table
+    let r1 = OwnedRow::new(vec![
+        Some(0_i32.into()),
+        Some(1_i32.into()),
+        Some(1_i32.into()),
+    ]);
+    state_table.insert(r1.clone());
+
+    let r2 = OwnedRow::new(vec![
+        Some(0_i32.into()),
+        Some(2_i32.into()),
+        Some(2_i32.into()),
+    ]);
+    state_table.insert(r2.clone());
+
+    let r3 = OwnedRow::new(vec![
+        Some(0_i32.into()),
+        Some(3_i32.into()),
+        Some(3_i32.into()),
+    ]);
+    state_table.insert(r3.clone());
+
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+    test_env.commit_epoch(epoch.prev).await;
+
+    {
+        // test read
+        let item_1 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(1_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r1, item_1);
+
+        let item_2 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(2_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(r2, item_2);
+
+        let item_3 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(3_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(r3, item_3);
+    }
+
+    {
+        // update watermark
+        let watermark = ScalarImpl::Int32(1);
+        state_table.update_watermark(watermark);
+
+        epoch.inc_for_test();
+        test_env
+            .storage
+            .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+        state_table.commit_for_test(epoch).await.unwrap();
+        test_env.commit_epoch(epoch.prev).await;
+
+        // do not rewrite key-range or filter data for non-pk-prefix watermark
+        let item_1 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(1_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r1, item_1);
+
+        let item_2 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(2_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2, item_2);
+
+        let item_3 = state_table
+            .get_row(OwnedRow::new(vec![Some(0_i32.into()), Some(3_i32.into())]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r3, item_3);
+    }
+}
+
+#[tokio::test]
+async fn test_committed_watermark_descending_direction() {
+    const TEST_TABLE_ID: TableId = TableId::new(233);
+    let mut table = gen_pbtable_with_dist_key(
+        TEST_TABLE_ID,
+        vec![
+            ColumnDesc::unnamed(ColumnId::from(0), DataType::Int32),
+            ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+        ],
+        vec![OrderType::descending()],
+        vec![0],
+        1,
+        vec![0],
+    );
+    table.watermark_indices = vec![0];
+    table.clean_watermark_indices = vec![0];
+
+    let test_env = prepare_hummock_test_env().await;
+    test_env.register_table(table.clone()).await;
+
+    let vnode_count = VirtualNode::COUNT_FOR_TEST;
+    let half = vnode_count / 2;
+    let bitmap_of = |range: std::ops::Range<usize>| {
+        let mut b = BitmapBuilder::zeroed(vnode_count);
+        range.for_each(|i| b.set(i, true));
+        Arc::new(b.finish())
+    };
+
+    let mut state_table_low = StateTable::from_table_catalog_inconsistent_op(
+        &table,
+        test_env.storage.clone(),
+        Some(bitmap_of(0..half)),
+    )
+    .await;
+    let mut state_table_high = StateTable::from_table_catalog_inconsistent_op(
+        &table,
+        test_env.storage.clone(),
+        Some(bitmap_of(half..vnode_count)),
+    )
+    .await;
+
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table_low.init_epoch(epoch).await.unwrap();
+    state_table_high.init_epoch(epoch).await.unwrap();
+
+    state_table_low.update_watermark(ScalarImpl::Int32(100));
+    state_table_high.update_watermark(ScalarImpl::Int32(200));
+
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table_low.commit_for_test(epoch).await.unwrap();
+    state_table_high.commit_for_test(epoch).await.unwrap();
+    test_env.commit_epoch(epoch.prev).await;
+
+    let state_table = StateTable::from_table_catalog_inconsistent_op(
+        &table,
+        test_env.storage.clone(),
+        Some(bitmap_of(0..vnode_count)),
+    )
+    .await;
+    assert_eq!(
+        state_table.get_committed_watermark(),
+        Some(&ScalarImpl::Int32(200)),
+    );
+}
+
+#[tokio::test]
+async fn test_state_table_with_vnode_stats() {
+    use prometheus::Registry;
+    use risingwave_common::config::MetricLevel;
+
+    use crate::common::table::state_table::StateTableBuilder;
+    use crate::executor::monitor::StreamingMetrics;
+    use crate::task::{ActorId, FragmentId};
+
+    const TEST_TABLE_ID: TableId = TableId::new(233);
+    let test_env = prepare_hummock_test_env().await;
+
+    let column_descs = vec![
+        ColumnDesc::unnamed(ColumnId::from(0), DataType::Int32),
+        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+        ColumnDesc::unnamed(ColumnId::from(2), DataType::Int32),
+    ];
+    let order_types = vec![OrderType::ascending()];
+    let pk_index = vec![0_usize];
+    let read_prefix_len_hint = 1;
+    let table = gen_pbtable(
+        TEST_TABLE_ID,
+        column_descs.clone(),
+        order_types.clone(),
+        pk_index.clone(),
+        read_prefix_len_hint,
+    );
+
+    test_env.register_table(table.clone()).await;
+
+    // Attach metrics to verify vnode pruning effectiveness
+    let registry = Registry::new();
+    let metrics = StreamingMetrics::new(&registry, MetricLevel::Debug).new_state_table_metrics(
+        TEST_TABLE_ID,
+        ActorId::new(1),
+        FragmentId::new(1),
+    );
+
+    // Build state table with vnode stats enabled
+    let vnode_bitmap = {
+        let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+        for i in 0..VirtualNode::COUNT_FOR_TEST {
+            builder.set(i, true);
+        }
+        builder.finish()
+    };
+    let mut config = StreamingConfig::default();
+    config.developer.enable_state_table_vnode_stats_pruning = true;
+    let mut state_table: StateTable<HummockStorage> = StateTableBuilder::new(
+        &table,
+        test_env.storage.clone(),
+        Some(Arc::new(vnode_bitmap)),
+    )
+    .enable_vnode_key_stats(true, &Arc::new(config))
+    .with_metrics(metrics)
+    .forbid_preload_all_rows()
+    .build()
+    .await;
+
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
+
+    // Insert some rows
+    state_table.insert(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(11_i32.into()),
+        Some(111_i32.into()),
+    ]));
+
+    state_table.insert(OwnedRow::new(vec![
+        Some(5_i32.into()),
+        Some(55_i32.into()),
+        Some(555_i32.into()),
+    ]));
+
+    state_table.insert(OwnedRow::new(vec![
+        Some(9_i32.into()),
+        Some(99_i32.into()),
+        Some(999_i32.into()),
+    ]));
+
+    // Commit first epoch to establish vnode stats (min=1, max=9)
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+
+    // Verify rows can be read
+    let row1 = state_table
+        .get_row(OwnedRow::new(vec![Some(1_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        row1,
+        Some(OwnedRow::new(vec![
+            Some(1_i32.into()),
+            Some(11_i32.into()),
+            Some(111_i32.into()),
+        ]))
+    );
+
+    let row5 = state_table
+        .get_row(OwnedRow::new(vec![Some(5_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        row5,
+        Some(OwnedRow::new(vec![
+            Some(5_i32.into()),
+            Some(55_i32.into()),
+            Some(555_i32.into()),
+        ]))
+    );
+
+    let row9 = state_table
+        .get_row(OwnedRow::new(vec![Some(9_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        row9,
+        Some(OwnedRow::new(vec![
+            Some(9_i32.into()),
+            Some(99_i32.into()),
+            Some(999_i32.into()),
+        ]))
+    );
+
+    // Test reading non-existent rows and ensure pruning happens
+    // Key 0 is less than min key (1)
+    let row0 = state_table
+        .get_row(OwnedRow::new(vec![Some(0_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(row0, None);
+
+    // gets above should be pruned by vnode stats
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        1
+    );
+
+    // Key 10 is greater than max key (9)
+    let row10 = state_table
+        .get_row(OwnedRow::new(vec![Some(10_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(row10, None);
+
+    // Both gets above should be pruned by vnode stats
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        2
+    );
+
+    // Test exists() for existing rows
+    let exists1 = state_table
+        .exists(OwnedRow::new(vec![Some(1_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists1);
+
+    let exists5 = state_table
+        .exists(OwnedRow::new(vec![Some(5_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists5);
+
+    let exists9 = state_table
+        .exists(OwnedRow::new(vec![Some(9_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists9);
+
+    // Test exists() for non-existent rows with pruning
+    // Key 0 is less than min key (1) - should be pruned
+    let exists0 = state_table
+        .exists(OwnedRow::new(vec![Some(0_i32.into())]))
+        .await
+        .unwrap();
+    assert!(!exists0);
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        3
+    );
+
+    // Key 10 is greater than max key (9) - should be pruned
+    let exists10 = state_table
+        .exists(OwnedRow::new(vec![Some(10_i32.into())]))
+        .await
+        .unwrap();
+    assert!(!exists10);
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        4
+    );
+
+    // Test update and delete operations
+    state_table.delete(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(11_i32.into()),
+        Some(111_i32.into()),
+    ]));
+
+    state_table.insert(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(11_i32.into()),
+        Some(1111_i32.into()),
+    ]));
+
+    // Verify updated row
+    let row1_updated = state_table
+        .get_row(OwnedRow::new(vec![Some(1_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        row1_updated,
+        Some(OwnedRow::new(vec![
+            Some(1_i32.into()),
+            Some(11_i32.into()),
+            Some(1111_i32.into()),
+        ]))
+    );
+
+    // Commit second epoch
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+
+    // Verify all rows after commit
+    let row1_commit = state_table
+        .get_row(OwnedRow::new(vec![Some(1_i32.into())]))
+        .await
+        .unwrap();
+    assert_eq!(
+        row1_commit,
+        Some(OwnedRow::new(vec![
+            Some(1_i32.into()),
+            Some(11_i32.into()),
+            Some(1111_i32.into()),
+        ]))
+    );
+
+    // Test iteration with vnode stats: prefix 1 should yield 1 row
+    let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Unbounded, Unbounded);
+    let pk_prefix = OwnedRow::new(vec![Some(1_i32.into())]);
+    let iter = state_table
+        .iter_with_prefix(pk_prefix, sub_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(iter);
+
+    let mut count = 0;
+    while let Some(result) = iter.next().await {
+        result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 1);
+
+    // Iteration over pruned prefix should immediately return empty and increment metric
+    let pruned_prefix = OwnedRow::new(vec![Some(0_i32.into())]);
+    let pruned_iter = state_table
+        .iter_with_prefix(pruned_prefix, sub_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(pruned_iter);
+    assert!(pruned_iter.next().await.is_none());
+    assert_eq!(
+        state_table.metrics().unwrap().iter_vnode_pruned_count.get(),
+        1
+    );
+
+    // iteration over another pruned prefix should immediately return empty and increment metric
+    let pruned_prefix = OwnedRow::new(vec![Some(10_i32.into())]);
+    let pruned_iter = state_table
+        .iter_with_prefix(pruned_prefix, sub_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(pruned_iter);
+    assert!(pruned_iter.next().await.is_none());
+    assert_eq!(
+        state_table.metrics().unwrap().iter_vnode_pruned_count.get(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_state_table_pruned_key_range_with_two_pk_columns() {
+    use prometheus::Registry;
+    use risingwave_common::config::MetricLevel;
+
+    use crate::common::table::state_table::StateTableBuilder;
+    use crate::executor::monitor::StreamingMetrics;
+    use crate::task::{ActorId, FragmentId};
+
+    const TEST_TABLE_ID: TableId = TableId::new(234);
+    let test_env = prepare_hummock_test_env().await;
+
+    // Create a table with two primary key columns
+    let column_descs = vec![
+        ColumnDesc::unnamed(ColumnId::from(0), DataType::Int32),
+        ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+        ColumnDesc::unnamed(ColumnId::from(2), DataType::Int32),
+    ];
+    let order_types = vec![OrderType::ascending(), OrderType::ascending()];
+    let pk_index = vec![0_usize, 1_usize];
+    let read_prefix_len_hint = 0;
+    let table = gen_pbtable(
+        TEST_TABLE_ID,
+        column_descs.clone(),
+        order_types.clone(),
+        pk_index.clone(),
+        read_prefix_len_hint,
+    );
+
+    test_env.register_table(table.clone()).await;
+
+    let registry = Registry::new();
+    let metrics = StreamingMetrics::new(&registry, MetricLevel::Debug).new_state_table_metrics(
+        TEST_TABLE_ID,
+        ActorId::new(2),
+        FragmentId::new(2),
+    );
+
+    let vnode_bitmap = {
+        let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+        for i in 0..VirtualNode::COUNT_FOR_TEST {
+            builder.set(i, true);
+        }
+        builder.finish()
+    };
+    let mut config = StreamingConfig::default();
+    config.developer.enable_state_table_vnode_stats_pruning = true;
+    let mut state_table: StateTable<HummockStorage> = StateTableBuilder::new(
+        &table,
+        test_env.storage.clone(),
+        Some(Arc::new(vnode_bitmap)),
+    )
+    .enable_vnode_key_stats(true, &Arc::new(config))
+    .with_metrics(metrics)
+    .forbid_preload_all_rows()
+    .build()
+    .await;
+
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.init_epoch(epoch).await.unwrap();
+
+    // Insert rows with two-column PKs
+    // (1, 10), (1, 20), (1, 30)
+    // (5, 50), (5, 60)
+    // (9, 90)
+    state_table.insert(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(10_i32.into()),
+        Some(100_i32.into()),
+    ]));
+    state_table.insert(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(20_i32.into()),
+        Some(200_i32.into()),
+    ]));
+    state_table.insert(OwnedRow::new(vec![
+        Some(1_i32.into()),
+        Some(30_i32.into()),
+        Some(300_i32.into()),
+    ]));
+    state_table.insert(OwnedRow::new(vec![
+        Some(5_i32.into()),
+        Some(50_i32.into()),
+        Some(500_i32.into()),
+    ]));
+    state_table.insert(OwnedRow::new(vec![
+        Some(5_i32.into()),
+        Some(60_i32.into()),
+        Some(600_i32.into()),
+    ]));
+    state_table.insert(OwnedRow::new(vec![
+        Some(9_i32.into()),
+        Some(90_i32.into()),
+        Some(900_i32.into()),
+    ]));
+
+    // Commit to establish vnode stats
+    epoch.inc_for_test();
+    test_env
+        .storage
+        .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+    state_table.commit_for_test(epoch).await.unwrap();
+
+    // Test 1: Full range scan should find all 6 rows
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) =
+        (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    let mut count = 0;
+    while (it.next().await).is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 6);
+
+    // Test 2: Range before min key (1, 10) should be pruned
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (
+        std::ops::Bound::Excluded(OwnedRow::new(vec![
+            Some((-10_i32).into()),
+            Some(0_i32.into()),
+        ])),
+        std::ops::Bound::Excluded(OwnedRow::new(vec![Some(0_i32.into()), Some(99_i32.into())])),
+    );
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    assert!(it.next().await.is_none());
+    assert_eq!(
+        state_table.metrics().unwrap().iter_vnode_pruned_count.get(),
+        1
+    );
+
+    // Test 3: Range after max key (9, 90) should be pruned
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (
+        std::ops::Bound::Included(OwnedRow::new(vec![
+            Some(100_i32.into()),
+            Some(0_i32.into()),
+        ])),
+        std::ops::Bound::Included(OwnedRow::new(vec![
+            Some(200_i32.into()),
+            Some(0_i32.into()),
+        ])),
+    );
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    assert!(it.next().await.is_none());
+    assert_eq!(
+        state_table.metrics().unwrap().iter_vnode_pruned_count.get(),
+        2
+    );
+
+    // Test 4: Range that extends before min key gets narrowed
+    // Range: [-100, 50] should be narrowed to [min_key, 50] and return rows (1,10), (1,20), (1,30), (5,50)
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (
+        std::ops::Bound::Excluded(OwnedRow::new(vec![
+            Some((-100_i32).into()),
+            Some(0_i32.into()),
+        ])),
+        std::ops::Bound::Included(OwnedRow::new(vec![Some(5_i32.into()), Some(50_i32.into())])),
+    );
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    let mut count = 0;
+    while let Some(row) = it.next().await {
+        let row = row.unwrap();
+        count += 1;
+        // Verify we're getting the expected rows
+        match count {
+            1 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(1_i32.into()),
+                    Some(10_i32.into()),
+                    Some(100_i32.into())
+                ])
+            ),
+            2 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(1_i32.into()),
+                    Some(20_i32.into()),
+                    Some(200_i32.into())
+                ])
+            ),
+            3 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(1_i32.into()),
+                    Some(30_i32.into()),
+                    Some(300_i32.into())
+                ])
+            ),
+            4 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(5_i32.into()),
+                    Some(50_i32.into()),
+                    Some(500_i32.into())
+                ])
+            ),
+            _ => panic!("Unexpected row"),
+        }
+    }
+    assert_eq!(count, 4);
+
+    // Test 5: Range that extends after max key gets narrowed
+    // Range: [5, 1000] should be narrowed to [5, max_key] and return rows (5,50), (5,60), (9,90)
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (
+        std::ops::Bound::Included(OwnedRow::new(vec![Some(5_i32.into()), Some(0_i32.into())])),
+        std::ops::Bound::Included(OwnedRow::new(vec![
+            Some(1000_i32.into()),
+            Some(0_i32.into()),
+        ])),
+    );
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    let mut count = 0;
+    while let Some(row) = it.next().await {
+        let row = row.unwrap();
+        count += 1;
+        match count {
+            1 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(5_i32.into()),
+                    Some(50_i32.into()),
+                    Some(500_i32.into())
+                ])
+            ),
+            2 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(5_i32.into()),
+                    Some(60_i32.into()),
+                    Some(600_i32.into())
+                ])
+            ),
+            3 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(9_i32.into()),
+                    Some(90_i32.into()),
+                    Some(900_i32.into())
+                ])
+            ),
+            _ => panic!("Unexpected row"),
+        }
+    }
+    assert_eq!(count, 3);
+
+    // Test 6: Range within bounds returns correct rows
+    // Range: [(1, 15), (5, 55)] should return (1,20), (1,30), (5,50)
+    let pk_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (
+        std::ops::Bound::Excluded(OwnedRow::new(vec![Some(1_i32.into()), Some(15_i32.into())])),
+        std::ops::Bound::Included(OwnedRow::new(vec![Some(5_i32.into()), Some(55_i32.into())])),
+    );
+    let it = state_table
+        .iter_with_vnode(SINGLETON_VNODE, &pk_range, Default::default())
+        .await
+        .unwrap();
+    pin_mut!(it);
+    let mut count = 0;
+    while let Some(row) = it.next().await {
+        let row = row.unwrap();
+        count += 1;
+        match count {
+            1 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(1_i32.into()),
+                    Some(20_i32.into()),
+                    Some(200_i32.into())
+                ])
+            ),
+            2 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(1_i32.into()),
+                    Some(30_i32.into()),
+                    Some(300_i32.into())
+                ])
+            ),
+            3 => assert_eq!(
+                row.as_ref(),
+                &OwnedRow::new(vec![
+                    Some(5_i32.into()),
+                    Some(50_i32.into()),
+                    Some(500_i32.into())
+                ])
+            ),
+            _ => panic!("Unexpected row"),
+        }
+    }
+    assert_eq!(count, 3);
+
+    // Test 7: exists() for existing rows with two-column PKs
+    let exists_1_10 = state_table
+        .exists(OwnedRow::new(vec![Some(1_i32.into()), Some(10_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists_1_10);
+
+    let exists_5_50 = state_table
+        .exists(OwnedRow::new(vec![Some(5_i32.into()), Some(50_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists_5_50);
+
+    let exists_9_90 = state_table
+        .exists(OwnedRow::new(vec![Some(9_i32.into()), Some(90_i32.into())]))
+        .await
+        .unwrap();
+    assert!(exists_9_90);
+
+    // Test 8: exists() for non-existent row within range (should not be pruned)
+    let exists_1_15 = state_table
+        .exists(OwnedRow::new(vec![Some(1_i32.into()), Some(15_i32.into())]))
+        .await
+        .unwrap();
+    assert!(!exists_1_15);
+    // This should NOT increment pruned count since (1, 15) is within the range
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        0
+    );
+
+    // Test 9: exists() for key before min key - should be pruned
+    let exists_before_min = state_table
+        .exists(OwnedRow::new(vec![Some(0_i32.into()), Some(5_i32.into())]))
+        .await
+        .unwrap();
+    assert!(!exists_before_min);
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        1
+    );
+
+    // Test 10: exists() for key after max key - should be pruned
+    let exists_after_max = state_table
+        .exists(OwnedRow::new(vec![
+            Some(100_i32.into()),
+            Some(0_i32.into()),
+        ]))
+        .await
+        .unwrap();
+    assert!(!exists_after_max);
+    assert_eq!(
+        state_table.metrics().unwrap().get_vnode_pruned_count.get(),
+        2
+    );
+}
+
+/// A pk-prefix watermark hides the rows below it from reads at once, not only once committed.
+#[tokio::test]
+async fn test_pending_watermark_hides_rows() {
+    use futures::TryStreamExt;
+    use risingwave_common::row::Row;
+
+    use crate::common::table::state_table::StateTableBuilder;
+
+    /// The keys returned by a forward scan, by a reverse scan, and by point gets.
+    async fn visible_keys(state_table: &StateTable<HummockStorage>) -> [Vec<i32>; 3] {
+        let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Unbounded, Unbounded);
+        let key = |row: OwnedRow| row.datum_at(0).unwrap().into_int32();
+        let forward: Vec<OwnedRow> = state_table
+            .iter_with_prefix(row::empty(), sub_range, PrefetchOptions::default())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let backward: Vec<OwnedRow> = state_table
+            .rev_iter_with_prefix(row::empty(), sub_range, PrefetchOptions::default())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut found = vec![];
+        for k in 0..=5 {
+            let pk = OwnedRow::new(vec![Some(k.into())]);
+            let exists = state_table.exists(&pk).await.unwrap();
+            assert_eq!(exists, state_table.get_row(&pk).await.unwrap().is_some());
+            if exists {
+                found.push(k);
+            }
+        }
+        [
+            forward.into_iter().map(key).collect(),
+            backward.into_iter().map(key).collect(),
+            found,
+        ]
+    }
+
+    const TEST_TABLE_ID: TableId = TableId::new(233);
+    let mut table = gen_pbtable(
+        TEST_TABLE_ID,
+        vec![
+            ColumnDesc::unnamed(ColumnId::from(0), DataType::Int32),
+            ColumnDesc::unnamed(ColumnId::from(1), DataType::Int32),
+        ],
+        vec![OrderType::ascending()],
+        vec![0],
+        0,
+    );
+    table.watermark_indices = vec![0];
+    table.clean_watermark_indices = vec![0];
+    let row = |k: i32| OwnedRow::new(vec![Some(k.into()), Some(k.into())]);
+
+    for preload in [false, true] {
+        let test_env = prepare_hummock_test_env().await;
+        test_env.register_table(table.clone()).await;
+        let mut config = StreamingConfig::default();
+        config.developer.default_enable_mem_preload_state_table = preload;
+        let mut state_table: StateTable<HummockStorage> =
+            StateTableBuilder::new(&table, test_env.storage.clone(), None)
+                .enable_preload_all_rows_by_config(&config)
+                .build()
+                .await;
+
+        let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+        test_env
+            .storage
+            .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+        state_table.init_epoch(epoch).await.unwrap();
+        for k in 1..=4 {
+            state_table.insert(row(k));
+        }
+        epoch.inc_for_test();
+        test_env
+            .storage
+            .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+        state_table.commit_for_test(epoch).await.unwrap();
+        test_env.commit_epoch(epoch.prev).await;
+
+        // Rows written in the epoch of the watermark, before it.
+        state_table.insert(row(0));
+        state_table.insert(row(5));
+        state_table.update_watermark(ScalarImpl::Int32(3));
+        let expected = [vec![3, 4, 5], vec![5, 4, 3], vec![3, 4, 5]];
+        assert_eq!(
+            visible_keys(&state_table).await,
+            expected,
+            "preload: {preload}, before the commit"
+        );
+
+        epoch.inc_for_test();
+        test_env
+            .storage
+            .start_epoch(epoch.curr, HashSet::from_iter([TEST_TABLE_ID]));
+        state_table.commit_for_test(epoch).await.unwrap();
+        test_env.commit_epoch(epoch.prev).await;
+        assert_eq!(
+            visible_keys(&state_table).await,
+            expected,
+            "preload: {preload}, after the commit"
         );
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -217,6 +217,15 @@ impl OrderType {
     pub fn reverse(self) -> Self {
         Self::new(self.direction.reverse(), self.nulls_are)
     }
+
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::ascending_nulls_first(),
+            Self::ascending_nulls_last(),
+            Self::descending_nulls_first(),
+            Self::descending_nulls_last(),
+        ]
+    }
 }
 
 impl fmt::Display for OrderType {
@@ -241,7 +250,7 @@ impl fmt::Display for OrderType {
 /// (`Vec<ColumnOrder>`).
 ///
 /// Corresponds to protobuf [`PbColumnOrder`].
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Copy)]
 pub struct ColumnOrder {
     pub column_index: usize,
     pub order_type: OrderType,
@@ -269,7 +278,7 @@ impl ColumnOrder {
         }
     }
 
-    pub fn to_protobuf(&self) -> PbColumnOrder {
+    pub fn to_protobuf(self) -> PbColumnOrder {
         PbColumnOrder {
             column_index: self.column_index as _,
             order_type: Some(self.order_type.to_protobuf()),
@@ -287,6 +296,26 @@ impl fmt::Debug for ColumnOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self)
     }
+}
+
+/// Returns the index of the first `ORDER BY` column of a streaming TopN operator if watermarks on
+/// that column can be forwarded by the operator, i.e. when the column is ordered `ASC NULLS LAST`.
+///
+/// A watermark `wm` on a column promises that no row with the column value `< wm` will ever arrive
+/// again. To forward it, the operator must guarantee that it will never emit any change (insertion,
+/// deletion or update) to rows with the column value `< wm` afterwards. A row arriving at a TopN
+/// operator can only change its own output and the output of rows ordered *after* it, by evicting
+/// them from or restoring them into the top N. When the first `ORDER BY` column is ordered
+/// `ASC NULLS LAST`, all such rows are not smaller than the arriving row in that column, which is
+/// `>= wm` (or NULL, treated as the largest) by the watermark guarantee. With `DESC` or
+/// `ASC NULLS FIRST` ordering, an arriving row may evict rows with values `< wm` instead, so
+/// watermarks on the column must be dropped.
+///
+/// The rule is shared by the optimizer and the executors so that they stay in sync.
+pub fn topn_watermark_forwardable_order_key(order_by: &[ColumnOrder]) -> Option<usize> {
+    let first = order_by.first()?;
+    (first.order_type.is_ascending() && first.order_type.nulls_are_largest())
+        .then_some(first.column_index)
 }
 
 pub struct ColumnOrderDisplay<'a> {
@@ -572,6 +601,23 @@ pub fn cmp_rows(lhs: impl Row, rhs: impl Row, order_types: &[OrderType]) -> Orde
         })
 }
 
+/// Compare two rows column-by-column, assuming all columns are in ascending order.
+/// This function avoids the allocation of `order_types` before each call.
+///
+/// # Panics
+///
+/// See [`cmp_rows`]
+pub fn cmp_rows_ascending(lhs: impl Row, rhs: impl Row) -> Ordering {
+    assert_eq!(lhs.len(), rhs.len());
+    let order_type = OrderType::ascending();
+    lhs.iter()
+        .zip_eq_debug(rhs.iter())
+        .fold(Ordering::Equal, |acc, (l, r)| match acc {
+            Ordering::Equal => cmp_datum(l, r, order_type),
+            acc => acc,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -579,7 +625,7 @@ mod tests {
     use super::*;
     use crate::array::{ListValue, StructValue};
     use crate::row::OwnedRow;
-    use crate::types::{DataType, Datum, ScalarImpl};
+    use crate::types::{DataType, Datum, ScalarImpl, StructType};
 
     #[test]
     fn test_order_type() {
@@ -720,8 +766,8 @@ mod tests {
                 DataType::Date,
                 DataType::Timestamp,
                 DataType::Time,
-                DataType::new_struct(vec![DataType::Int32, DataType::Float32], vec![]),
-                DataType::List(Box::new(DataType::Int32)),
+                StructType::unnamed(vec![DataType::Int32, DataType::Float32]).into(),
+                DataType::Int32.list(),
             ],
         );
         assert_eq!(

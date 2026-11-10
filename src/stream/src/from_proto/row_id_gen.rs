@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,13 @@ use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
 use crate::error::StreamResult;
-use crate::executor::row_id_gen::RowIdGenExecutor;
 use crate::executor::Executor;
+use crate::executor::row_id_gen::RowIdGenExecutor;
 use crate::task::ExecutorParams;
 
 pub struct RowIdGenExecutorBuilder;
+
+impl_stream_node_body!(RowIdGen(RowIdGenNode) => RowIdGenExecutorBuilder);
 
 impl ExecutorBuilder for RowIdGenExecutorBuilder {
     type Node = RowIdGenNode;
@@ -33,9 +35,7 @@ impl ExecutorBuilder for RowIdGenExecutorBuilder {
     ) -> StreamResult<Executor> {
         let [upstream]: [_; 1] = params.input.try_into().unwrap();
         tracing::debug!("row id gen executor: {:?}", params.vnode_bitmap);
-        let vnodes = params
-            .vnode_bitmap
-            .expect("vnodes not set for row id gen executor");
+        let vnodes = params.vnode_bitmap;
         let exec = RowIdGenExecutor::new(
             params.actor_context,
             upstream,

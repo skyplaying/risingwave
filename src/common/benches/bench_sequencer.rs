@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lint_reasons)]
-
 use std::cell::RefCell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use itertools::Itertools;
@@ -65,7 +63,7 @@ fn atomic_skip(loops: usize, atomic: Arc<AtomicUsize>, skip: usize) -> Duration 
     for _ in 0..loops {
         cnt += 1;
         let _ = cnt;
-        if cnt % skip == 0 {
+        if cnt.is_multiple_of(skip) {
             let _ = atomic.fetch_add(skip, Ordering::Relaxed);
         } else {
             let _ = atomic.load(Ordering::Relaxed);

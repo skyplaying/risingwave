@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::{DisplayFromStr, serde_as};
 
-use crate::connector_common::{AwsAuthProps, KafkaPrivateLinkCommon};
+use crate::connector_common::{AwsAuthProps, KafkaConnectionProps, KafkaPrivateLinkCommon};
+use crate::enforce_secret::EnforceSecret;
+use crate::error::ConnectorResult;
 
 mod client_context;
 pub mod enumerator;
@@ -28,6 +30,7 @@ pub mod stats;
 
 pub use client_context::*;
 pub use enumerator::*;
+use risingwave_common::id::FragmentId;
 pub use source::*;
 pub use split::*;
 use with_options::WithOptions;
@@ -51,17 +54,30 @@ pub struct RdKafkaPropertiesConsumer {
     /// consumer queue.
     #[serde(rename = "properties.queued.min.messages")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub queued_min_messages: Option<usize>,
 
     #[serde(rename = "properties.queued.max.messages.kbytes")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub queued_max_messages_kbytes: Option<usize>,
 
     /// Maximum time the broker may wait to fill the Fetch response with `fetch.min.`bytes of
     /// messages.
     #[serde(rename = "properties.fetch.wait.max.ms")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub fetch_wait_max_ms: Option<usize>,
+
+    /// Minimum number of bytes the broker responds with. If fetch.wait.max.ms expires the accumulated data will be sent to the client regardless of this setting.
+    #[serde(rename = "properties.fetch.min.bytes")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub fetch_min_bytes: Option<usize>,
+
+    /// Initial maximum number of bytes per topic+partition to request when fetching messages from the broker. If the client encounters a message larger than this value it will gradually try to increase it until the entire message can be fetched.
+    #[serde(rename = "properties.fetch.message.max.bytes")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub fetch_message_max_bytes: Option<usize>,
 
     /// How long to postpone the next fetch request for a topic+partition in case the current fetch
     /// queue thresholds (`queued.min.messages` or `queued.max.messages.kbytes`) have been
@@ -70,28 +86,37 @@ pub struct RdKafkaPropertiesConsumer {
     /// increase CPU utilization.
     #[serde(rename = "properties.fetch.queue.backoff.ms")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub fetch_queue_backoff_ms: Option<usize>,
 
     /// Maximum amount of data the broker shall return for a Fetch request. Messages are fetched in
     /// batches by the consumer and if the first message batch in the first non-empty partition of
     /// the Fetch request is larger than this value, then the message batch will still be returned
     /// to ensure the consumer can make progress. The maximum message batch size accepted by the
-    /// broker is defined via `message.max.bytes` (broker config) or `max.message.bytes` (broker
-    /// topic config). `fetch.max.bytes` is automatically adjusted upwards to be at least
-    /// `message.max.bytes` (consumer config).
+    /// broker is defined via `message.max.bytes` (broker config) or `max.message.bytes` (broker
+    /// topic config). `fetch.max.bytes` is automatically adjusted upwards to be at least
+    /// `message.max.bytes` (consumer config).
     #[serde(rename = "properties.fetch.max.bytes")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub fetch_max_bytes: Option<usize>,
 
     /// Whether to automatically and periodically commit offsets in the background.
     ///
-    /// Note that RisingWave does NOT rely on committed offsets. Committing offset is only for exposing the
+    /// Note that RisingWave does NOT rely on committed offsets. Committing offset is only for exposing the
     /// progress for monitoring. Setting this to false can avoid creating consumer groups.
     ///
     /// default: true
     #[serde(rename = "properties.enable.auto.commit")]
     #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
     pub enable_auto_commit: Option<bool>,
+
+    /// The frequency in milliseconds that the consumer offsets are committed.
+    #[serde(rename = "properties.auto.commit.interval.ms")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub auto_commit_interval_ms: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, WithOptions)]
@@ -120,6 +145,21 @@ pub struct KafkaProperties {
     )]
     pub time_offset: Option<String>,
 
+    /// Specify a custom consumer group id prefix for the source.
+    /// Defaults to `rw-consumer`.
+    ///
+    /// Notes:
+    /// - Each job (materialized view) will have a separated consumer group and
+    ///   contains a generated suffix in the group id.
+    ///   The consumer group will be `{group_id_prefix}-{fragment_id}`.
+    /// - The consumer group is solely for monintoring progress in some external
+    ///   Kafka tools, and for authorization. RisingWave does not rely on committed
+    ///   offsets, and does not join the consumer group. It just reports offsets
+    ///   to the group.
+    #[serde(rename = "group.id.prefix")]
+    #[with_option(allow_alter_on_fly)]
+    pub group_id_prefix: Option<String>,
+
     /// This parameter is used to tell `KafkaSplitReader` to produce `UpsertMessage`s, which
     /// combine both key and value fields of the Kafka message.
     /// TODO: Currently, `Option<bool>` can not be parsed here.
@@ -128,6 +168,9 @@ pub struct KafkaProperties {
 
     #[serde(flatten)]
     pub common: KafkaCommon,
+
+    #[serde(flatten)]
+    pub connection: KafkaConnectionProps,
 
     #[serde(flatten)]
     pub rdkafka_properties_common: RdKafkaPropertiesCommon,
@@ -143,6 +186,16 @@ pub struct KafkaProperties {
 
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, String>,
+}
+
+impl EnforceSecret for KafkaProperties {
+    fn enforce_secret<'a>(prop_iter: impl Iterator<Item = &'a str>) -> ConnectorResult<()> {
+        for prop in prop_iter {
+            KafkaConnectionProps::enforce_one(prop)?;
+            AwsAuthProps::enforce_one(prop)?;
+        }
+        Ok(())
+    }
 }
 
 impl SourceProperties for KafkaProperties {
@@ -164,6 +217,14 @@ impl KafkaProperties {
         self.rdkafka_properties_common.set_client(c);
         self.rdkafka_properties_consumer.set_client(c);
     }
+
+    pub fn group_id(&self, fragment_id: FragmentId) -> String {
+        format!(
+            "{}-{}",
+            self.group_id_prefix.as_deref().unwrap_or("rw-consumer"),
+            fragment_id
+        )
+    }
 }
 
 const KAFKA_ISOLATION_LEVEL: &str = "read_committed";
@@ -179,6 +240,12 @@ impl RdKafkaPropertiesConsumer {
         if let Some(v) = &self.fetch_wait_max_ms {
             c.set("fetch.wait.max.ms", v.to_string());
         }
+        if let Some(v) = &self.fetch_min_bytes {
+            c.set("fetch.min.bytes", v.to_string());
+        }
+        if let Some(v) = &self.fetch_message_max_bytes {
+            c.set("fetch.message.max.bytes", v.to_string());
+        }
         if let Some(v) = &self.fetch_queue_backoff_ms {
             c.set("fetch.queue.backoff.ms", v.to_string());
         }
@@ -188,41 +255,52 @@ impl RdKafkaPropertiesConsumer {
         if let Some(v) = &self.enable_auto_commit {
             c.set("enable.auto.commit", v.to_string());
         }
+        if let Some(v) = &self.auto_commit_interval_ms {
+            c.set("auto.commit.interval.ms", v.to_string());
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use maplit::hashmap;
+    use std::collections::BTreeMap;
+
+    use maplit::btreemap;
 
     use super::*;
 
     #[test]
     fn test_parse_config_consumer_common() {
-        let config: HashMap<String, String> = hashmap! {
+        let config: BTreeMap<String, String> = btreemap! {
             // common
-            "properties.bootstrap.server".to_string() => "127.0.0.1:9092".to_string(),
-            "topic".to_string() => "test".to_string(),
+            "properties.bootstrap.server".to_owned() => "127.0.0.1:9092".to_owned(),
+            "topic".to_owned() => "test".to_owned(),
             // kafka props
-            "scan.startup.mode".to_string() => "earliest".to_string(),
+            "scan.startup.mode".to_owned() => "earliest".to_owned(),
             // RdKafkaPropertiesCommon
-            "properties.message.max.bytes".to_string() => "12345".to_string(),
-            "properties.receive.message.max.bytes".to_string() => "54321".to_string(),
+            "properties.message.max.bytes".to_owned() => "12345".to_owned(),
+            "properties.receive.message.max.bytes".to_owned() => "54321".to_owned(),
+            "properties.reconnect.backoff.ms".to_owned() => "1000".to_owned(),
+            "properties.reconnect.backoff.max.ms".to_owned() => "30000".to_owned(),
+            "properties.socket.connection.setup.timeout.ms".to_owned() => "60000".to_owned(),
+            "properties.retry.backoff.ms".to_owned() => "200".to_owned(),
+            "properties.retry.backoff.max.ms".to_owned() => "2000".to_owned(),
             // RdKafkaPropertiesConsumer
-            "properties.queued.min.messages".to_string() => "114514".to_string(),
-            "properties.queued.max.messages.kbytes".to_string() => "114514".to_string(),
-            "properties.fetch.wait.max.ms".to_string() => "114514".to_string(),
-            "properties.fetch.max.bytes".to_string() => "114514".to_string(),
-            "properties.enable.auto.commit".to_string() => "true".to_string(),
-            "properties.fetch.queue.backoff.ms".to_string() => "114514".to_string(),
+            "properties.queued.min.messages".to_owned() => "114514".to_owned(),
+            "properties.queued.max.messages.kbytes".to_owned() => "114514".to_owned(),
+            "properties.fetch.wait.max.ms".to_owned() => "114514".to_owned(),
+            "properties.fetch.max.bytes".to_owned() => "114514".to_owned(),
+            "properties.enable.auto.commit".to_owned() => "true".to_owned(),
+            "properties.auto.commit.interval.ms".to_owned() => "10000".to_owned(),
+            "properties.fetch.queue.backoff.ms".to_owned() => "114514".to_owned(),
             // PrivateLink
-            "broker.rewrite.endpoints".to_string() => "{\"broker1\": \"10.0.0.1:8001\"}".to_string(),
+            "broker.rewrite.endpoints".to_owned() => "{\"broker1\": \"10.0.0.1:8001\"}".to_owned(),
         };
 
         let props: KafkaProperties =
             serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
 
-        assert_eq!(props.scan_startup_mode, Some("earliest".to_string()));
+        assert_eq!(props.scan_startup_mode, Some("earliest".to_owned()));
         assert_eq!(
             props.rdkafka_properties_common.receive_message_max_bytes,
             Some(54321)
@@ -230,6 +308,25 @@ mod test {
         assert_eq!(
             props.rdkafka_properties_common.message_max_bytes,
             Some(12345)
+        );
+        assert_eq!(
+            props.rdkafka_properties_common.reconnect_backoff_ms,
+            Some(1000)
+        );
+        assert_eq!(
+            props.rdkafka_properties_common.reconnect_backoff_max_ms,
+            Some(30000)
+        );
+        assert_eq!(
+            props
+                .rdkafka_properties_common
+                .socket_connection_setup_timeout_ms,
+            Some(60000)
+        );
+        assert_eq!(props.rdkafka_properties_common.retry_backoff_ms, Some(200));
+        assert_eq!(
+            props.rdkafka_properties_common.retry_backoff_max_ms,
+            Some(2000)
         );
         assert_eq!(
             props.rdkafka_properties_consumer.queued_min_messages,
@@ -252,11 +349,26 @@ mod test {
             Some(true)
         );
         assert_eq!(
+            props.rdkafka_properties_consumer.auto_commit_interval_ms,
+            Some(10000)
+        );
+        assert_eq!(
             props.rdkafka_properties_consumer.fetch_queue_backoff_ms,
             Some(114514)
         );
-        let hashmap: HashMap<String, String> = hashmap! {
-            "broker1".to_string() => "10.0.0.1:8001".to_string()
+        let mut client_config = rdkafka::ClientConfig::new();
+        props.set_client(&mut client_config);
+        assert_eq!(client_config.get("reconnect.backoff.ms"), Some("1000"));
+        assert_eq!(client_config.get("reconnect.backoff.max.ms"), Some("30000"));
+        assert_eq!(
+            client_config.get("socket.connection.setup.timeout.ms"),
+            Some("60000")
+        );
+        assert_eq!(client_config.get("retry.backoff.ms"), Some("200"));
+        assert_eq!(client_config.get("retry.backoff.max.ms"), Some("2000"));
+        assert_eq!(client_config.get("auto.commit.interval.ms"), Some("10000"));
+        let hashmap: BTreeMap<String, String> = btreemap! {
+            "broker1".to_owned() => "10.0.0.1:8001".to_owned()
         };
         assert_eq!(props.privatelink_common.broker_rewrite_map, Some(hashmap));
     }

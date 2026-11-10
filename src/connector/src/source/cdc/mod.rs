@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,23 +15,37 @@
 pub mod enumerator;
 pub mod external;
 pub mod jni_source;
+pub mod mariadb;
+pub mod mongodb;
+pub mod mysql;
+pub mod oracle;
+pub mod postgres;
 pub mod source;
 pub mod split;
+pub mod sql_server;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
 pub use enumerator::*;
 use itertools::Itertools;
+use risingwave_common::bail;
+use risingwave_common::id::{ActorId, SourceId};
+use risingwave_common::license::FeatureNotAvailable;
 use risingwave_pb::catalog::PbSource;
 use risingwave_pb::connector_service::{PbSourceType, PbTableSchema, SourceType, TableSchema};
 use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
-use risingwave_pb::plan_common::ExternalTableDesc;
+use risingwave_pb::plan_common::{ExternalTableDesc, PbEncodeType, PbFormatType};
+use risingwave_pb::secret::PbSecretRef;
+use risingwave_pb::source::{PbCdcTableSnapshotSplit, PbCdcTableSnapshotSplitsWithGeneration};
+use risingwave_pb::stream_plan::StreamCdcScanOptions;
 use simd_json::prelude::ArrayTrait;
 pub use source::*;
 
+use crate::enforce_secret::EnforceSecret;
 use crate::error::ConnectorResult;
-use crate::source::{SourceProperties, SplitImpl, TryFromHashmap};
+use crate::source::cdc::external::SchemaTableName;
+use crate::source::{CdcTableSnapshotSplitRaw, SourceProperties, SplitImpl, TryFromBTreeMap};
 use crate::{for_all_classified_sources, impl_cdc_source_type};
 
 pub const CDC_CONNECTOR_NAME_SUFFIX: &str = "-cdc";
@@ -42,18 +56,264 @@ pub const CDC_SHARING_MODE_KEY: &str = "rw.sharing.mode.enable";
 pub const CDC_BACKFILL_ENABLE_KEY: &str = "snapshot";
 pub const CDC_BACKFILL_SNAPSHOT_INTERVAL_KEY: &str = "snapshot.interval";
 pub const CDC_BACKFILL_SNAPSHOT_BATCH_SIZE_KEY: &str = "snapshot.batch_size";
+pub const CDC_BACKFILL_PARALLELISM: &str = "backfill.parallelism";
+pub const CDC_BACKFILL_NUM_ROWS_PER_SPLIT: &str = "backfill.num_rows_per_split";
+pub const CDC_BACKFILL_AS_EVEN_SPLITS: &str = "backfill.as_even_splits";
+pub const CDC_BACKFILL_SPLIT_PK_COLUMN_INDEX: &str = "backfill.split_pk_column_index";
 // We enable transaction for shared cdc source by default
 pub const CDC_TRANSACTIONAL_KEY: &str = "transactional";
 pub const CDC_WAIT_FOR_STREAMING_START_TIMEOUT: &str = "cdc.source.wait.streaming.start.timeout";
+pub const CDC_BACKFILL_MAX_PARALLELISM: u32 = 256;
+
+// User can set strong-schema='true' to enable strong schema for mongo cdc source
+pub const CDC_MONGODB_STRONG_SCHEMA_KEY: &str = "strong_schema";
 
 pub const MYSQL_CDC_CONNECTOR: &str = Mysql::CDC_CONNECTOR_NAME;
+pub const MARIADB_CDC_CONNECTOR: &str = Mariadb::CDC_CONNECTOR_NAME;
 pub const POSTGRES_CDC_CONNECTOR: &str = Postgres::CDC_CONNECTOR_NAME;
-pub const CITUS_CDC_CONNECTOR: &str = Citus::CDC_CONNECTOR_NAME;
 pub const MONGODB_CDC_CONNECTOR: &str = Mongodb::CDC_CONNECTOR_NAME;
+pub const SQL_SERVER_CDC_CONNECTOR: &str = SqlServer::CDC_CONNECTOR_NAME;
+pub const ORACLE_CDC_CONNECTOR: &str = Oracle::CDC_CONNECTOR_NAME;
 
-pub trait CdcSourceTypeTrait: Send + Sync + Clone + 'static {
+/// Build a unique CDC table identifier from a source ID and external table name
+pub fn build_cdc_table_id(source_id: SourceId, external_table_name: &str) -> String {
+    format!("{}.{}", source_id, external_table_name)
+}
+
+pub trait CdcSourceTypeTrait: Send + Sync + Clone + std::fmt::Debug + 'static {
     const CDC_CONNECTOR_NAME: &'static str;
     fn source_type() -> CdcSourceType;
+}
+
+/// Behavior switches.
+pub trait CdcSourceRuntimeFlags: CdcSourceTypeTrait {
+    /// When true, only shared sources are supported; otherwise only direct sources are supported.
+    const CAN_BACKFILL: bool = false;
+    /// When true, the planner may choose parallelized backfill.
+    const CAN_BACKFILL_IN_PARALLEL: bool = false;
+    /// When true, a shared source sets Debezium's `provide.transaction.metadata`, so that all rows
+    /// of one upstream transaction go into a single chunk.
+    const CAN_USE_TRANSACTION_METADATA: bool = false;
+    /// When true, the source executor waits for a non-empty split offset before reporting the
+    /// initial CDC offset.
+    const NEEDS_NON_EMPTY_INITIAL_OFFSET: bool = false;
+    /// When true, the consumed offset is committed back to the upstream database on each
+    /// checkpoint via a JNI call.
+    const NEEDS_OFFSET_COMMIT_ON_CHECKPOINT: bool = false;
+}
+
+/// Checks the `CREATE` and `ALTER` statements of a CDC source connector.
+pub trait CdcSourceDdlValidator: CdcSourceTypeTrait {
+    /// Checks the `FORMAT ... ENCODE ...` clause of a `CREATE` statement.
+    fn check_format_encode(format: PbFormatType, encode: PbEncodeType) -> ConnectorResult<()> {
+        check_format_encode_inner(
+            Self::CDC_CONNECTOR_NAME,
+            format,
+            encode,
+            &[
+                (PbFormatType::Debezium, &[PbEncodeType::Json]),
+                // support source stream job
+                (PbFormatType::Plain, &[PbEncodeType::Json]),
+            ],
+        )
+    }
+
+    /// Checks an additional column type in the `INCLUDE` clause of a `CREATE` statement, such as
+    /// `timestamp` in `INCLUDE timestamp AS ts`.
+    fn check_include_column(additional_column_type: &str) -> ConnectorResult<()> {
+        bail!(
+            "additional column type {} is not supported for connector {}, which accepts no additional column",
+            additional_column_type,
+            Self::CDC_CONNECTOR_NAME
+        )
+    }
+
+    /// Checks the `WITH (...)` options of a `CREATE` statement, and fills in the options that the
+    /// CDC source generates when they are omitted, such as a random `slot.name` for Postgres.
+    /// The connector node later renders the filled options into the Debezium config through the
+    /// `.properties` template of the CDC source. An override calls [`check_common_with_options`]
+    /// first.
+    fn check_and_fill_create_with_options(
+        props: &mut BTreeMap<String, String>,
+    ) -> ConnectorResult<()> {
+        check_common_with_options(props)
+    }
+
+    /// Checks that the license allows the CDC source.
+    fn check_license() -> Result<(), FeatureNotAvailable> {
+        Ok(())
+    }
+
+    /// Checks that `ALTER SOURCE ... CONNECTOR WITH (...)` only changes options that a running
+    /// CDC source can apply. An override calls [`check_common_with_options`] first.
+    fn check_alter_with_options(
+        props: &BTreeMap<String, String>,
+        _secret_refs: &BTreeMap<String, PbSecretRef>,
+    ) -> ConnectorResult<()> {
+        check_common_with_options(props)
+    }
+}
+
+/// Handles the identifiers of upstream objects of a CDC source connector, such as tables and
+/// columns: how the connector spells them, quotes them, and how Debezium names them.
+// TODO(#27225): move the remaining per-connector identifier handling in as trait methods.
+pub trait CdcSourceExternalTableIdentifier: CdcSourceTypeTrait {
+    /// Returns the canonical identifier of the external table that the connect properties of a
+    /// CDC table point to: the part of the Debezium topic name of the table's change events that
+    /// the source reader keeps as `_rw_table_name`. A CDC table filters the change events of its
+    /// source by this identifier, and its `cdc_table_id` is built from it.
+    fn canonical_name(connect_properties: &BTreeMap<String, String>) -> String {
+        let SchemaTableName {
+            schema_name,
+            table_name,
+        } = SchemaTableName::from_properties(connect_properties);
+        format!("{schema_name}.{table_name}")
+    }
+
+    /// Splits a `.`-separated name, such as the one in the `TABLE '...'` clause of a CDC table,
+    /// into its identifiers, following the connector's quoting syntax. Returns `None` if the name
+    /// is malformed.
+    fn split_quoted_identifier(name: &str) -> Option<Vec<String>> {
+        split_quoted_identifier_inner(name, '"', '"')
+    }
+}
+
+/// Splits a `.`-separated name into its identifiers. An identifier wrapped in `open` and `close`
+/// may contain `.`, and a doubled `close` inside it stands for one `close`, e.g. `"a.b"` and
+/// `"a""b"` for Postgres, `[a.b]` and `[a]]b]` for SQL Server. Returns `None` if the name is
+/// malformed.
+pub fn split_quoted_identifier_inner(name: &str, open: char, close: char) -> Option<Vec<String>> {
+    let mut parts = vec![];
+    let mut current = String::new();
+    let mut chars = name.chars().peekable();
+    let mut in_quote = false;
+    let mut just_closed_quote = false;
+
+    while let Some(ch) = chars.next() {
+        if in_quote {
+            if ch == close {
+                if chars.peek() == Some(&close) {
+                    current.push(close);
+                    chars.next();
+                } else {
+                    in_quote = false;
+                    just_closed_quote = true;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else {
+            match ch {
+                '.' => {
+                    if current.is_empty() {
+                        return None;
+                    }
+                    parts.push(std::mem::take(&mut current));
+                    just_closed_quote = false;
+                }
+                _ if ch == open && current.is_empty() => in_quote = true,
+                _ if ch == open || ch == close || just_closed_quote => return None,
+                _ => current.push(ch),
+            }
+        }
+    }
+
+    if in_quote || current.is_empty() {
+        return None;
+    }
+    parts.push(current);
+    Some(parts)
+}
+
+/// Checks the `WITH (...)` options that every CDC source accepts, on both `CREATE` and `ALTER`.
+pub fn check_common_with_options(props: &BTreeMap<String, String>) -> ConnectorResult<()> {
+    // RisingWave consumes schema-less JSON from Debezium and cannot reconstruct the scale of
+    // binary logical decimals emitted by `precise`. `double` can lose precision, so an explicit
+    // override must retain the common `string` default from `debezium.properties`.
+    if let Some(mode) = props.get("debezium.decimal.handling.mode")
+        && mode != "string"
+    {
+        bail!("'debezium.decimal.handling.mode' must be 'string', got: '{mode}'");
+    }
+    for key in [
+        CDC_WAIT_FOR_STREAMING_START_TIMEOUT,
+        "debezium.max.queue.size",
+    ] {
+        if let Some(value) = props.get(key)
+            && value.parse::<u32>().is_err()
+        {
+            bail!("Invalid value `{value}` for `{key}`");
+        }
+    }
+    // Keep this policy in sync with Java's `SourceValidateHandler.validateHeartbeatInterval`:
+    // match Java's ASCII integer syntax and Debezium's signed 32-bit range.
+    if let Some(value) = props.get("debezium.heartbeat.interval.ms")
+        && !value.parse::<i32>().is_ok_and(|interval| interval > 0)
+    {
+        bail!("'debezium.heartbeat.interval.ms' must be a positive integer, got: '{value}'");
+    }
+    Ok(())
+}
+
+pub fn check_format_encode_inner(
+    connector_name: &str,
+    format: PbFormatType,
+    encode: PbEncodeType,
+    compatible_formats: &[(PbFormatType, &[PbEncodeType])],
+) -> ConnectorResult<()> {
+    let Some((_, compatible_encodes)) = compatible_formats.iter().find(|(f, _)| *f == format)
+    else {
+        bail!(
+            "connector {} does not support format {:?}",
+            connector_name,
+            format
+        );
+    };
+    if !compatible_encodes.contains(&encode) {
+        bail!(
+            "connector {} does not support format {:?} with encode {:?}",
+            connector_name,
+            format,
+            encode
+        );
+    }
+    Ok(())
+}
+
+pub fn check_include_column_inner(
+    connector_name: &str,
+    additional_column_type: &str,
+    compatible_additional_column_types: &[&str],
+) -> ConnectorResult<()> {
+    if !compatible_additional_column_types.contains(&additional_column_type) {
+        bail!(
+            "additional column type {} is not supported for connector {}, acceptable column types: {:?}",
+            additional_column_type,
+            connector_name,
+            compatible_additional_column_types
+        );
+    }
+    Ok(())
+}
+
+pub fn check_alter_with_options_inner(
+    connector_name: &str,
+    props: &BTreeMap<String, String>,
+    secret_refs: &BTreeMap<String, PbSecretRef>,
+    allowed_keys: &[&str],
+) -> ConnectorResult<()> {
+    if let Some(key) = props
+        .keys()
+        .chain(secret_refs.keys())
+        .find(|key| !allowed_keys.contains(&key.as_str()))
+    {
+        bail!(
+            "Field '{}' is not allowed to be altered on the fly for connector: {}",
+            key,
+            connector_name
+        );
+    }
+    Ok(())
 }
 
 for_all_classified_sources!(impl_cdc_source_type);
@@ -62,9 +322,11 @@ impl<'a> From<&'a str> for CdcSourceType {
     fn from(name: &'a str) -> Self {
         match name {
             MYSQL_CDC_CONNECTOR => CdcSourceType::Mysql,
+            MARIADB_CDC_CONNECTOR => CdcSourceType::Mariadb,
             POSTGRES_CDC_CONNECTOR => CdcSourceType::Postgres,
-            CITUS_CDC_CONNECTOR => CdcSourceType::Citus,
             MONGODB_CDC_CONNECTOR => CdcSourceType::Mongodb,
+            SQL_SERVER_CDC_CONNECTOR => CdcSourceType::SqlServer,
+            ORACLE_CDC_CONNECTOR => CdcSourceType::Oracle,
             _ => CdcSourceType::Unspecified,
         }
     }
@@ -74,9 +336,11 @@ impl CdcSourceType {
     pub fn as_str_name(&self) -> &str {
         match self {
             CdcSourceType::Mysql => "MySQL",
+            CdcSourceType::Mariadb => "MariaDB",
             CdcSourceType::Postgres => "Postgres",
-            CdcSourceType::Citus => "Citus",
             CdcSourceType::Mongodb => "MongoDB",
+            CdcSourceType::SqlServer => "SQL Server",
+            CdcSourceType::Oracle => "Oracle",
             CdcSourceType::Unspecified => "Unspecified",
         }
     }
@@ -85,7 +349,7 @@ impl CdcSourceType {
 #[derive(Clone, Debug, Default)]
 pub struct CdcProperties<T: CdcSourceTypeTrait> {
     /// Properties specified in the WITH clause by user
-    pub properties: HashMap<String, String>,
+    pub properties: BTreeMap<String, String>,
 
     /// Schema of the source specified by users
     pub table_schema: TableSchema,
@@ -115,12 +379,12 @@ pub fn table_schema_exclude_additional_columns(table_schema: &TableSchema) -> Ta
     }
 }
 
-impl<T: CdcSourceTypeTrait> TryFromHashmap for CdcProperties<T> {
-    fn try_from_hashmap(
-        properties: HashMap<String, String>,
+impl<T: CdcSourceTypeTrait> TryFromBTreeMap for CdcProperties<T> {
+    fn try_from_btreemap(
+        properties: BTreeMap<String, String>,
         _deny_unknown_fields: bool,
     ) -> ConnectorResult<Self> {
-        let is_share_source = properties
+        let is_share_source: bool = properties
             .get(CDC_SHARING_MODE_KEY)
             .is_some_and(|v| v == "true");
         Ok(CdcProperties {
@@ -134,10 +398,12 @@ impl<T: CdcSourceTypeTrait> TryFromHashmap for CdcProperties<T> {
     }
 }
 
+impl<T: CdcSourceTypeTrait> EnforceSecret for CdcProperties<T> {} // todo: enforce jdbc like properties
+
 impl<T: CdcSourceTypeTrait> SourceProperties for CdcProperties<T>
 where
     DebeziumCdcSplit<T>: TryFrom<SplitImpl, Error = crate::error::ConnectorError> + Into<SplitImpl>,
-    DebeziumSplitEnumerator<T>: ListCdcSplits<CdcSourceType = T>,
+    DebeziumSplitEnumerator<T>: ListCdcSplits<CdcSourceType = T> + enumerator::CdcMonitor,
 {
     type Split = DebeziumCdcSplit<T>;
     type SplitEnumerator = DebeziumSplitEnumerator<T>;
@@ -180,9 +446,6 @@ where
     }
 
     fn init_from_pb_cdc_table_desc(&mut self, table_desc: &ExternalTableDesc) {
-        let properties: HashMap<String, String> =
-            table_desc.connect_properties.clone().into_iter().collect();
-
         let table_schema = TableSchema {
             columns: table_desc
                 .columns
@@ -198,7 +461,6 @@ where
             pk_indices: table_desc.stream_key.clone(),
         };
 
-        self.properties = properties;
         self.table_schema = table_schema;
         self.is_cdc_source_job = false;
         self.is_backfill_table = true;
@@ -215,5 +477,193 @@ impl<T: CdcSourceTypeTrait> crate::source::UnknownFields for CdcProperties<T> {
 impl<T: CdcSourceTypeTrait> CdcProperties<T> {
     pub fn get_source_type_pb(&self) -> SourceType {
         SourceType::from(T::source_type())
+    }
+}
+
+pub const INVALID_CDC_SPLIT_ASSIGNMENT_GENERATION_ID: u64 = 0;
+pub const INITIAL_CDC_SPLIT_ASSIGNMENT_GENERATION_ID: u64 = 1;
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CdcTableSnapshotSplitAssignmentWithGeneration {
+    pub splits: HashMap<ActorId, (Vec<CdcTableSnapshotSplitRaw>, u64)>,
+}
+
+impl CdcTableSnapshotSplitAssignmentWithGeneration {
+    pub fn new(splits: HashMap<ActorId, (Vec<CdcTableSnapshotSplitRaw>, u64)>) -> Self {
+        Self { splits }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            splits: HashMap::default(),
+        }
+    }
+}
+
+pub fn build_cdc_table_snapshot_split(s: &CdcTableSnapshotSplitRaw) -> PbCdcTableSnapshotSplit {
+    PbCdcTableSnapshotSplit {
+        split_id: s.split_id,
+        left_bound_inclusive: s.left_bound_inclusive.clone(),
+        right_bound_exclusive: s.right_bound_exclusive.clone(),
+    }
+}
+
+pub fn build_actor_cdc_table_snapshot_splits_with_generation(
+    pb_cdc_table_snapshot_split_assignment: PbCdcTableSnapshotSplitsWithGeneration,
+) -> CdcTableSnapshotSplitAssignmentWithGeneration {
+    let splits = pb_cdc_table_snapshot_split_assignment
+        .splits
+        .into_iter()
+        .map(|(actor_id, splits)| {
+            let generation = splits.generation;
+            let splits = splits
+                .splits
+                .into_iter()
+                .map(|s| CdcTableSnapshotSplitRaw {
+                    split_id: s.split_id,
+                    left_bound_inclusive: s.left_bound_inclusive,
+                    right_bound_exclusive: s.right_bound_exclusive,
+                })
+                .collect();
+            (actor_id, (splits, generation))
+        })
+        .collect();
+    CdcTableSnapshotSplitAssignmentWithGeneration { splits }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub struct CdcScanOptions {
+    /// Used by Used in non-parallel backfill, i.e. backfill V1.
+    pub disable_backfill: bool,
+    /// Used by non-parallelized backfill. The frequency of snapshot read resets for consuming the WAL backlog.
+    pub snapshot_barrier_interval: u32,
+    /// Used by non-parallelized backfill. The number of rows to fetch in a single batch when reading from an external table.
+    pub snapshot_batch_size: u32,
+    /// Used by parallelized backfill, i.e. backfill V2. The initial parallelism of parallel backfill.
+    pub backfill_parallelism: u32,
+    /// Used by parallelized backfill. The estimated number of rows per split used in splits generation.
+    pub backfill_num_rows_per_split: u64,
+    /// Used by parallelized backfill. For supported split column data type, assume an uniform distribution and adopt a much faster splits generation method.
+    pub backfill_as_even_splits: bool,
+    /// Used by parallelized backfill. Specify the index of primary key column to use as split column.
+    pub backfill_split_pk_column_index: u32,
+}
+
+impl Default for CdcScanOptions {
+    fn default() -> Self {
+        Self {
+            disable_backfill: false,
+            snapshot_barrier_interval: 10,
+            snapshot_batch_size: 1000,
+            // 0 means disable backfill v2.
+            backfill_parallelism: 0,
+            backfill_num_rows_per_split: 100_000,
+            backfill_as_even_splits: true,
+            backfill_split_pk_column_index: 0,
+        }
+    }
+}
+
+impl CdcScanOptions {
+    pub fn to_proto(&self) -> StreamCdcScanOptions {
+        StreamCdcScanOptions {
+            disable_backfill: self.disable_backfill,
+            snapshot_barrier_interval: self.snapshot_barrier_interval,
+            snapshot_batch_size: self.snapshot_batch_size,
+            backfill_parallelism: self.backfill_parallelism,
+            backfill_num_rows_per_split: self.backfill_num_rows_per_split,
+            backfill_as_even_splits: self.backfill_as_even_splits,
+            backfill_split_pk_column_index: self.backfill_split_pk_column_index,
+        }
+    }
+
+    pub fn from_proto(proto: &StreamCdcScanOptions) -> Self {
+        Self {
+            disable_backfill: proto.disable_backfill,
+            snapshot_barrier_interval: proto.snapshot_barrier_interval,
+            snapshot_batch_size: proto.snapshot_batch_size,
+            backfill_parallelism: proto.backfill_parallelism,
+            backfill_num_rows_per_split: proto.backfill_num_rows_per_split,
+            backfill_as_even_splits: proto.backfill_as_even_splits,
+            backfill_split_pk_column_index: proto.backfill_split_pk_column_index,
+        }
+    }
+
+    pub fn is_parallelized_backfill(&self) -> bool {
+        !self.disable_backfill
+            && self.backfill_num_rows_per_split > 0
+            && self.backfill_parallelism > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect_properties(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn test_canonical_name() {
+        assert_eq!(
+            Mysql::canonical_name(&connect_properties(&[
+                ("connector", MYSQL_CDC_CONNECTOR),
+                ("database.name", "mydb"),
+                ("table.name", "orders"),
+            ])),
+            "mydb.orders"
+        );
+        assert_eq!(
+            Postgres::canonical_name(&connect_properties(&[
+                ("connector", POSTGRES_CDC_CONNECTOR),
+                ("database.name", "postgres"),
+                ("schema.name", "public"),
+                ("table.name", "a.b"),
+            ])),
+            "public.a.b"
+        );
+        assert_eq!(
+            SqlServer::canonical_name(&connect_properties(&[
+                ("connector", SQL_SERVER_CDC_CONNECTOR),
+                ("database.name", "my.db"),
+                ("schema.name", "dbo"),
+                ("table.name", "a.b"),
+            ])),
+            "my.db.dbo.a.b"
+        );
+    }
+
+    #[test]
+    fn test_split_quoted_identifier() {
+        let parts = |parts: &[&str]| Some(parts.iter().map(|p| (*p).to_owned()).collect_vec());
+
+        assert_eq!(
+            Postgres::split_quoted_identifier("public.orders"),
+            parts(&["public", "orders"])
+        );
+        assert_eq!(
+            Postgres::split_quoted_identifier(r#""My.Schema"."a""b.c""#),
+            parts(&["My.Schema", r#"a"b.c"#])
+        );
+        assert_eq!(
+            SqlServer::split_quoted_identifier("[my.db].dbo.[a]]b.c]"),
+            parts(&["my.db", "dbo", "a]b.c"])
+        );
+        assert_eq!(
+            SqlServer::split_quoted_identifier("dbo.a[b"),
+            None,
+            "`[` opens a quote only at the start of a part"
+        );
+
+        for name in ["", "a..b", ".a", "a.", r#"public."a"#, r#"public."a"b"#] {
+            assert_eq!(Postgres::split_quoted_identifier(name), None, "{name}");
+        }
+        for name in ["[a", "dbo.[a]b]", "dbo.a]b", "[a]].b"] {
+            assert_eq!(SqlServer::split_quoted_identifier(name), None, "{name}");
+        }
     }
 }

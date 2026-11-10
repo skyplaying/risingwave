@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use risingwave_common_estimate_size::EstimateSize;
 
 use crate::dispatch_scalar_ref_variants;
 use crate::types::{Datum, DatumRef, ScalarImpl, ScalarRefImpl};
-use crate::util::sort_util::{cmp_datum, partial_cmp_datum, OrderType};
+use crate::util::sort_util::{OrderType, cmp_datum, partial_cmp_datum};
 
 pub fn default_partial_cmp_scalar_ref_impl(
     lhs: ScalarRefImpl<'_>,
@@ -133,7 +133,7 @@ impl<T: DefaultOrd> From<T> for DefaultOrdered<T> {
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
+#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<T: DefaultOrd> PartialOrd for DefaultOrdered<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.default_partial_cmp(other.as_inner())

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,23 +14,27 @@
 
 use std::fmt::Display;
 
+use FrameBound::{CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding};
 use enum_as_inner::EnumAsInner;
 use parse_display::Display;
 use risingwave_common::types::DataType;
+use risingwave_common::util::sort_util::OrderType;
 use risingwave_common::{bail, must_match};
 use risingwave_pb::expr::window_frame::{PbBounds, PbExclusion};
 use risingwave_pb::expr::{PbWindowFrame, PbWindowFunction};
-use FrameBound::{CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding};
 
-use super::{RangeFrameBounds, RowsFrameBound, RowsFrameBounds, WindowFuncKind};
-use crate::aggregate::AggArgs;
+use super::{
+    RangeFrameBounds, RowsFrameBound, RowsFrameBounds, SessionFrameBounds, WindowFuncKind,
+};
 use crate::Result;
+use crate::aggregate::AggArgs;
 
 #[derive(Debug, Clone)]
 pub struct WindowFuncCall {
     pub kind: WindowFuncKind,
-    pub args: AggArgs,
     pub return_type: DataType,
+    pub args: AggArgs,
+    pub ignore_nulls: bool,
     pub frame: Frame,
 }
 
@@ -38,8 +42,9 @@ impl WindowFuncCall {
     pub fn from_protobuf(call: &PbWindowFunction) -> Result<Self> {
         let call = WindowFuncCall {
             kind: WindowFuncKind::from_protobuf(call.get_type()?)?,
-            args: AggArgs::from_protobuf(call.get_args())?,
             return_type: DataType::from(call.get_return_type()?),
+            args: AggArgs::from_protobuf(call.get_args())?,
+            ignore_nulls: call.get_ignore_nulls(),
             frame: Frame::from_protobuf(call.get_frame()?)?,
         };
         Ok(call)
@@ -87,10 +92,14 @@ impl Frame {
         use risingwave_pb::expr::window_frame::PbType;
         let bounds = match frame.get_type()? {
             PbType::Unspecified => bail!("unspecified type of `WindowFrame`"),
+            #[expect(deprecated)]
             PbType::RowsLegacy => {
-                let start = FrameBound::<usize>::from_protobuf_legacy(frame.get_start()?)?;
-                let end = FrameBound::<usize>::from_protobuf_legacy(frame.get_end()?)?;
-                FrameBounds::Rows(RowsFrameBounds { start, end })
+                #[expect(deprecated)]
+                {
+                    let start = FrameBound::<usize>::from_protobuf_legacy(frame.get_start()?)?;
+                    let end = FrameBound::<usize>::from_protobuf_legacy(frame.get_end()?)?;
+                    FrameBounds::Rows(RowsFrameBounds { start, end })
+                }
             }
             PbType::Rows => {
                 let bounds = must_match!(frame.get_bounds()?, PbBounds::Rows(bounds) => bounds);
@@ -100,6 +109,10 @@ impl Frame {
                 let bounds = must_match!(frame.get_bounds()?, PbBounds::Range(bounds) => bounds);
                 FrameBounds::Range(RangeFrameBounds::from_protobuf(bounds)?)
             }
+            PbType::Session => {
+                let bounds = must_match!(frame.get_bounds()?, PbBounds::Session(bounds) => bounds);
+                FrameBounds::Session(SessionFrameBounds::from_protobuf(bounds)?)
+            }
         };
         let exclusion = FrameExclusion::from_protobuf(frame.get_exclusion()?)?;
         Ok(Self { bounds, exclusion })
@@ -108,8 +121,8 @@ impl Frame {
     pub fn to_protobuf(&self) -> PbWindowFrame {
         use risingwave_pb::expr::window_frame::PbType;
         let exclusion = self.exclusion.to_protobuf() as _;
+        #[expect(deprecated)] // because of `start` and `end` fields
         match &self.bounds {
-            #[expect(deprecated)]
             FrameBounds::Rows(bounds) => PbWindowFrame {
                 r#type: PbType::Rows as _,
                 start: None, // deprecated
@@ -117,13 +130,19 @@ impl Frame {
                 exclusion,
                 bounds: Some(PbBounds::Rows(bounds.to_protobuf())),
             },
-            #[expect(deprecated)]
             FrameBounds::Range(bounds) => PbWindowFrame {
                 r#type: PbType::Range as _,
                 start: None, // deprecated
                 end: None,   // deprecated
                 exclusion,
                 bounds: Some(PbBounds::Range(bounds.to_protobuf())),
+            },
+            FrameBounds::Session(bounds) => PbWindowFrame {
+                r#type: PbType::Session as _,
+                start: None, // deprecated
+                end: None,   // deprecated
+                exclusion,
+                bounds: Some(PbBounds::Session(bounds.to_protobuf())),
             },
         }
     }
@@ -135,6 +154,7 @@ pub enum FrameBounds {
     Rows(RowsFrameBounds),
     // Groups(GroupsFrameBounds),
     Range(RangeFrameBounds),
+    Session(SessionFrameBounds),
 }
 
 impl FrameBounds {
@@ -142,6 +162,7 @@ impl FrameBounds {
         match self {
             Self::Rows(bounds) => bounds.validate(),
             Self::Range(bounds) => bounds.validate(),
+            Self::Session(bounds) => bounds.validate(),
         }
     }
 
@@ -149,6 +170,7 @@ impl FrameBounds {
         match self {
             Self::Rows(RowsFrameBounds { start, .. }) => start.is_unbounded_preceding(),
             Self::Range(RangeFrameBounds { start, .. }) => start.is_unbounded_preceding(),
+            Self::Session(_) => false,
         }
     }
 
@@ -156,11 +178,99 @@ impl FrameBounds {
         match self {
             Self::Rows(RowsFrameBounds { end, .. }) => end.is_unbounded_following(),
             Self::Range(RangeFrameBounds { end, .. }) => end.is_unbounded_following(),
+            Self::Session(_) => false,
         }
     }
 
     pub fn is_unbounded(&self) -> bool {
         self.start_is_unbounded() || self.end_is_unbounded()
+    }
+
+    /// Whether the frame may include rows *preceding* the current row in the frame ordering.
+    pub fn may_include_preceding_rows(&self) -> bool {
+        match self {
+            Self::Rows(RowsFrameBounds { start, .. }) => {
+                start.is_unbounded_preceding() || start.is_preceding()
+            }
+            Self::Range(RangeFrameBounds { start, .. }) => {
+                start.is_unbounded_preceding() || start.is_preceding()
+            }
+            Self::Session(_) => true,
+        }
+    }
+
+    /// Whether the frame may include rows *following* the current row in the frame ordering.
+    pub fn may_include_following_rows(&self) -> bool {
+        match self {
+            Self::Rows(RowsFrameBounds { end, .. }) => {
+                end.is_unbounded_following() || end.is_following()
+            }
+            Self::Range(RangeFrameBounds { end, .. }) => {
+                end.is_unbounded_following() || end.is_following()
+            }
+            Self::Session(_) => true,
+        }
+    }
+
+    /// Whether the window of a row may be closed by the watermark of the order key in ascending
+    /// order, rather than only by later rows. A frame ending before the current row is closed once
+    /// the row arrives, and a frame without an end is never closed.
+    pub fn may_close_by_watermark(&self) -> bool {
+        match self {
+            Self::Rows(_) => false,
+            Self::Range(RangeFrameBounds {
+                order_data_type,
+                end,
+                ..
+            }) => match end {
+                Preceding(offset) => match order_data_type {
+                    // Subtraction is exact only for these types. A float or decimal frame end may
+                    // round back to the current row, or stay at an infinity, e.g., `2^54 - 1.0` in
+                    // `float8`.
+                    DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Timestamp
+                    | DataType::Timestamptz
+                    | DataType::Interval => offset.is_zero(),
+                    _ => true,
+                },
+                CurrentRow | Following(_) => true,
+                UnboundedFollowing => false,
+                UnboundedPreceding => unreachable!("frame end never be UNBOUNDED PRECEDING"),
+            },
+            Self::Session(_) => true,
+        }
+    }
+}
+
+/// Whether a watermark on the first `ORDER BY` column can be forwarded through a general (i.e.
+/// non-EOWC) streaming over window operator evaluating the given `frames`, which all share the
+/// same `PARTITION BY` and `ORDER BY` clauses.
+///
+/// A watermark `wm` on a column promises that no row with the column value `< wm` will ever arrive
+/// again. To forward it, the operator must guarantee that the outputs of rows with the column value
+/// `< wm` will never change again, which holds when a row can only affect (i.e. be included in the
+/// frames of) rows that are not "smaller" than itself in the column:
+///
+/// - the column is ordered `ASC` and no frame extends to following rows, or
+/// - the column is ordered `DESC` and no frame extends to preceding rows.
+///
+/// Additionally, NULLs must be ordered as the largest values (`ASC NULLS LAST` or `DESC NULLS
+/// FIRST`). Rows with NULL in the column are not covered by the watermark guarantee, so they must
+/// also land on the "larger" side to never affect rows below the watermark.
+pub fn can_forward_watermark_on_order_key<'a>(
+    frames: impl IntoIterator<Item = &'a Frame>,
+    first_order_type: OrderType,
+) -> bool {
+    if !first_order_type.nulls_are_largest() {
+        return false;
+    }
+    let mut frames = frames.into_iter();
+    if first_order_type.is_ascending() {
+        frames.all(|frame| !frame.bounds.may_include_following_rows())
+    } else {
+        frames.all(|frame| !frame.bounds.may_include_preceding_rows())
     }
 }
 
@@ -267,5 +377,173 @@ impl FrameExclusion {
             Self::CurrentRow => PbExclusion::CurrentRow,
             Self::NoOthers => PbExclusion::NoOthers,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_common::types::{Decimal, Interval, ScalarImpl};
+
+    use super::*;
+    use crate::window_function::{RangeFrameBound, RangeFrameOffset, SessionFrameGap};
+
+    fn rows_frame(start: RowsFrameBound, end: RowsFrameBound) -> Frame {
+        Frame::rows(start, end)
+    }
+
+    fn range_frame(start: FrameBound<i64>, end: FrameBound<i64>, order_type: OrderType) -> Frame {
+        // The offsets don't need to be prepared for evaluation here.
+        let bound = |bound: FrameBound<i64>| -> RangeFrameBound {
+            bound.map(|offset| RangeFrameOffset::new(ScalarImpl::Int64(offset)))
+        };
+        Frame {
+            bounds: FrameBounds::Range(RangeFrameBounds {
+                order_data_type: DataType::Int64,
+                order_type,
+                offset_data_type: DataType::Int64,
+                start: bound(start),
+                end: bound(end),
+            }),
+            exclusion: FrameExclusion::default(),
+        }
+    }
+
+    fn session_frame(order_type: OrderType) -> Frame {
+        Frame {
+            bounds: FrameBounds::Session(SessionFrameBounds {
+                order_data_type: DataType::Int64,
+                order_type,
+                gap_data_type: DataType::Int64,
+                gap: SessionFrameGap::new(ScalarImpl::Int64(10)),
+            }),
+            exclusion: FrameExclusion::default(),
+        }
+    }
+
+    #[test]
+    fn test_may_close_by_watermark() {
+        let asc = OrderType::ascending();
+        let may_close = |frame: Frame| frame.bounds.may_close_by_watermark();
+
+        assert!(!may_close(rows_frame(Preceding(1), Preceding(1))));
+        assert!(!may_close(rows_frame(CurrentRow, Following(1))));
+        assert!(may_close(range_frame(UnboundedPreceding, CurrentRow, asc)));
+        assert!(may_close(range_frame(CurrentRow, Following(10), asc)));
+        assert!(may_close(range_frame(Preceding(10), Preceding(0), asc)));
+        assert!(!may_close(range_frame(Preceding(10), Preceding(5), asc)));
+        assert!(!may_close(range_frame(CurrentRow, UnboundedFollowing, asc)));
+        assert!(may_close(session_frame(asc)));
+
+        // A positive offset ends the frame before the current row only for exact subtraction.
+        let preceding = |order_data_type: DataType, offset_data_type, offset: ScalarImpl| Frame {
+            bounds: FrameBounds::Range(RangeFrameBounds {
+                order_data_type,
+                order_type: asc,
+                offset_data_type,
+                start: Preceding(RangeFrameOffset::new(offset.clone())),
+                end: Preceding(RangeFrameOffset::new(offset)),
+            }),
+            exclusion: FrameExclusion::default(),
+        };
+        assert!(may_close(preceding(
+            DataType::Float64,
+            DataType::Float64,
+            1.0f64.into()
+        )));
+        assert!(may_close(preceding(
+            DataType::Float32,
+            DataType::Float32,
+            1.0f32.into()
+        )));
+        assert!(may_close(preceding(
+            DataType::Decimal,
+            DataType::Decimal,
+            Decimal::from(1).into()
+        )));
+        assert!(!may_close(preceding(
+            DataType::Timestamp,
+            DataType::Interval,
+            Interval::from_month_day_usec(1, 0, 0).into()
+        )));
+    }
+
+    #[test]
+    fn test_can_forward_watermark_on_order_key() {
+        let asc = OrderType::ascending(); // ASC NULLS LAST
+        let desc = OrderType::descending(); // DESC NULLS FIRST
+        let can_forward =
+            |frames: &[Frame], order_type| can_forward_watermark_on_order_key(frames, order_type);
+
+        let preceding_only = [
+            rows_frame(UnboundedPreceding, CurrentRow), // rank functions
+            rows_frame(Preceding(1), Preceding(1)),     // `lag`
+            rows_frame(Preceding(2), CurrentRow),
+        ];
+        let following_only = [
+            rows_frame(CurrentRow, UnboundedFollowing),
+            rows_frame(Following(1), Following(1)), // `lead`
+            rows_frame(CurrentRow, Following(2)),
+        ];
+        let current_row_only = [rows_frame(CurrentRow, CurrentRow)];
+        let both_sides = [
+            rows_frame(Preceding(1), Following(1)),
+            rows_frame(UnboundedPreceding, UnboundedFollowing),
+        ];
+
+        assert!(can_forward(&preceding_only, asc));
+        assert!(!can_forward(&preceding_only, desc));
+        assert!(!can_forward(&following_only, asc));
+        assert!(can_forward(&following_only, desc));
+        assert!(can_forward(&current_row_only, asc));
+        assert!(can_forward(&current_row_only, desc));
+        assert!(!can_forward(&both_sides, asc));
+        assert!(!can_forward(&both_sides, desc));
+
+        // Any frame extending to the "smaller" side of the current row disables forwarding.
+        let mixed = [
+            rows_frame(Preceding(1), Preceding(1)),
+            rows_frame(Following(1), Following(1)),
+        ];
+        assert!(!can_forward(&mixed, asc));
+        assert!(!can_forward(&mixed, desc));
+
+        // `RANGE` frames follow the same rule.
+        for order_type in [asc, desc] {
+            let preceding_only = [range_frame(Preceding(10), CurrentRow, order_type)];
+            let following_only = [range_frame(CurrentRow, Following(10), order_type)];
+            let both_sides = [range_frame(Preceding(10), Following(10), order_type)];
+            assert_eq!(
+                can_forward(&preceding_only, order_type),
+                order_type.is_ascending()
+            );
+            assert_eq!(
+                can_forward(&following_only, order_type),
+                order_type.is_descending()
+            );
+            assert!(!can_forward(&both_sides, order_type));
+        }
+
+        // `SESSION` frames extend to both sides.
+        for order_type in [asc, desc] {
+            assert!(!can_forward(&[session_frame(order_type)], order_type));
+        }
+
+        // NULLs must be ordered as the largest values.
+        assert!(!can_forward(
+            &preceding_only,
+            OrderType::ascending_nulls_first()
+        ));
+        assert!(!can_forward(
+            &following_only,
+            OrderType::descending_nulls_last()
+        ));
+        assert!(can_forward(
+            &preceding_only,
+            OrderType::ascending_nulls_last()
+        ));
+        assert!(can_forward(
+            &following_only,
+            OrderType::descending_nulls_first()
+        ));
     }
 }

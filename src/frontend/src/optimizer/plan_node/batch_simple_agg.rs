@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_pb::batch_plan::plan_node::NodeBody;
+use risingwave_expr::aggregate::{AggType, PbAggKind};
 use risingwave_pb::batch_plan::SortAggNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
 
 use super::batch::prelude::*;
 use super::generic::{self, PlanAggCall};
 use super::utils::impl_distill_by_unit;
-use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch};
+use super::{
+    BatchPlanRef as PlanRef, ExprRewritable, PlanBase, PlanTreeNodeUnary, ToBatchPb,
+    ToDistributedBatch,
+};
 use crate::error::Result;
 use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
@@ -28,7 +32,7 @@ use crate::optimizer::property::{Distribution, Order, RequiredDist};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BatchSimpleAgg {
     pub base: PlanBase<Batch>,
-    core: generic::Agg<PlanRef>,
+    pub core: generic::Agg<PlanRef>,
 }
 
 impl BatchSimpleAgg {
@@ -51,11 +55,19 @@ impl BatchSimpleAgg {
     }
 
     pub(crate) fn can_two_phase_agg(&self) -> bool {
-        self.core.can_two_phase_agg() && self.two_phase_agg_enabled()
+        self.core.can_two_phase_agg()
+            && self
+                .core
+                // Ban two phase approx percentile.
+                .agg_calls
+                .iter()
+                .map(|agg_call| &agg_call.agg_type)
+                .all(|agg_type| !matches!(agg_type, AggType::Builtin(PbAggKind::ApproxPercentile)))
+            && self.two_phase_agg_enabled()
     }
 }
 
-impl PlanTreeNodeUnary for BatchSimpleAgg {
+impl PlanTreeNodeUnary<Batch> for BatchSimpleAgg {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -67,7 +79,7 @@ impl PlanTreeNodeUnary for BatchSimpleAgg {
         })
     }
 }
-impl_plan_tree_node_for_unary! { BatchSimpleAgg }
+impl_plan_tree_node_for_unary! { Batch, BatchSimpleAgg }
 impl_distill_by_unit!(BatchSimpleAgg, core, "BatchSimpleAgg");
 
 impl ToDistributedBatch for BatchSimpleAgg {
@@ -127,13 +139,13 @@ impl ToLocalBatch for BatchSimpleAgg {
         let new_input = self.input().to_local()?;
 
         let new_input =
-            RequiredDist::single().enforce_if_not_satisfies(new_input, &Order::any())?;
+            RequiredDist::single().batch_enforce_if_not_satisfies(new_input, &Order::any())?;
 
         Ok(self.clone_with_input(new_input).into())
     }
 }
 
-impl ExprRewritable for BatchSimpleAgg {
+impl ExprRewritable<Batch> for BatchSimpleAgg {
     fn has_rewritable_expr(&self) -> bool {
         true
     }

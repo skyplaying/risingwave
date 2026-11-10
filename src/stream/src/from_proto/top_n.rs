@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,13 @@ use risingwave_common::util::sort_util::ColumnOrder;
 use risingwave_pb::stream_plan::TopNNode;
 
 use super::*;
-use crate::common::table::state_table::StateTable;
+use crate::common::table::state_table::StateTableBuilder;
 use crate::executor::{AppendOnlyTopNExecutor, TopNExecutor};
 
 pub struct TopNExecutorBuilder<const APPEND_ONLY: bool>;
+
+impl_stream_node_body!(TopN(TopNNode) => TopNExecutorBuilder<false>);
+impl_stream_node_body!(AppendOnlyTopN(TopNNode) => TopNExecutorBuilder<true>);
 
 impl<const APPEND_ONLY: bool> ExecutorBuilder for TopNExecutorBuilder<APPEND_ONLY> {
     type Node = TopNNode;
@@ -34,8 +37,11 @@ impl<const APPEND_ONLY: bool> ExecutorBuilder for TopNExecutorBuilder<APPEND_ONL
         let [input]: [_; 1] = params.input.try_into().unwrap();
 
         let table = node.get_table()?;
-        let vnodes = params.vnode_bitmap.map(Arc::new);
-        let state_table = StateTable::from_table_catalog(table, store, vnodes).await;
+        let vnodes = Some(Arc::new(params.vnode_bitmap));
+        let state_table = StateTableBuilder::new(table, store, vnodes)
+            .enable_preload_all_rows_by_config(&params.config)
+            .build()
+            .await;
         let storage_key = table
             .get_pk()
             .iter()
@@ -48,8 +54,8 @@ impl<const APPEND_ONLY: bool> ExecutorBuilder for TopNExecutorBuilder<APPEND_ONL
             .collect();
 
         macro_rules! build {
-            ($excutor:ident, $with_ties:literal) => {
-                Ok($excutor::<_, $with_ties>::new(
+            ($executor:ident, $with_ties:literal) => {
+                Ok($executor::<_, $with_ties>::new(
                     input,
                     params.actor_context,
                     params.info.schema.clone(),

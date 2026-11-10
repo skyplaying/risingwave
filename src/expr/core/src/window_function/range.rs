@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use educe::Educe;
-use futures_util::FutureExt;
+use num_traits::Zero;
 use risingwave_common::bail;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{
@@ -32,11 +32,10 @@ use super::FrameBound::{
     self, CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding,
 };
 use super::FrameBoundsImpl;
-use crate::expr::{
-    build_func, BoxedExpression, Expression, ExpressionBoxExt, InputRefExpression,
-    LiteralExpression,
-};
 use crate::Result;
+use crate::expr::{
+    InputRefExpression, LiteralExpression, SyncExpression, SyncExpressionBoxExt, build_func,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct RangeFrameBounds {
@@ -130,8 +129,10 @@ impl FrameBoundsImpl for RangeFrameBounds {
                             );
                         }
                     }
-                },
-                _ => unreachable!("other order column data types are not supported and should be banned in frontend"),
+                }
+                _ => unreachable!(
+                    "other order column data types are not supported and should be banned in frontend"
+                ),
             }
             Ok(())
         })
@@ -311,10 +312,10 @@ pub struct RangeFrameOffset {
     offset: ScalarImpl,
     /// Built expression for `$0 + offset`.
     #[educe(PartialEq(ignore), Hash(ignore))]
-    add_expr: Option<Arc<BoxedExpression>>,
+    add_expr: Option<Arc<dyn SyncExpression>>,
     /// Built expression for `$0 - offset`.
     #[educe(PartialEq(ignore), Hash(ignore))]
-    sub_expr: Option<Arc<BoxedExpression>>,
+    sub_expr: Option<Arc<dyn SyncExpression>>,
 }
 
 impl RangeFrameOffset {
@@ -326,22 +327,46 @@ impl RangeFrameOffset {
         }
     }
 
+    pub fn is_zero(&self) -> bool {
+        match self.offset.as_scalar_ref_impl() {
+            ScalarRefImpl::Int16(val) => val == 0,
+            ScalarRefImpl::Int32(val) => val == 0,
+            ScalarRefImpl::Int64(val) => val == 0,
+            ScalarRefImpl::Float32(val) => val.is_zero(),
+            ScalarRefImpl::Float64(val) => val.is_zero(),
+            ScalarRefImpl::Decimal(val) => val.is_zero(),
+            ScalarRefImpl::Interval(val) => val.is_zero(),
+            _ => unreachable!(
+                "other order column data types are not supported and should be banned in frontend"
+            ),
+        }
+    }
+
     fn prepare(&mut self, order_data_type: &DataType, offset_data_type: &DataType) -> Result<()> {
         use risingwave_pb::expr::expr_node::PbType as PbExprType;
 
         let input_expr = InputRefExpression::new(order_data_type.clone(), 0);
         let offset_expr =
             LiteralExpression::new(offset_data_type.clone(), Some(self.offset.clone()));
-        self.add_expr = Some(Arc::new(build_func(
+        let add_expr = build_func(
             PbExprType::Add,
             order_data_type.clone(),
             vec![input_expr.clone().boxed(), offset_expr.clone().boxed()],
-        )?));
-        self.sub_expr = Some(Arc::new(build_func(
+        )?;
+        let crate::expr::BoxedExpression::Sync(add_expr) = add_expr else {
+            bail!("range frame offset add expression must be sync");
+        };
+        self.add_expr = Some(add_expr);
+
+        let sub_expr = build_func(
             PbExprType::Subtract,
             order_data_type.clone(),
             vec![input_expr.boxed(), offset_expr.boxed()],
-        )?));
+        )?;
+        let crate::expr::BoxedExpression::Sync(sub_expr) = sub_expr else {
+            bail!("range frame offset subtract expression must be sync");
+        };
+        self.sub_expr = Some(sub_expr);
         Ok(())
     }
 
@@ -368,9 +393,9 @@ impl Deref for RangeFrameOffset {
 #[educe(Clone, Copy)]
 struct RangeFrameOffsetRef<'a> {
     /// Built expression for `$0 + offset`.
-    add_expr: &'a dyn Expression,
+    add_expr: &'a dyn SyncExpression,
     /// Built expression for `$0 - offset`.
-    sub_expr: &'a dyn Expression,
+    sub_expr: &'a dyn SyncExpression,
 }
 
 impl FrameBound<RangeFrameOffsetRef<'_>> {
@@ -393,8 +418,6 @@ impl FrameBound<RangeFrameOffsetRef<'_>> {
         let row = OwnedRow::new(vec![order_value.to_owned_datum()]);
         Sentinelled::Normal(
             expr.eval_row(&row)
-                .now_or_never()
-                .expect("frame bound calculation should finish immediately")
                 .expect("just simple calculation, should succeed"), // TODO(rc): handle overflow
         )
     }

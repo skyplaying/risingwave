@@ -12,10 +12,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import useErrorToast from "../../hook/useErrorToast"
 
 /**
@@ -23,7 +22,8 @@ import useErrorToast from "../../hook/useErrorToast"
  * @param fetchFn The function to fetch data from the server.
  * @param intervalMs The interval in milliseconds to fetch data from the server. If null, the data is fetched only once.
  * @param when If true, fetch data from the server. If false, do nothing.
- * @returns The response from the server.
+ * @returns The response from the server, a `refresh` function to re-fetch on demand,
+ * and a `loading` flag that is true while a request is in flight.
  */
 export default function useFetch<T>(
   fetchFn: () => Promise<T>,
@@ -31,17 +31,22 @@ export default function useFetch<T>(
   when: boolean = true
 ) {
   const [response, setResponse] = useState<T>()
+  const [loading, setLoading] = useState(false)
+  const [tick, setTick] = useState(0)
   const toast = useErrorToast()
+  const refresh = useCallback(() => setTick((t) => t + 1), [])
 
-  // NOTE(eric): Don't put `fetchFn` in the dependency array. It might be a lambda function
   useEffect(() => {
     const fetchData = async () => {
       if (when) {
+        setLoading(true)
         try {
           const res = await fetchFn()
           setResponse(res)
         } catch (e: any) {
           toast(e)
+        } finally {
+          setLoading(false)
         }
       }
     }
@@ -53,7 +58,11 @@ export default function useFetch<T>(
 
     const timer = setInterval(fetchData, intervalMs)
     return () => clearInterval(timer)
-  }, [toast, intervalMs, when])
+    // NOTE(eric): Don't put `fetchFn` in the dependency array. Otherwise, it can cause an infinite loop.
+    // This is because `fetchFn` can be recreated every render, then it will trigger a dependency change,
+    // which triggers a re-render, and so on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toast, intervalMs, when, tick])
 
-  return { response }
+  return { response, refresh, loading }
 }

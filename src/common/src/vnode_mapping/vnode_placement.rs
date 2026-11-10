@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use num_integer::Integer;
 use risingwave_common::hash::WorkerSlotId;
 use risingwave_pb::common::WorkerNode;
 
-use crate::buffer::{Bitmap, BitmapBuilder};
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::hash::{VirtualNode, WorkerSlotMapping};
 
 /// Calculate a new vnode mapping, keeping locality and balance on a best effort basis.
@@ -30,21 +30,26 @@ pub fn place_vnode(
     hint_worker_slot_mapping: Option<&WorkerSlotMapping>,
     workers: &[WorkerNode],
     max_parallelism: Option<usize>,
+    vnode_count: usize,
 ) -> Option<WorkerSlotMapping> {
+    if let Some(mapping) = hint_worker_slot_mapping {
+        assert_eq!(mapping.len(), vnode_count);
+    }
+
     // Get all serving worker slots from all available workers, grouped by worker id and ordered
     // by worker slot id in each group.
     let mut worker_slots: LinkedList<_> = workers
         .iter()
-        .filter(|w| w.property.as_ref().map_or(false, |p| p.is_serving))
+        .filter(|w| w.property.as_ref().is_some_and(|p| p.is_serving))
         .sorted_by_key(|w| w.id)
-        .map(|w| (0..w.parallel_units.len()).map(|idx| WorkerSlotId::new(w.id, idx)))
+        .map(|w| (0..w.compute_node_parallelism()).map(|idx| WorkerSlotId::new(w.id, idx)))
         .collect();
 
     // Set serving parallelism to the minimum of total number of worker slots, specified
     // `max_parallelism` and total number of virtual nodes.
     let serving_parallelism = std::cmp::min(
         worker_slots.iter().map(|slots| slots.len()).sum(),
-        std::cmp::min(max_parallelism.unwrap_or(usize::MAX), VirtualNode::COUNT),
+        std::cmp::min(max_parallelism.unwrap_or(usize::MAX), vnode_count),
     );
 
     // Select `serving_parallelism` worker slots in a round-robin fashion, to distribute workload
@@ -79,14 +84,14 @@ pub fn place_vnode(
         is_temp: bool,
     }
 
-    let (expected, mut remain) = VirtualNode::COUNT.div_rem(&selected_slots.len());
+    let (expected, mut remain) = vnode_count.div_rem(&selected_slots.len());
     let mut balances: HashMap<WorkerSlotId, Balance> = HashMap::default();
 
     for slot in &selected_slots {
         let mut balance = Balance {
             slot: *slot,
             balance: -(expected as i32),
-            builder: BitmapBuilder::zeroed(VirtualNode::COUNT),
+            builder: BitmapBuilder::zeroed(vnode_count),
             is_temp: false,
         };
 
@@ -100,9 +105,9 @@ pub fn place_vnode(
     // Now to maintain affinity, if a hint has been provided via `hint_worker_slot_mapping`, follow
     // that mapping to adjust balances.
     let mut temp_slot = Balance {
-        slot: WorkerSlotId::new(0u32, usize::MAX), /* This id doesn't matter for `temp_slot`. It's distinguishable via `is_temp`. */
+        slot: WorkerSlotId::new(0u32.into(), usize::MAX), /* This id doesn't matter for `temp_slot`. It's distinguishable via `is_temp`. */
         balance: 0,
-        builder: BitmapBuilder::zeroed(VirtualNode::COUNT),
+        builder: BitmapBuilder::zeroed(vnode_count),
         is_temp: true,
     };
     match hint_worker_slot_mapping {
@@ -123,7 +128,7 @@ pub fn place_vnode(
         }
         None => {
             // No hint is provided, assign all vnodes to `temp_pu`.
-            for vnode in VirtualNode::all() {
+            for vnode in VirtualNode::all(vnode_count) {
                 temp_slot.balance += 1;
                 temp_slot.builder.set(vnode.to_index(), true);
             }
@@ -158,7 +163,7 @@ pub fn place_vnode(
         let mut dst = balances.pop_back().unwrap();
         let n = std::cmp::min(src.balance.abs(), dst.balance.abs());
         let mut moved = 0;
-        for idx in 0..VirtualNode::COUNT {
+        for idx in 0..vnode_count {
             if moved >= n {
                 break;
             }
@@ -189,7 +194,7 @@ pub fn place_vnode(
     for (worker_slot, bitmap) in results {
         worker_result
             .entry(worker_slot)
-            .or_insert(BitmapBuilder::zeroed(VirtualNode::COUNT).finish())
+            .or_insert(Bitmap::zeros(vnode_count))
             .bitor_assign(&bitmap);
     }
 
@@ -198,47 +203,42 @@ pub fn place_vnode(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use risingwave_common::hash::WorkerSlotMapping;
     use risingwave_pb::common::worker_node::Property;
-    use risingwave_pb::common::{ParallelUnit, WorkerNode};
+    use risingwave_pb::common::{WorkerNode, WorkerType};
 
-    use crate::hash::{ParallelUnitId, VirtualNode};
-    use crate::vnode_mapping::vnode_placement::place_vnode;
+    use crate::hash::VirtualNode;
+
+    /// [`super::place_vnode`] with [`VirtualNode::COUNT_FOR_TEST`] as the vnode count.
+    fn place_vnode(
+        hint_worker_slot_mapping: Option<&WorkerSlotMapping>,
+        workers: &[WorkerNode],
+        max_parallelism: Option<usize>,
+    ) -> Option<WorkerSlotMapping> {
+        super::place_vnode(
+            hint_worker_slot_mapping,
+            workers,
+            max_parallelism,
+            VirtualNode::COUNT_FOR_TEST,
+        )
+    }
+
     #[test]
     fn test_place_vnode() {
-        assert_eq!(VirtualNode::COUNT, 256);
+        assert_eq!(VirtualNode::COUNT_FOR_TEST, 256);
 
-        let mut pu_id_counter: ParallelUnitId = 0;
-        let mut pu_to_worker: HashMap<ParallelUnitId, u32> = Default::default();
         let serving_property = Property {
-            is_unschedulable: false,
             is_serving: true,
             is_streaming: false,
+            ..Default::default()
         };
-
-        let mut gen_pus_for_worker =
-            |worker_node_id: u32, number: u32, pu_to_worker: &mut HashMap<ParallelUnitId, u32>| {
-                let mut results = vec![];
-                for i in 0..number {
-                    results.push(ParallelUnit {
-                        id: pu_id_counter + i,
-                        worker_node_id,
-                    })
-                }
-                pu_id_counter += number;
-                for pu in &results {
-                    pu_to_worker.insert(pu.id, pu.worker_node_id);
-                }
-                results
-            };
 
         let count_same_vnode_mapping = |wm1: &WorkerSlotMapping, wm2: &WorkerSlotMapping| {
             assert_eq!(wm1.len(), 256);
             assert_eq!(wm2.len(), 256);
             let mut count: usize = 0;
-            for idx in 0..VirtualNode::COUNT {
+            for idx in 0..VirtualNode::COUNT_FOR_TEST {
                 let vnode = VirtualNode::from_index(idx);
                 if wm1.get(vnode) == wm2.get(vnode) {
                     count += 1;
@@ -247,25 +247,29 @@ mod tests {
             count
         };
 
+        let mut property = serving_property.clone();
+        property.parallelism = 1;
         let worker_1 = WorkerNode {
-            id: 1,
-            parallel_units: gen_pus_for_worker(1, 1, &mut pu_to_worker),
-            property: Some(serving_property.clone()),
+            id: 1.into(),
+            r#type: WorkerType::ComputeNode.into(),
+            property: Some(property),
             ..Default::default()
         };
 
         assert!(
-            place_vnode(None, &[worker_1.clone()], Some(0)).is_none(),
+            place_vnode(None, std::slice::from_ref(&worker_1), Some(0)).is_none(),
             "max_parallelism should >= 0"
         );
 
-        let re_worker_mapping_2 = place_vnode(None, &[worker_1.clone()], None).unwrap();
+        let re_worker_mapping_2 = place_vnode(None, std::slice::from_ref(&worker_1), None).unwrap();
         assert_eq!(re_worker_mapping_2.iter_unique().count(), 1);
 
+        let mut property = serving_property.clone();
+        property.parallelism = 50;
         let worker_2 = WorkerNode {
-            id: 2,
-            parallel_units: gen_pus_for_worker(2, 50, &mut pu_to_worker),
-            property: Some(serving_property.clone()),
+            id: 2.into(),
+            property: Some(property),
+            r#type: WorkerType::ComputeNode.into(),
             ..Default::default()
         };
 
@@ -281,10 +285,12 @@ mod tests {
         let score = count_same_vnode_mapping(&re_worker_mapping_2, &re_worker_mapping);
         assert!(score >= 5);
 
+        let mut property = serving_property;
+        property.parallelism = 60;
         let worker_3 = WorkerNode {
-            id: 3,
-            parallel_units: gen_pus_for_worker(3, 60, &mut pu_to_worker),
-            property: Some(serving_property),
+            id: 3.into(),
+            r#type: WorkerType::ComputeNode.into(),
+            property: Some(property),
             ..Default::default()
         };
         let re_pu_mapping_2 = place_vnode(

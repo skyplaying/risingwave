@@ -1,5 +1,41 @@
 # THIS FILE IS AUTO_GENERATED. DO NOT EDIT
+# UPDATE WITH: ./risedev generate-with-options
 
+AzblobConfig:
+  fields:
+  - name: azblob.container_name
+    field_type: String
+    required: true
+  - name: azblob.path
+    field_type: String
+    comments: The directory where the sink file is located.
+    required: true
+  - name: azblob.credentials.account_name
+    field_type: String
+    required: false
+    default: Default::default
+  - name: azblob.credentials.account_key
+    field_type: String
+    required: false
+    default: Default::default
+  - name: azblob.endpoint_url
+    field_type: String
+    required: true
+  - name: max_row_count
+    field_type: usize
+    required: false
+    default: DEFAULT_MAX_ROW_COUNR
+  - name: rollover_seconds
+    field_type: usize
+    required: false
+    default: DEFAULT_ROLLOVER_SECONDS
+  - name: path_partition_prefix
+    field_type: PathPartitionPrefix
+    required: false
+    default: Default::default
+  - name: r#type
+    field_type: String
+    required: true
 BigQueryConfig:
   fields:
   - name: bigquery.local.path
@@ -17,31 +53,40 @@ BigQueryConfig:
   - name: bigquery.table
     field_type: String
     required: true
-  - name: bigquery.max_batch_rows
-    field_type: usize
+  - name: auto_create
+    field_type: bool
     required: false
-    default: '1024'
+    default: Default::default
+    alias:
+    - create_table_if_not_exists
+  - name: bigquery.credentials
+    field_type: String
+    required: false
   - name: aws.region
     field_type: String
     required: false
     alias:
     - region
+    - s3.region
   - name: aws.endpoint_url
     field_type: String
     required: false
     alias:
     - endpoint_url
     - endpoint
+    - s3.endpoint
   - name: aws.credentials.access_key_id
     field_type: String
     required: false
     alias:
     - access_key
+    - s3.access.key
   - name: aws.credentials.secret_access_key
     field_type: String
     required: false
     alias:
     - secret_key
+    - s3.secret.key
   - name: aws.credentials.session_token
     field_type: String
     required: false
@@ -64,6 +109,9 @@ BigQueryConfig:
     required: false
     alias:
     - profile
+  - name: aws.msk.signer_timeout_sec
+    field_type: u64
+    required: false
   - name: r#type
     field_type: String
     required: true
@@ -84,37 +132,89 @@ ClickHouseConfig:
   - name: clickhouse.table
     field_type: String
     required: true
+  - name: clickhouse.delete.column
+    field_type: String
+    required: false
+  - name: commit_checkpoint_interval
+    field_type: u64
+    comments: Commit every n(>0) checkpoints, default is 10.
+    required: false
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
   - name: r#type
     field_type: String
     required: true
 DeltaLakeConfig:
   fields:
-  - name: s3.access.key
-    field_type: String
-    required: false
-  - name: s3.secret.key
-    field_type: String
-    required: false
   - name: location
     field_type: String
     required: true
-  - name: s3.region
+  - name: aws.region
     field_type: String
     required: false
-  - name: s3.endpoint
+    alias:
+    - region
+    - s3.region
+  - name: aws.endpoint_url
     field_type: String
+    required: false
+    alias:
+    - endpoint_url
+    - endpoint
+    - s3.endpoint
+  - name: aws.credentials.access_key_id
+    field_type: String
+    required: false
+    alias:
+    - access_key
+    - s3.access.key
+  - name: aws.credentials.secret_access_key
+    field_type: String
+    required: false
+    alias:
+    - secret_key
+    - s3.secret.key
+  - name: aws.credentials.session_token
+    field_type: String
+    required: false
+    alias:
+    - session_token
+  - name: aws.credentials.role.arn
+    field_type: String
+    comments: IAM role
+    required: false
+    alias:
+    - arn
+  - name: aws.credentials.role.external_id
+    field_type: String
+    comments: external ID in IAM role trust policy
+    required: false
+    alias:
+    - external_id
+  - name: aws.profile
+    field_type: String
+    required: false
+    alias:
+    - profile
+  - name: aws.msk.signer_timeout_sec
+    field_type: u64
     required: false
   - name: gcs.service.account
     field_type: String
     required: false
   - name: commit_checkpoint_interval
     field_type: u64
-    comments: Commit every n(>0) checkpoints, if n is not set, we will commit every checkpoint.
+    comments: Commit every n(>0) checkpoints, default is 10.
     required: false
-    default: Default::default
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
   - name: r#type
     field_type: String
     required: true
+  - name: is_exactly_once
+    field_type: bool
+    comments: Whether to use the Delta transaction log to deduplicate replayed epoch commits.
+    required: false
 DorisConfig:
   fields:
   - name: doris.url
@@ -132,9 +232,18 @@ DorisConfig:
   - name: doris.table
     field_type: String
     required: true
+  - name: doris.partial_update
+    field_type: String
+    required: false
   - name: r#type
     field_type: String
     required: true
+  - name: doris.stream_load.http.timeout.ms
+    field_type: u64
+    comments: The timeout in milliseconds for stream load http request, defaults to 30 seconds.
+    required: false
+    default: 30 * 1000
+    allow_alter_on_fly: true
 DynamoDbConfig:
   fields:
   - name: table
@@ -151,22 +260,26 @@ DynamoDbConfig:
     required: false
     alias:
     - region
+    - s3.region
   - name: aws.endpoint_url
     field_type: String
     required: false
     alias:
     - endpoint_url
     - endpoint
+    - s3.endpoint
   - name: aws.credentials.access_key_id
     field_type: String
     required: false
     alias:
     - access_key
+    - s3.access.key
   - name: aws.credentials.secret_access_key
     field_type: String
     required: false
     alias:
     - secret_key
+    - s3.secret.key
   - name: aws.credentials.session_token
     field_type: String
     required: false
@@ -189,12 +302,188 @@ DynamoDbConfig:
     required: false
     alias:
     - profile
+  - name: aws.msk.signer_timeout_sec
+    field_type: u64
+    required: false
+  - name: dynamodb.max_batch_item_nums
+    field_type: usize
+    required: false
+    default: '25'
+  - name: dynamodb.max_future_send_nums
+    field_type: usize
+    required: false
+    default: '256'
+  - name: dynamodb.batch_write_retry_times
+    field_type: usize
+    required: false
+    default: '3'
+  - name: dynamodb.batch_write_retry_backoff_ms
+    field_type: u64
+    required: false
+    default: '100'
+ElasticSearchConfig:
+  fields:
+  - name: url
+    field_type: String
+    required: true
+  - name: index
+    field_type: String
+    comments: The index's name of elasticsearch or openserach
+    required: false
+  - name: delimiter
+    field_type: String
+    comments: If pk is set, then "pk1+delimiter+pk2+delimiter..." will be used as the key, if pk is not set, we will just use the first column as the key.
+    required: false
+  - name: username
+    field_type: String
+    comments: The username of elasticsearch or openserach
+    required: false
+  - name: password
+    field_type: String
+    comments: The username of elasticsearch or openserach
+    required: false
+  - name: index_column
+    field_type: String
+    comments: It is used for dynamic index, if it is be set, the value of this column will be used as the index. It and `index` can only set one
+    required: false
+  - name: routing_column
+    field_type: String
+    comments: It is used for dynamic route, if it is be set, the value of this column will be used as the route
+    required: false
+  - name: retry_on_conflict
+    field_type: i32
+    required: true
+  - name: batch_num_messages
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: batch_size_kb
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: concurrent_requests
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: r#type
+    field_type: String
+    required: false
+    default: '"upsert" . to_owned ()'
+FirestoreConfig:
+  fields:
+  - name: firestore.project_id
+    field_type: String
+    comments: Google Cloud project ID
+    required: true
+  - name: firestore.collection
+    field_type: String
+    comments: Collection path. A parent document segment may reference a column, e.g. `users/{user_id}/orders`.
+    required: true
+  - name: firestore.database_id
+    field_type: String
+    comments: 'Optional: Firestore database ID (for multi-database projects)'
+    required: false
+  - name: firestore.credentials
+    field_type: String
+    comments: |-
+      A JSON string containing the service account credentials for authorization
+      see the [service-account](https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account) credentials guide.
+    required: false
+  - name: firestore.document_id_column
+    field_type: String
+    comments: |-
+      Column whose value is used as the Firestore document ID. Values must be unique and valid
+      Firestore document IDs. Duplicate values in the same resolved collection intentionally
+      map multiple rows to the same Firestore document.
+    required: false
+  - name: firestore.skip_invalid_rows
+    field_type: bool
+    comments: |-
+      Skip invalid rows and document-level `INVALID_ARGUMENT/OUT_OF_RANGE` rejections (default: false).
+      Skipped mutations are not delivered; authentication and transient failures still fail the chunk.
+    required: false
+    default: Default::default
+  - name: firestore.decimal_mode
+    field_type: FirestoreDecimalMode
+    comments: |-
+      DECIMAL encoding: `decimal128` (default, Enterprise only) or `double` (may lose precision).
+      Database metadata is checked for Decimal128; unavailable metadata never selects double.
+    required: false
+    default: Default::default
+  - name: firestore.max_batch_size
+    field_type: usize
+    comments: 'Maximum batch size for batch writes (default: 500)'
+    required: false
+    default: '500'
+  - name: firestore.max_future_send_nums
+    field_type: usize
+    comments: |-
+      Maximum concurrent batch write requests within one chunk (default: 256).
+      Chunks are written sequentially to preserve per-document mutation order.
+    required: false
+    default: '256'
+FsConfig:
+  fields:
+  - name: fs.path
+    field_type: String
+    comments: The directory where the sink file is located.
+    required: true
+  - name: max_row_count
+    field_type: usize
+    required: false
+    default: DEFAULT_MAX_ROW_COUNR
+  - name: rollover_seconds
+    field_type: usize
+    required: false
+    default: DEFAULT_ROLLOVER_SECONDS
+  - name: path_partition_prefix
+    field_type: PathPartitionPrefix
+    required: false
+    default: Default::default
+  - name: r#type
+    field_type: String
+    required: true
+GcsConfig:
+  fields:
+  - name: gcs.bucket_name
+    field_type: String
+    required: true
+  - name: gcs.credential
+    field_type: String
+    comments: The base64 encoded credential key. If not set, ADC will be used.
+    required: true
+  - name: gcs.service_account
+    field_type: String
+    comments: If credential/ADC is not set. The service account can be used to provide the credential info.
+    required: false
+    default: Default::default
+  - name: gcs.path
+    field_type: String
+    comments: The directory where the sink file is located
+    required: true
+  - name: max_row_count
+    field_type: usize
+    required: false
+    default: DEFAULT_MAX_ROW_COUNR
+  - name: rollover_seconds
+    field_type: usize
+    required: false
+    default: DEFAULT_ROLLOVER_SECONDS
+  - name: path_partition_prefix
+    field_type: PathPartitionPrefix
+    required: false
+    default: Default::default
+  - name: r#type
+    field_type: String
+    required: true
 GooglePubSubConfig:
   fields:
   - name: pubsub.project_id
     field_type: String
-    comments: The Google Pub/Sub Project ID
-    required: true
+    comments: |-
+      The Google Pub/Sub project ID. If omitted, the connector uses the project ID from
+      the credentials or Application Default Credentials.
+    required: false
   - name: pubsub.topic
     field_type: String
     comments: Specifies the Pub/Sub topic to publish messages
@@ -205,17 +494,42 @@ GooglePubSubConfig:
     required: true
   - name: pubsub.emulator_host
     field_type: String
-    comments: use the connector with a pubsub emulator  <https://cloud.google.com/pubsub/docs/emulator>
+    comments: |-
+      use the connector with a pubsub emulator
+      <https://cloud.google.com/pubsub/docs/emulator>
     required: false
   - name: pubsub.credentials
     field_type: String
-    comments: A JSON string containing the service account credentials for authorization,  see the [service-account](https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account) credentials guide.  The provided account credential must have the  `pubsub.publisher` [role](https://cloud.google.com/pubsub/docs/access-control#roles)
+    comments: |-
+      A JSON string containing the service account credentials for authorization. If omitted,
+      the connector uses Google Application Default Credentials (ADC) when allowed by the
+      deployment environment.
+      see the [service-account](https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account) credentials guide.
+      The provided account credential must have the
+      `pubsub.publisher` [role](https://cloud.google.com/pubsub/docs/access-control#roles)
     required: false
+HttpConfig:
+  fields:
+  - name: url
+    field_type: String
+    comments: The endpoint URL to send data to.
+    required: false
+  - name: method
+    field_type: String
+    comments: HTTP request method. Supported values are `POST` and `PUT`. Defaults to `POST`.
+    required: false
+  - name: content_type
+    field_type: String
+    comments: |-
+      Content-Type header value. Defaults to `text/plain` for `varchar` and `application/json`
+      for `jsonb`.
+    required: false
+  - name: r#type
+    field_type: String
+    comments: Sink type, must be "append-only".
+    required: true
 IcebergConfig:
   fields:
-  - name: connector
-    field_type: String
-    required: true
   - name: r#type
     field_type: String
     required: true
@@ -223,22 +537,7 @@ IcebergConfig:
     field_type: bool
     required: false
     default: Default::default
-  - name: table.name
-    field_type: String
-    required: true
-  - name: database.name
-    field_type: String
-    required: false
-  - name: catalog.name
-    field_type: String
-    required: false
   - name: catalog.type
-    field_type: String
-    required: false
-  - name: warehouse.path
-    field_type: String
-    required: true
-  - name: catalog.uri
     field_type: String
     required: false
   - name: s3.region
@@ -249,9 +548,189 @@ IcebergConfig:
     required: false
   - name: s3.access.key
     field_type: String
-    required: true
+    required: false
   - name: s3.secret.key
     field_type: String
+    required: false
+  - name: s3.iam_role_arn
+    field_type: String
+    required: false
+  - name: glue.access.key
+    field_type: String
+    required: false
+  - name: glue.secret.key
+    field_type: String
+    required: false
+  - name: glue.iam_role_arn
+    field_type: String
+    required: false
+  - name: glue.region
+    field_type: String
+    required: false
+  - name: glue.endpoint
+    field_type: String
+    required: false
+  - name: glue.id
+    field_type: String
+    comments: |-
+      AWS Client id, can be omitted for storage catalog or when
+      caller's AWS account ID matches glue id
+    required: false
+  - name: gcs.credential
+    field_type: String
+    required: false
+  - name: azblob.account_name
+    field_type: String
+    required: false
+  - name: azblob.account_key
+    field_type: String
+    required: false
+  - name: azblob.endpoint_url
+    field_type: String
+    required: false
+  - name: adlsgen2.account_name
+    field_type: String
+    required: false
+  - name: adlsgen2.account_key
+    field_type: String
+    required: false
+  - name: adlsgen2.endpoint
+    field_type: String
+    required: false
+  - name: adlsgen2.tenant_id
+    field_type: String
+    required: false
+  - name: adlsgen2.client_id
+    field_type: String
+    required: false
+  - name: adlsgen2.client_secret
+    field_type: String
+    required: false
+  - name: adlsgen2.authority_host
+    field_type: String
+    required: false
+  - name: warehouse.path
+    field_type: String
+    comments: Path of iceberg warehouse.
+    required: false
+  - name: catalog.name
+    field_type: String
+    comments: Catalog name, default value is risingwave.
+    required: false
+  - name: catalog.uri
+    field_type: String
+    comments: URI of iceberg catalog, only applicable in rest catalog.
+    required: false
+  - name: catalog.credential
+    field_type: String
+    comments: |-
+      Credential for accessing iceberg catalog, only applicable in rest catalog.
+      A credential to exchange for a token in the `OAuth2` client credentials flow.
+    required: false
+  - name: catalog.token
+    field_type: String
+    comments: |-
+      token for accessing iceberg catalog, only applicable in rest catalog.
+      A Bearer token which will be used for interaction with the server.
+    required: false
+  - name: catalog.oauth2_server_uri
+    field_type: String
+    comments: |-
+      `oauth2_server_uri` for accessing iceberg catalog, only applicable in rest catalog.
+      Token endpoint URI to fetch token from if the Rest Catalog is not the authorization server.
+    required: false
+  - name: catalog.scope
+    field_type: String
+    comments: |-
+      scope for accessing iceberg catalog, only applicable in rest catalog.
+      Additional scope for `OAuth2`.
+    required: false
+  - name: catalog.rest.signing_region
+    field_type: String
+    comments: The signing region to use when signing requests to the REST catalog.
+    required: false
+  - name: catalog.rest.signing_name
+    field_type: String
+    comments: The signing name to use when signing requests to the REST catalog.
+    required: false
+  - name: catalog.rest.sigv4_enabled
+    field_type: bool
+    comments: Whether to use `SigV4` for signing requests to the REST catalog.
+    required: false
+    default: Default::default
+  - name: s3.path.style.access
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: enable_config_load
+    field_type: bool
+    comments: Enable config load. This parameter set to true will load warehouse credentials from the environment. Only allowed to be used in a self-hosted environment.
+    required: false
+    default: Default::default
+  - name: hosted_catalog
+    field_type: bool
+    comments: This is only used by iceberg engine to enable the hosted catalog.
+    required: false
+    default: Default::default
+  - name: catalog.header
+    field_type: String
+    comments: |-
+      The HTTP header to be used in catalog requests.
+      Example:
+      `catalog.header = "key1=value1;key2=value2;key3=value3"`
+      For Google Cloud Lakehouse Iceberg REST catalogs, set
+      `catalog.header = "x-goog-user-project=PROJECT_ID"` to specify the billing project.
+      Explain the format of the header:
+      - Each header is a key-value pair, separated by an '='.
+      - Multiple headers can be specified, separated by a ';'.
+    required: false
+  - name: vended_credentials
+    field_type: bool
+    comments: |-
+      Enable vended credentials for Iceberg REST catalog.
+      For Google Cloud Lakehouse Iceberg REST catalogs, this sends
+      `X-Iceberg-Access-Delegation: vended-credentials`.
+    required: false
+    default: Default::default
+  - name: catalog.security
+    field_type: String
+    comments: |-
+      Security type for REST catalog authentication.
+      Supported values: `none`, `oauth2`, `google`.
+      When set to `google`, native REST catalogs authenticate using
+      `gcs.credential` or Google Application Default Credentials (ADC).
+      JNI REST catalogs use Java's `GoogleAuthManager` with ADC;
+      `gcs.credential` only configures Rust `FileIO` storage credentials.
+      Vended credentials use the native Rust REST catalog.
+    required: false
+  - name: gcp.auth.scopes
+    field_type: String
+    comments: |-
+      OAuth-based scopes for Google authentication.
+      Comma-separated list of OAuth-based scopes to request.
+      Only applicable when `catalog.security` is set to `google`.
+      Default: <https://www.googleapis.com/auth/cloud-platform>
+    required: false
+  - name: catalog.io_impl
+    field_type: String
+    comments: |-
+      Custom `FileIO` implementation class for the Iceberg catalog.
+      Allows specifying a custom `FileIO` implementation instead of the default.
+      Examples:
+      - `org.apache.iceberg.aws.s3.S3FileIO` for Amazon S3 (default)
+      - `org.apache.iceberg.gcp.gcs.GCSFileIO` for Google Cloud Storage
+      - `org.apache.iceberg.azure.adlsv2.ADLSFileIO` for Azure Data Lake Storage Gen2
+      Applies only to JNI catalogs. Native REST catalogs route storage by URI
+      and support GCS vended credentials without a Java `FileIO` class.
+    required: false
+  - name: database.name
+    field_type: String
+    required: false
+  - name: table.name
+    field_type: String
+    comments: |-
+      Table name or namespace-qualified table name. Dots are treated as
+      Iceberg namespace separators.
     required: true
   - name: primary_key
     field_type: Vec<String>
@@ -260,17 +739,250 @@ IcebergConfig:
   - name: java_catalog_props
     field_type: HashMap<String,String>
     required: false
+  - name: partition_by
+    field_type: String
+    required: false
+    default: Default::default
+    iceberg_engine: true
+  - name: order_key
+    field_type: String
+    required: false
+    default: Default::default
+    iceberg_engine: true
   - name: commit_checkpoint_interval
+    field_type: u64
+    comments: Commit every n(>0) checkpoints, default is 60.
+    required: false
+    default: ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: create_table_if_not_exists
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: default_table_location_from_namespace
+    field_type: bool
+    comments: |-
+      For REST catalogs such as AWS Glue, derive a missing table location from the
+      namespace's `location` property. Defaults to false. An existing location
+      derived from `warehouse.path` takes precedence; a missing or empty namespace
+      location leaves server-side location assignment unchanged.
+    required: false
+    default: Default::default
+  - name: is_exactly_once
+    field_type: bool
+    comments: Whether it is `exactly_once`, the default is true.
+    required: false
+    default: Some (true)
+  - name: commit_retry_num
+    field_type: u32
+    required: false
+    default: '8'
+  - name: enable_compaction
+    field_type: bool
+    comments: Whether to enable iceberg compaction.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction_interval_sec
+    field_type: u64
+    comments: The interval of iceberg compaction
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: enable_snapshot_expiration
+    field_type: bool
+    comments: Whether to enable iceberg expired snapshots.
+    required: false
+    default: 'true'
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: write_mode
+    field_type: IcebergWriteMode
+    comments: The iceberg write mode, can be `merge-on-read` or `copy-on-write`.
+    required: false
+    default: 'IcebergWriteMode :: MergeOnRead'
+    iceberg_engine: true
+  - name: format_version
+    field_type: FormatVersion
+    comments: Iceberg format version for table creation.
+    required: false
+    default: 'FormatVersion :: V2'
+    iceberg_engine: true
+  - name: snapshot_expiration_max_age_millis
+    field_type: i64
+    comments: |-
+      The maximum age (in milliseconds) for snapshots before they expire
+      For example, if set to 3600000, snapshots older than 1 hour will be expired
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: snapshot_expiration_retain_last
+    field_type: i32
+    comments: The number of snapshots to retain
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: snapshot_expiration_clear_expired_files
+    field_type: bool
+    required: false
+    default: 'true'
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: snapshot_expiration_clear_expired_meta_data
+    field_type: bool
+    required: false
+    default: 'true'
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: enable_manifest_rewrite
+    field_type: bool
+    comments: Whether to periodically rewrite fragmented Iceberg data manifests.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: manifest_rewrite_target_size_bytes
+    field_type: u64
+    comments: Target size in bytes for rewritten Iceberg data manifests.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: manifest_rewrite_min_count_to_merge
+    field_type: usize
+    comments: Minimum number of manifests required to rewrite an under-filled batch.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: enable_orphan_file_cleanup
+    field_type: bool
+    comments: |-
+      Whether to periodically remove files that are unreachable from Iceberg metadata.
+      Cleanup runs on the global Iceberg orphan-file cleanup interval.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: orphan_file_cleanup_min_age_millis
+    field_type: u64
+    comments: |-
+      Minimum file age in milliseconds before an unreachable file may be removed.
+      Defaults to 7 days and must be at least 24 hours.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.max_snapshots_num
+    field_type: usize
+    comments: |-
+      The maximum number of snapshots allowed since the last rewrite operation
+      If set, sink will check snapshot count and wait if exceeded
+      If unset, defaults to 1000 only when compaction is enabled
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.small_files_threshold_mb
     field_type: u64
     required: false
     default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.delete_files_count_threshold
+    field_type: usize
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.delete_ratio_percent
+    field_type: u32
+    comments: Minimum percentage of deleted physical rows for PK-index compaction.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.trigger_snapshot_count
+    field_type: usize
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.target_file_size_mb
+    field_type: u64
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.type
+    field_type: CompactionType
+    comments: |-
+      Compaction type: `auto`, `full`, `small-files`, or `files-with-delete`
+      If not set, defaults to `auto` when Iceberg compaction is licensed, otherwise `full`
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.write_parquet_compression
+    field_type: String
+    comments: |-
+      Parquet compression codec
+      Supported values: uncompressed, snappy, gzip, lzo, brotli, lz4, zstd
+      Default is zstd
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.write_parquet_max_row_group_rows
+    field_type: usize
+    comments: |-
+      Deprecated: maximum number of rows in a Parquet row group.
+      Accepted for backward compatibility, but ignored by the writer.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: compaction.write_parquet_max_row_group_bytes
+    field_type: usize
+    comments: |-
+      Maximum size of a Parquet row group in bytes
+      Default is 128 `MiB`, matching Iceberg defaults.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+    iceberg_engine: true
+  - name: enable_pk_index
+    field_type: bool
+    comments: |-
+      Whether to enable PK index for upsert sink. Default is false.
+      For upsert iceberg sinks (V2/V3, merge-on-read): maintain a pk index and write
+      position deletes instead of equality deletes.
+    required: false
+    default: Default::default
+    iceberg_engine: true
+  - name: legacy_pk_index_file_path
+    field_type: bool
+    comments: |-
+      Whether the PK index of a pk-index sink stores full data file paths. Default is true.
+      When false, the sink writes every data file as `{data_location}/{uuid}.parquet` and the
+      PK index only stores the 16-byte uuid, from which the path is rebuilt. New pk-index sinks
+      are created with false; sinks created before this option existed keep the legacy layout.
+      It must not change after the sink is created.
+
+      While it is false, the table's data location must never change: neither the
+      `write.data.path` or `write.folder-storage.path` table property nor the table location.
+      RisingWave never changes them, but it cannot stop other engines from doing so. After such
+      a change, uuids already in the PK index rebuild paths that do not exist, and the position
+      deletes written for those rows silently have no effect.
+    required: false
+    default: 'true'
 KafkaConfig:
   fields:
-  - name: properties.bootstrap.server
-    field_type: String
-    required: true
-    alias:
-    - kafka.brokers
   - name: topic
     field_type: String
     required: true
@@ -280,65 +992,128 @@ KafkaConfig:
     field_type: Duration
     required: false
     default: 'Duration :: from_secs (5)'
+    allow_alter_on_fly: true
+  - name: properties.bootstrap.server
+    field_type: String
+    required: true
+    alias:
+    - kafka.brokers
   - name: properties.security.protocol
     field_type: String
-    comments: Security protocol used for RisingWave to communicate with Kafka brokers. Could be  PLAINTEXT, SSL, SASL_PLAINTEXT or SASL_SSL.
+    comments: |-
+      Security protocol used for RisingWave to communicate with Kafka brokers. Could be
+      PLAINTEXT, SSL, `SASL_PLAINTEXT` or `SASL_SSL`.
     required: false
+    allow_alter_on_fly: true
   - name: properties.ssl.endpoint.identification.algorithm
     field_type: String
     required: false
+    allow_alter_on_fly: true
   - name: properties.ssl.ca.location
     field_type: String
     comments: Path to CA certificate file for verifying the broker's key.
     required: false
+    allow_alter_on_fly: true
+  - name: properties.ssl.ca.pem
+    field_type: String
+    comments: CA certificate string (PEM format) for verifying the broker's key.
+    required: false
+    allow_alter_on_fly: true
   - name: properties.ssl.certificate.location
     field_type: String
     comments: Path to client's certificate file (PEM).
     required: false
+    allow_alter_on_fly: true
+  - name: properties.ssl.certificate.pem
+    field_type: String
+    comments: Client's public key string (PEM format) used for authentication.
+    required: false
+    allow_alter_on_fly: true
   - name: properties.ssl.key.location
     field_type: String
     comments: Path to client's private key file (PEM).
     required: false
+    allow_alter_on_fly: true
+  - name: properties.ssl.key.pem
+    field_type: String
+    comments: Client's private key string (PEM format) used for authentication.
+    required: false
+    allow_alter_on_fly: true
   - name: properties.ssl.key.password
     field_type: String
     comments: Passphrase of client's private key.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.mechanism
     field_type: String
-    comments: SASL mechanism if SASL is enabled. Currently support PLAIN, SCRAM, GSSAPI, and AWS_MSK_IAM.
+    comments: SASL mechanism if SASL is enabled. Currently support PLAIN, SCRAM, GSSAPI, OAUTHBEARER, and `AWS_MSK_IAM`.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.username
     field_type: String
     comments: SASL username for SASL/PLAIN and SASL/SCRAM.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.password
     field_type: String
     comments: SASL password for SASL/PLAIN and SASL/SCRAM.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.kerberos.service.name
     field_type: String
     comments: Kafka server's Kerberos principal name under SASL/GSSAPI, not including /hostname@REALM.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.kerberos.keytab
     field_type: String
     comments: Path to client's Kerberos keytab file under SASL/GSSAPI.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.kerberos.principal
     field_type: String
     comments: Client's Kerberos principal name under SASL/GSSAPI.
     required: false
-  - name: properties.sasl.kerberos.kinit.cmd
-    field_type: String
-    comments: Shell command to refresh or acquire the client's Kerberos ticket under SASL/GSSAPI.
-    required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.kerberos.min.time.before.relogin
     field_type: String
     comments: Minimum time in milliseconds between key refresh attempts under SASL/GSSAPI.
     required: false
+    allow_alter_on_fly: true
   - name: properties.sasl.oauthbearer.config
     field_type: String
     comments: Configurations for SASL/OAUTHBEARER.
     required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.method
+    field_type: String
+    comments: SASL/OAUTHBEARER token acquisition method. Set to "oidc" to use the OIDC client credentials flow.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.client.id
+    field_type: String
+    comments: Client ID for SASL/OAUTHBEARER OIDC provider.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.client.secret
+    field_type: String
+    comments: Client secret for SASL/OAUTHBEARER OIDC provider.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.token.endpoint.url
+    field_type: String
+    comments: OIDC token endpoint URL for SASL/OAUTHBEARER.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.scope
+    field_type: String
+    comments: OIDC scope for SASL/OAUTHBEARER.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.sasl.oauthbearer.extensions
+    field_type: String
+    comments: SASL/OAUTHBEARER extensions for broker-facing claims (e.g. Confluent Cloud logicalCluster, identityPoolId).
+    required: false
+    allow_alter_on_fly: true
   - name: properties.retry.max
     field_type: u32
     required: false
@@ -349,81 +1124,159 @@ KafkaConfig:
     default: 'Duration :: from_millis (100)'
   - name: primary_key
     field_type: String
-    comments: We have parsed the primary key for an upsert kafka sink into a `usize` vector representing  the indices of the pk columns in the frontend, so we simply store the primary key here  as a string.
+    comments: |-
+      We have parsed the primary key for an upsert kafka sink into a `usize` vector representing
+      the indices of the pk columns in the frontend, so we simply store the primary key here
+      as a string.
     required: false
   - name: properties.message.max.bytes
     field_type: usize
-    comments: Maximum Kafka protocol request message size. Due to differing framing overhead between  protocol versions the producer is unable to reliably enforce a strict max message limit at  produce time and may exceed the maximum size by one message in protocol ProduceRequests,  the broker will enforce the the topic's max.message.bytes limit
+    comments: |-
+      Maximum Kafka protocol request message size. Due to differing framing overhead between
+      protocol versions the producer is unable to reliably enforce a strict max message limit at
+      produce time and may exceed the maximum size by one message in protocol `ProduceRequests`,
+      the broker will enforce the topic's max.message.bytes limit
     required: false
+    allow_alter_on_fly: true
   - name: properties.receive.message.max.bytes
     field_type: usize
-    comments: Maximum Kafka protocol response message size. This serves as a safety precaution to avoid  memory exhaustion in case of protocol hickups. This value must be at least fetch.max.bytes  + 512 to allow for protocol overhead; the value is adjusted automatically unless the  configuration property is explicitly set.
+    comments: |-
+      Maximum Kafka protocol response message size. This serves as a safety precaution to avoid
+      memory exhaustion in case of protocol hickups. This value must be at least fetch.max.bytes
+      + 512 to allow for protocol overhead; the value is adjusted automatically unless the
+      configuration property is explicitly set.
     required: false
+    allow_alter_on_fly: true
   - name: properties.statistics.interval.ms
     field_type: usize
     required: false
+    allow_alter_on_fly: true
   - name: properties.client.id
     field_type: String
     comments: Client identifier
     required: false
+    allow_alter_on_fly: true
   - name: properties.enable.ssl.certificate.verification
     field_type: bool
     required: false
+    allow_alter_on_fly: true
+  - name: properties.reconnect.backoff.ms
+    field_type: usize
+    comments: |-
+      Initial backoff time in milliseconds before reconnecting to a broker after a connection
+      closes.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.reconnect.backoff.max.ms
+    field_type: usize
+    comments: |-
+      Maximum backoff time in milliseconds before reconnecting to a broker after a connection
+      closes.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.socket.connection.setup.timeout.ms
+    field_type: usize
+    comments: |-
+      Maximum time in milliseconds allowed for broker connection setup, including TCP setup and
+      SSL/SASL handshakes.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.socket.keepalive.enable
+    field_type: bool
+    required: false
+    default: 'true'
+  - name: properties.retry.backoff.ms
+    field_type: usize
+    comments: Initial backoff time in milliseconds before retrying a failed protocol request.
+    required: false
+    allow_alter_on_fly: true
+  - name: properties.retry.backoff.max.ms
+    field_type: usize
+    comments: Maximum backoff time in milliseconds before retrying a failed protocol request.
+    required: false
+    allow_alter_on_fly: true
   - name: properties.allow.auto.create.topics
     field_type: bool
     comments: Allow automatic topic creation on the broker when subscribing to or assigning non-existent topics.
     required: false
+    allow_alter_on_fly: true
   - name: properties.queue.buffering.max.messages
     field_type: usize
-    comments: Maximum number of messages allowed on the producer queue. This queue is shared by all  topics and partitions. A value of 0 disables this limit.
+    comments: |-
+      Maximum number of messages allowed on the producer queue. This queue is shared by all
+      topics and partitions. A value of 0 disables this limit.
     required: false
+    allow_alter_on_fly: true
   - name: properties.queue.buffering.max.kbytes
     field_type: usize
-    comments: Maximum total message size sum allowed on the producer queue. This queue is shared by all  topics and partitions. This property has higher priority than queue.buffering.max.messages.
+    comments: |-
+      Maximum total message size sum allowed on the producer queue. This queue is shared by all
+      topics and partitions. This property has higher priority than queue.buffering.max.messages.
     required: false
+    allow_alter_on_fly: true
   - name: properties.queue.buffering.max.ms
     field_type: f64
-    comments: Delay in milliseconds to wait for messages in the producer queue to accumulate before  constructing message batches (MessageSets) to transmit to brokers. A higher value allows  larger and more effective (less overhead, improved compression) batches of messages to  accumulate at the expense of increased message delivery latency.
+    comments: |-
+      Delay in milliseconds to wait for messages in the producer queue to accumulate before
+      constructing message batches (`MessageSets`) to transmit to brokers. A higher value allows
+      larger and more effective (less overhead, improved compression) batches of messages to
+      accumulate at the expense of increased message delivery latency.
     required: false
+    allow_alter_on_fly: true
   - name: properties.enable.idempotence
     field_type: bool
-    comments: 'When set to true, the producer will ensure that messages are successfully produced exactly  once and in the original produce order. The following configuration properties are adjusted  automatically (if not modified by the user) when idempotence is enabled:  max.in.flight.requests.per.connection=5 (must be less than or equal to 5),  retries=INT32_MAX (must be greater than 0), acks=all, queuing.strategy=fifo. Producer  will fail if user-supplied configuration is incompatible.'
+    comments: |-
+      When set to true, the producer will ensure that messages are successfully produced exactly
+      once and in the original produce order. The following configuration properties are adjusted
+      automatically (if not modified by the user) when idempotence is enabled:
+      max.in.flight.requests.per.connection=5 (must be less than or equal to 5),
+      `retries=INT32_MAX` (must be greater than 0), acks=all, queuing.strategy=fifo. Producer
+      will fail if user-supplied configuration is incompatible.
     required: false
+    allow_alter_on_fly: true
   - name: properties.message.send.max.retries
     field_type: usize
     comments: How many times to retry sending a failing Message.
     required: false
-  - name: properties.retry.backoff.ms
-    field_type: usize
-    comments: The backoff time in milliseconds before retrying a protocol request.
-    required: false
+    allow_alter_on_fly: true
   - name: properties.batch.num.messages
     field_type: usize
-    comments: Maximum number of messages batched in one MessageSet
+    comments: Maximum number of messages batched in one `MessageSet`
     required: false
+    allow_alter_on_fly: true
   - name: properties.batch.size
     field_type: usize
-    comments: Maximum size (in bytes) of all messages batched in one MessageSet, including protocol  framing overhead. This limit is applied after the first message has been added to the  batch, regardless of the first message's size, this is to ensure that messages that exceed  batch.size are produced.
+    comments: |-
+      Maximum size (in bytes) of all messages batched in one `MessageSet`, including protocol
+      framing overhead. This limit is applied after the first message has been added to the
+      batch, regardless of the first message's size, this is to ensure that messages that exceed
+      batch.size are produced.
     required: false
+    allow_alter_on_fly: true
   - name: properties.compression.codec
     field_type: CompressionCodec
     comments: Compression codec to use for compressing message sets.
     required: false
   - name: properties.message.timeout.ms
     field_type: usize
-    comments: Produce message timeout.  This value is used to limits the time a produced message waits for  successful delivery (including retries).
+    comments: |-
+      Produce message timeout.
+      This value is used to limits the time a produced message waits for
+      successful delivery (including retries).
     required: false
-    default: '5000'
+    allow_alter_on_fly: true
   - name: properties.max.in.flight.requests.per.connection
     field_type: usize
     comments: The maximum number of unacknowledged requests the client will send on a single connection before blocking.
     required: false
     default: '5'
+    allow_alter_on_fly: true
   - name: properties.request.required.acks
     field_type: i32
     required: false
+    allow_alter_on_fly: true
   - name: broker.rewrite.endpoints
-    field_type: HashMap<String,String>
+    field_type: BTreeMap<String,String>
     comments: This is generated from `private_link_targets` and `private_link_endpoint` in frontend, instead of given by users.
     required: false
   - name: aws.region
@@ -431,22 +1284,26 @@ KafkaConfig:
     required: false
     alias:
     - region
+    - s3.region
   - name: aws.endpoint_url
     field_type: String
     required: false
     alias:
     - endpoint_url
     - endpoint
+    - s3.endpoint
   - name: aws.credentials.access_key_id
     field_type: String
     required: false
     alias:
     - access_key
+    - s3.access.key
   - name: aws.credentials.secret_access_key
     field_type: String
     required: false
     alias:
     - secret_key
+    - s3.secret.key
   - name: aws.credentials.session_token
     field_type: String
     required: false
@@ -469,6 +1326,9 @@ KafkaConfig:
     required: false
     alias:
     - profile
+  - name: aws.msk.signer_timeout_sec
+    field_type: u64
+    required: false
 KinesisSinkConfig:
   fields:
   - name: stream
@@ -511,15 +1371,110 @@ KinesisSinkConfig:
     required: false
     alias:
     - kinesis.assumerole.external_id
+  - name: kinesis.sdk.connect_timeout_ms
+    field_type: u64
+    required: false
+    default: '10000'
+  - name: kinesis.sdk.read_timeout_ms
+    field_type: u64
+    required: false
+    default: '10000'
+  - name: kinesis.sdk.operation_timeout_ms
+    field_type: u64
+    required: false
+    default: '10000'
+  - name: kinesis.sdk.operation_attempt_timeout_ms
+    field_type: u64
+    required: false
+    default: '10000'
+  - name: kinesis.sdk.max_retry_limit
+    field_type: u32
+    required: false
+    default: '3'
+  - name: kinesis.sdk.init_backoff_ms
+    field_type: u64
+    required: false
+    default: '1000'
+  - name: kinesis.sdk.max_backoff_ms
+    field_type: u64
+    required: false
+    default: '20000'
+LanceDbConfig:
+  fields:
+  - name: lancedb.uri
+    field_type: String
+    comments: URI of the `LanceDB` database (e.g., `/tmp/lancedb`, `<s3://bucket/path/db>`)
+    required: true
+  - name: lancedb.table
+    field_type: String
+    comments: Table name in the `LanceDB` database
+    required: true
+  - name: commit_checkpoint_interval
+    field_type: u64
+    comments: Commit every n(>0) checkpoints, default is 10.
+    required: false
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
+  - name: r#type
+    field_type: String
+    required: true
+  - name: is_exactly_once
+    field_type: bool
+    comments: |-
+      Whether to use RisingWave's two-phase commit framework for exactly-once commits.
+      Defaults to true. Set to false to use single-phase commits.
+    required: false
+MongodbConfig:
+  fields:
+  - name: mongodb.url
+    field_type: String
+    comments: The URL of `MongoDB`
+    required: true
+  - name: collection.name
+    field_type: String
+    comments: |-
+      The collection name where data should be written to or read from. For sinks, the format is
+      `db_name.collection_name`. Data can also be written to dynamic collections, see `collection.name.field`
+      for more information.
+    required: true
+  - name: r#type
+    field_type: String
+    required: true
+  - name: collection.name.field
+    field_type: String
+    comments: |-
+      The dynamic collection name where data should be sunk to. If specified, the field value will be used
+      as the collection name. The collection name format is same as `collection.name`. If the field value is
+      null or an empty string, then the `collection.name` will be used as a fallback destination.
+    required: false
+  - name: collection.name.field.drop
+    field_type: bool
+    comments: |-
+      Controls whether the field value of `collection.name.field` should be dropped when sinking.
+      Set this option to true to avoid the duplicate values of `collection.name.field` being written to the
+      result collection.
+    required: false
+    default: Default::default
+  - name: mongodb.bulk_write.max_entries
+    field_type: usize
+    comments: The maximum entries will accumulate before performing the bulk write, defaults to 1024.
+    required: false
+    default: '1024'
 MqttConfig:
   fields:
   - name: url
     field_type: String
-    comments: The url of the broker to connect to. e.g. tcp://localhost.  Must be prefixed with one of either `tcp://`, `mqtt://`, `ssl://`,`mqtts://`,  to denote the protocol for establishing a connection with the broker.  `mqtts://`, `ssl://` will use the native certificates if no ca is specified
+    comments: |-
+      The url of the broker to connect to. e.g. <tcp://localhost>.
+      Must be prefixed with one of either `tcp://`, `mqtt://`, `ssl://`,`mqtts://`,
+      to denote the protocol for establishing a connection with the broker.
+      `mqtts://`, `ssl://` will use the native certificates if no ca is specified
     required: true
   - name: qos
     field_type: QualityOfService
-    comments: The quality of service to use when publishing messages. Defaults to at_most_once.  Could be at_most_once, at_least_once or exactly_once
+    comments: |-
+      The quality of service to use when publishing messages. Defaults to `at_most_once`.
+      Could be `at_most_once`, `at_least_once` or `exactly_once`
     required: false
   - name: username
     field_type: String
@@ -531,28 +1486,44 @@ MqttConfig:
     required: false
   - name: client_prefix
     field_type: String
-    comments: Prefix for the mqtt client id.  The client id will be generated as `client_prefix`_`actor_id`_`(executor_id|source_id)`. Defaults to risingwave
+    comments: |-
+      Prefix for the mqtt client id.
+      The client id will be generated as `client_prefix`_`actor_id`_`(executor_id|source_id)`. Defaults to risingwave
     required: false
   - name: clean_start
     field_type: bool
-    comments: '`clean_start = true` removes all the state from queues & instructs the broker  to clean all the client state when client disconnects.   When set `false`, broker will hold the client state and performs pending  operations on the client when reconnection with same `client_id`  happens. Local queue state is also held to retransmit packets after reconnection.'
+    comments: |-
+      `clean_start = true` removes all the state from queues & instructs the broker
+      to clean all the client state when client disconnects.
+
+      When set `false`, broker will hold the client state and performs pending
+      operations on the client when reconnection with same `client_id`
+      happens. Local queue state is also held to retransmit packets after reconnection.
     required: false
     default: Default::default
   - name: inflight_messages
     field_type: usize
     comments: The maximum number of inflight messages. Defaults to 100
     required: false
-  - name: tls.client_key
+  - name: max_packet_size
+    field_type: u32
+    comments: The max size of messages received by the MQTT client
+    required: false
+  - name: tls.ca
     field_type: String
     comments: Path to CA certificate file for verifying the broker's key.
     required: false
   - name: tls.client_cert
     field_type: String
-    comments: Path to client's certificate file (PEM). Required for client authentication.  Can be a file path under fs:// or a string with the certificate content.
+    comments: |-
+      Path to client's certificate file (PEM). Required for client authentication.
+      Can be a file path under fs:// or a string with the certificate content.
     required: false
   - name: tls.client_key
     field_type: String
-    comments: Path to client's private key file (PEM). Required for client authentication.  Can be a file path under fs:// or a string with the private key content.
+    comments: |-
+      Path to client's private key file (PEM). Required for client authentication.
+      Can be a file path under fs:// or a string with the private key content.
     required: false
   - name: topic
     field_type: String
@@ -607,9 +1578,115 @@ NatsConfig:
   - name: max_message_size
     field_type: i32
     required: false
+  - name: allow_create_stream
+    field_type: bool
+    required: false
+    default: Default::default
   - name: r#type
     field_type: String
     required: true
+OpenSearchConfig:
+  fields:
+  - name: url
+    field_type: String
+    required: true
+  - name: index
+    field_type: String
+    comments: The index's name of elasticsearch or openserach
+    required: false
+  - name: delimiter
+    field_type: String
+    comments: If pk is set, then "pk1+delimiter+pk2+delimiter..." will be used as the key, if pk is not set, we will just use the first column as the key.
+    required: false
+  - name: username
+    field_type: String
+    comments: The username of elasticsearch or openserach
+    required: false
+  - name: password
+    field_type: String
+    comments: The username of elasticsearch or openserach
+    required: false
+  - name: index_column
+    field_type: String
+    comments: It is used for dynamic index, if it is be set, the value of this column will be used as the index. It and `index` can only set one
+    required: false
+  - name: routing_column
+    field_type: String
+    comments: It is used for dynamic route, if it is be set, the value of this column will be used as the route
+    required: false
+  - name: retry_on_conflict
+    field_type: i32
+    required: true
+  - name: batch_num_messages
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: batch_size_kb
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: concurrent_requests
+    field_type: usize
+    required: true
+    allow_alter_on_fly: true
+  - name: r#type
+    field_type: String
+    required: false
+    default: '"upsert" . to_owned ()'
+PostgresConfig:
+  fields:
+  - name: host
+    field_type: String
+    required: true
+  - name: port
+    field_type: u16
+    required: true
+  - name: user
+    field_type: String
+    required: true
+  - name: password
+    field_type: String
+    required: true
+  - name: database
+    field_type: String
+    required: true
+  - name: table
+    field_type: String
+    required: true
+  - name: schema
+    field_type: String
+    required: false
+    default: '"public" . to_owned ()'
+  - name: ssl_mode
+    field_type: SslMode
+    required: false
+    default: Default::default
+  - name: ssl.root.cert
+    field_type: String
+    required: false
+  - name: max_batch_rows
+    field_type: usize
+    required: false
+    default: '1024'
+  - name: r#type
+    field_type: String
+    required: true
+  - name: tcp.keepalive.enable
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: tcp.keepalive.idle
+    field_type: u32
+    required: false
+    default: 10 * 60
+  - name: tcp.keepalive.interval
+    field_type: u32
+    required: false
+    default: '10'
+  - name: tcp.keepalive.count
+    field_type: u32
+    required: false
+    default: '3'
 PulsarConfig:
   fields:
   - name: properties.retry.max
@@ -650,22 +1727,26 @@ PulsarConfig:
     required: false
     alias:
     - region
+    - s3.region
   - name: aws.endpoint_url
     field_type: String
     required: false
     alias:
     - endpoint_url
     - endpoint
+    - s3.endpoint
   - name: aws.credentials.access_key_id
     field_type: String
     required: false
     alias:
     - access_key
+    - s3.access.key
   - name: aws.credentials.secret_access_key
     field_type: String
     required: false
     alias:
     - secret_key
+    - s3.secret.key
   - name: aws.credentials.session_token
     field_type: String
     required: false
@@ -688,6 +1769,9 @@ PulsarConfig:
     required: false
     alias:
     - profile
+  - name: aws.msk.signer_timeout_sec
+    field_type: u64
+    required: false
   - name: properties.batch.size
     field_type: u32
     required: false
@@ -696,6 +1780,101 @@ PulsarConfig:
     field_type: usize
     required: false
     default: 1 << 20
+  - name: properties.routing.mode
+    field_type: PulsarRoutingMode
+    required: false
+    alias:
+    - properties.routing_mode
+    - routing_mode
+    - pulsar.routing_mode
+    - pulsar.routing.mode
+    - pulsar.properties.routing.mode
+    - pulsar.properties.routing_mode
+    allow_alter_on_fly: true
+RedShiftConfig:
+  fields:
+  - name: jdbc.url
+    field_type: String
+    required: true
+  - name: user
+    field_type: String
+    required: false
+  - name: password
+    field_type: String
+    required: false
+  - name: schema
+    field_type: String
+    required: false
+  - name: intermediate.schema.name
+    field_type: String
+    required: false
+  - name: table.name
+    field_type: String
+    required: true
+  - name: intermediate.table.name
+    field_type: String
+    required: false
+  - name: create_table_if_not_exists
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: writer_target_interval_seconds
+    field_type: u64
+    required: false
+    default: '3600'
+  - name: write_intermediate_interval_seconds
+    field_type: u64
+    required: false
+    default: '1800'
+  - name: batch_insert_rows
+    field_type: u32
+    required: false
+    default: '4096'
+  - name: with_s3
+    field_type: bool
+    required: false
+    default: 'true'
+  - name: s3.region_name
+    field_type: String
+    required: true
+    alias:
+    - snowflake.aws_region
+  - name: s3.bucket_name
+    field_type: String
+    required: true
+    alias:
+    - snowflake.s3_bucket
+  - name: s3.path
+    field_type: String
+    comments: The directory where the sink file is located.
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.s3_path
+  - name: enable_config_load
+    field_type: bool
+    comments: Enable config load. This parameter set to true will load s3 credentials from the environment. Only allowed to be used in a self-hosted environment.
+    required: false
+    default: Default::default
+  - name: s3.credentials.access
+    field_type: String
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_access_key_id
+  - name: s3.credentials.secret
+    field_type: String
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_secret_access_key
+  - name: s3.endpoint_url
+    field_type: String
+    required: false
+  - name: s3.assume_role
+    field_type: String
+    required: false
+    default: Default::default
 RedisConfig:
   fields:
   - name: redis.url
@@ -703,53 +1882,213 @@ RedisConfig:
     required: true
 SnowflakeConfig:
   fields:
-  - name: snowflake.database
+  - name: s3.region_name
     field_type: String
-    comments: The snowflake database used for sinking
     required: true
-  - name: snowflake.schema
+    alias:
+    - snowflake.aws_region
+  - name: s3.bucket_name
     field_type: String
-    comments: The corresponding schema where sink table exists
     required: true
-  - name: snowflake.pipe
+    alias:
+    - snowflake.s3_bucket
+  - name: s3.path
     field_type: String
-    comments: The created pipe object, will be used as `insertFiles` target
-    required: true
-  - name: snowflake.account_identifier
-    field_type: String
-    comments: 'The unique, snowflake provided `account_identifier`  NOTE: please use the form `<orgname>-<account_name>`  For detailed guidance, reference: <https://docs.snowflake.com/en/user-guide/admin-account-identifier>'
-    required: true
-  - name: snowflake.user
-    field_type: String
-    comments: 'The user that owns the table to be sinked  NOTE: the user should''ve been granted corresponding *role*  reference: <https://docs.snowflake.com/en/sql-reference/sql/grant-role>'
-    required: true
-  - name: snowflake.rsa_public_key_fp
-    field_type: String
-    comments: 'The public key fingerprint used when generating custom `jwt_token`  reference: <https://docs.snowflake.com/en/developer-guide/sql-api/authenticating>'
-    required: true
-  - name: snowflake.private_key
-    field_type: String
-    comments: The rsa pem key *without* encryption
-    required: true
-  - name: snowflake.s3_bucket
-    field_type: String
-    comments: The s3 bucket where intermediate sink files will be stored
-    required: true
-  - name: snowflake.s3_path
-    field_type: String
-    comments: The optional s3 path to be specified  the actual file location would be `s3://<s3_bucket>/<s3_path>/<rw_auto_gen_intermediate_file_name>`  if this field is specified by user(s)  otherwise it would be `s3://<s3_bucket>/<rw_auto_gen_intermediate_file_name>`
+    comments: The directory where the sink file is located.
     required: false
-  - name: snowflake.aws_access_key_id
+    default: Default::default
+    alias:
+    - snowflake.s3_path
+  - name: enable_config_load
+    field_type: bool
+    comments: Enable config load. This parameter set to true will load s3 credentials from the environment. Only allowed to be used in a self-hosted environment.
+    required: false
+    default: Default::default
+  - name: s3.credentials.access
     field_type: String
-    comments: s3 credentials
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_access_key_id
+  - name: s3.credentials.secret
+    field_type: String
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_secret_access_key
+  - name: s3.endpoint_url
+    field_type: String
+    required: false
+  - name: s3.assume_role
+    field_type: String
+    required: false
+    default: Default::default
+  - name: max_row_count
+    field_type: usize
+    required: false
+    default: DEFAULT_MAX_ROW_COUNR
+  - name: rollover_seconds
+    field_type: usize
+    required: false
+    default: DEFAULT_ROLLOVER_SECONDS
+  - name: path_partition_prefix
+    field_type: PathPartitionPrefix
+    required: false
+    default: Default::default
+  - name: r#type
+    field_type: String
     required: true
-  - name: snowflake.aws_secret_access_key
+SnowflakeV2Config:
+  fields:
+  - name: type
     field_type: String
-    comments: s3 credentials
     required: true
-  - name: snowflake.aws_region
+  - name: intermediate.table.name
     field_type: String
-    comments: The s3 region, e.g., us-east-2
+    required: false
+  - name: table.name
+    field_type: String
+    required: false
+  - name: database
+    field_type: String
+    required: false
+  - name: schema
+    field_type: String
+    required: false
+  - name: writer_target_interval_seconds
+    field_type: u64
+    required: false
+    default: '3600'
+  - name: write_intermediate_interval_seconds
+    field_type: u64
+    required: false
+    default: '1800'
+  - name: warehouse
+    field_type: String
+    required: false
+  - name: task.serverless
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: task.target_completion_interval
+    field_type: String
+    required: false
+  - name: jdbc.url
+    field_type: String
+    required: false
+  - name: username
+    field_type: String
+    required: false
+  - name: password
+    field_type: String
+    required: false
+  - name: auth.method
+    field_type: String
+    required: false
+  - name: private_key_file
+    field_type: String
+    required: false
+  - name: private_key_file_pwd
+    field_type: String
+    required: false
+  - name: private_key_pem
+    field_type: String
+    required: false
+  - name: commit_checkpoint_interval
+    field_type: u64
+    comments: Commit every n(>0) checkpoints, default is 10.
+    required: false
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
+  - name: auto_schema_change
+    field_type: bool
+    comments: |-
+      Enable auto schema change for upsert sink.
+      If enabled, the sink will automatically alter the target table to add new columns.
+    required: false
+    default: Default::default
+  - name: create_table_if_not_exists
+    field_type: bool
+    required: false
+    default: Default::default
+  - name: with_s3
+    field_type: bool
+    required: false
+    default: 'true'
+  - name: s3.region_name
+    field_type: String
+    required: true
+    alias:
+    - snowflake.aws_region
+  - name: s3.bucket_name
+    field_type: String
+    required: true
+    alias:
+    - snowflake.s3_bucket
+  - name: s3.path
+    field_type: String
+    comments: The directory where the sink file is located.
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.s3_path
+  - name: enable_config_load
+    field_type: bool
+    comments: Enable config load. This parameter set to true will load s3 credentials from the environment. Only allowed to be used in a self-hosted environment.
+    required: false
+    default: Default::default
+  - name: s3.credentials.access
+    field_type: String
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_access_key_id
+  - name: s3.credentials.secret
+    field_type: String
+    required: false
+    default: Default::default
+    alias:
+    - snowflake.aws_secret_access_key
+  - name: s3.endpoint_url
+    field_type: String
+    required: false
+  - name: s3.assume_role
+    field_type: String
+    required: false
+    default: Default::default
+  - name: stage
+    field_type: String
+    required: false
+SqlServerConfig:
+  fields:
+  - name: sqlserver.host
+    field_type: String
+    required: true
+  - name: sqlserver.port
+    field_type: u16
+    required: true
+  - name: sqlserver.user
+    field_type: String
+    required: true
+  - name: sqlserver.password
+    field_type: String
+    required: true
+  - name: sqlserver.database
+    field_type: String
+    required: true
+  - name: sqlserver.schema
+    field_type: String
+    required: false
+    default: '"dbo" . to_owned ()'
+  - name: sqlserver.table
+    field_type: String
+    required: true
+  - name: sqlserver.max_batch_rows
+    field_type: usize
+    required: false
+    default: '1024'
+  - name: r#type
+    field_type: String
     required: true
 StarrocksConfig:
   fields:
@@ -785,20 +2124,137 @@ StarrocksConfig:
     field_type: String
     comments: The `StarRocks` table you want to sink data to.
     required: true
+  - name: starrocks.use_https
+    field_type: bool
+    comments: Whether to use https to connect to the `StarRocks` server.
+    required: true
   - name: starrocks.stream_load.http.timeout.ms
     field_type: u64
     comments: The timeout in milliseconds for stream load http request, defaults to 10 seconds.
     required: false
     default: 30 * 1000
+    allow_alter_on_fly: true
   - name: commit_checkpoint_interval
     field_type: u64
-    comments: Set this option to a positive integer n, RisingWave will try to commit data  to Starrocks at every n checkpoints by leveraging the  [StreamLoad Transaction API](https://docs.starrocks.io/docs/loading/Stream_Load_transaction_interface/),  also, in this time, the `sink_decouple` option should be enabled as well.  Defaults to 1 if commit_checkpoint_interval <= 0
+    comments: |-
+      Set this option to a positive integer n, RisingWave will try to commit data
+      to Starrocks at every n checkpoints by leveraging the
+      [StreamLoad Transaction API](https://docs.starrocks.io/docs/loading/Stream_Load_transaction_interface/),
+      also, in this time, the `sink_decouple` option should be enabled as well.
+      Defaults to 10 if `commit_checkpoint_interval` <= 0
     required: false
-    default: Default::default
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
   - name: starrocks.partial_update
     field_type: String
     comments: Enable partial update
     required: false
+  - name: starrocks.max_batch_size_bytes
+    field_type: u64
+    comments: |-
+      The maximum size in bytes for each `StarRocks` stream load request payload.
+      Defaults to unlimited.
+    required: false
+    allow_alter_on_fly: true
+  - name: starrocks.max_transaction_size_bytes
+    field_type: u64
+    comments: |-
+      The maximum cumulative serialized payload bytes per writer/transaction.
+      Defaults to unlimited. Before the next row would exceed this limit, commit
+      the current transaction, even before `commit_checkpoint_interval` elapses.
+      A single oversized row is rejected. Early commits can increase data versions;
+      recovery can replay committed data under the sink's at-least-once contract.
+    required: false
+    allow_alter_on_fly: true
+  - name: starrocks.ignore_json_size
+    field_type: bool
+    comments: |-
+      Skip the `StarRocks` JSON size check. Defaults to false. This may increase
+      backend memory usage and does not disable `starrocks.max_batch_size_bytes`.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: starrocks.load_mem_limit
+    field_type: u64
+    comments: |-
+      The `StarRocks` load job memory limit in bytes. When omitted, use the server default.
+      This is not a limit on all HTTP receive buffers or total backend memory usage.
+    required: false
+    allow_alter_on_fly: true
+  - name: starrocks.transaction_timeout_seconds
+    field_type: u32
+    comments: |-
+      The server-side transaction timeout in seconds, from begin to prepared.
+      A positive 32-bit signed integer, subject to the server's configured timeout range.
+      When omitted, use the server default. Independent of the client HTTP timeout.
+    required: false
+    allow_alter_on_fly: true
+  - name: r#type
+    field_type: String
+    required: true
+TurbopufferConfig:
+  fields:
+  - name: base_url
+    field_type: String
+    required: true
+  - name: namespace
+    field_type: String
+    required: false
+  - name: namespace_column
+    field_type: String
+    required: false
+  - name: api_key
+    field_type: String
+    required: true
+  - name: distance_metric
+    field_type: String
+    required: false
+  - name: disable_backpressure
+    field_type: bool
+    required: false
+  - name: num_shards
+    field_type: usize
+    required: false
+  - name: full_text_search_columns
+    field_type: String
+    required: false
+  - name: filterable_columns
+    field_type: String
+    required: false
+  - name: write_batch_size
+    field_type: usize
+    required: false
+    default: DEFAULT_WRITE_BATCH_SIZE
+    allow_alter_on_fly: true
+  - name: max_linger_second
+    field_type: u64
+    required: false
+    default: DEFAULT_MAX_LINGER_SECOND
+    allow_alter_on_fly: true
+  - name: r#type
+    field_type: String
+    required: true
+WebhdfsConfig:
+  fields:
+  - name: webhdfs.endpoint
+    field_type: String
+    required: true
+  - name: webhdfs.path
+    field_type: String
+    comments: The directory where the sink file is located.
+    required: true
+  - name: max_row_count
+    field_type: usize
+    required: false
+    default: DEFAULT_MAX_ROW_COUNR
+  - name: rollover_seconds
+    field_type: usize
+    required: false
+    default: DEFAULT_ROLLOVER_SECONDS
+  - name: path_partition_prefix
+    field_type: PathPartitionPrefix
+    required: false
+    default: Default::default
   - name: r#type
     field_type: String
     required: true

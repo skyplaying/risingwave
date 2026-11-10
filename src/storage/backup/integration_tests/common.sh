@@ -13,28 +13,8 @@ function clean_all_data {
   cargo make --allow-private clean-data 1>/dev/null 2>&1
 }
 
-function get_meta_store_type() {
-  meta_store_type=${META_STORE_TYPE:-etcd}
-  if [ "${meta_store_type}" = "sql" ]
-  then
-    if ! command -v sqlite3 &> /dev/null;
-    then
-        echo "SQLite3 is not installed."
-        exit 1
-    fi
-  fi
-  echo "${meta_store_type}"
-}
-
-echo "meta store: $(get_meta_store_type)"
-
 function clean_meta_store() {
-  meta_store_type=$(get_meta_store_type)
-  if [ "$(get_meta_store_type)" = "sql" ]; then
-    clean_sqlite_data
-  else
-    clean_etcd_data
-  fi
+  clean_sqlite_data
 }
 
 function clean_sqlite_data() {
@@ -48,17 +28,9 @@ function clean_sqlite_data() {
   done <<< "${tables}"
 }
 
-function clean_etcd_data() {
-  cargo make --allow-private clean-etcd-data 1>/dev/null 2>&1
-}
-
 function start_cluster() {
   stop_cluster
-  if [ "$(get_meta_store_type)" = "sql" ]; then
-    cargo make d ci-meta-backup-test-sql 1>/dev/null 2>&1
-  else
-    cargo make d ci-meta-backup-test-etcd 1>/dev/null 2>&1
-  fi
+  cargo make d ci-meta-backup-test-sql 1>/dev/null 2>&1
   sleep 5
 }
 
@@ -74,19 +46,11 @@ function manual_compaction() {
 }
 
 function start_meta_store_minio() {
-    if [ "$(get_meta_store_type)" = "sql" ]; then
-      start_sql_minio
-    else
-      start_etcd_minio
-    fi
+  start_sql_minio
 }
 
 function start_sql_minio() {
   cargo make d ci-meta-backup-test-restore-sql 1>/dev/null 2>&1
-}
-
-function start_etcd_minio() {
-  cargo make d ci-meta-backup-test-restore-etcd 1>/dev/null 2>&1
 }
 
 function create_mvs() {
@@ -102,22 +66,23 @@ function drop_mvs() {
 }
 
 function backup() {
-  local job_id
-  job_id=$(${BACKUP_TEST_RW_ALL_IN_ONE} risectl meta backup-meta 2>&1 | grep "backup job succeeded" | awk -F ',' '{print $(NF-1)}'| awk '{print $(NF)}')
-  [ -n "${job_id}" ]
-  echo "${job_id}"
+  local snapshot_id
+  o=$(execute_sql_t "BACKUP;")
+  snapshot_id=$(echo "${o}" | awk '{$1=$1}; NF {print $1}' | tail -n 1)
+  # snapshot_id=$(awk '{$1=$1}; NF {print $1}' < <(execute_sql_t "BACKUP;") | tail -n 1)
+  [ -n "${snapshot_id}" ]
+  echo "${snapshot_id}"
 }
 
 function delete_snapshot() {
   local snapshot_id
   snapshot_id=$1
-  ${BACKUP_TEST_RW_ALL_IN_ONE} risectl meta delete-meta-snapshots "${snapshot_id}"
+  execute_sql "DELETE META SNAPSHOT ${snapshot_id};" 1>/dev/null
 }
 
 function restore() {
   local job_id
   job_id=$1
-  meta_store_type=$(get_meta_store_type)
   echo "try to restore snapshot ${job_id}"
   stop_cluster
   clean_meta_store
@@ -126,19 +91,98 @@ function restore() {
   risectl \
   meta \
   restore-meta \
-  --meta-store-type "${meta_store_type}" \
+  --meta-store-type "sql" \
   --meta-snapshot-id "${job_id}" \
-  --etcd-endpoints 127.0.0.1:2388 \
   --sql-endpoint "sqlite://${RW_SQLITE_DB}?mode=rwc" \
   --backup-storage-url minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
   --hummock-storage-url minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
+  --validate-integrity \
   1>/dev/null 2>&1
+}
+
+function create_minio_bucket() {
+  local bucket_name
+  bucket_name=$1
+  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
+  mb "hummock-minio/${bucket_name}"
+}
+
+function cp_minio_bucket() {
+  local from
+  from=$1
+  local to
+  to=$2
+  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
+  cp --recursive "hummock-minio/${from}" "hummock-minio/${to}"
+}
+
+function restore_with_overwrite() {
+  local job_id
+  job_id=$1
+  local overwrite_hummock_storage_url
+  overwrite_hummock_storage_url=$2
+  local overwrite_hummock_storage_dir
+  overwrite_hummock_storage_dir=$3
+  local overwrite_backup_storage_url
+  overwrite_backup_storage_url=$4
+  local overwrite_backup_storage_dir
+  overwrite_backup_storage_dir=$5
+  echo "try to restore snapshot ${job_id}"
+  stop_cluster
+  clean_meta_store
+  start_meta_store_minio
+  ${BACKUP_TEST_RW_ALL_IN_ONE} \
+  risectl \
+  meta \
+  restore-meta \
+  --meta-store-type "sql" \
+  --meta-snapshot-id "${job_id}" \
+  --sql-endpoint "sqlite://${RW_SQLITE_DB}?mode=rwc" \
+  --overwrite-hummock-storage-endpoint \
+  --overwrite-backup-storage-url "${overwrite_backup_storage_url}" \
+  --overwrite-backup-storage-directory "${overwrite_backup_storage_dir}" \
+  --hummock-storage-url "${overwrite_hummock_storage_url}" \
+  --hummock-storage-directory "${overwrite_hummock_storage_dir}" \
+  --backup-storage-url minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
+  --validate-integrity \
+  1>/dev/null 2>&1
+}
+
+function restore_fail_integrity_validation() {
+  local job_id
+  job_id=$1
+  echo "try to restore snapshot ${job_id}"
+  stop_cluster
+  clean_meta_store
+  start_meta_store_minio
+  set +e
+  local output
+  output=$(${BACKUP_TEST_RW_ALL_IN_ONE} \
+  risectl \
+  meta \
+  restore-meta \
+  --meta-store-type "sql" \
+  --meta-snapshot-id "${job_id}" \
+  --sql-endpoint "sqlite://${RW_SQLITE_DB}?mode=rwc" \
+  --backup-storage-url minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
+  --hummock-storage-url minio://hummockadmin:hummockadmin@127.0.0.1:9301/hummock001 \
+  --hummock-storage-directory dummy_dir \
+  --validate-integrity \
+  --dry-run 2>&1 | grep "Fail integrity validation." )
+  set -e
+  [ -n "${output}" ]
 }
 
 function execute_sql() {
   local sql
   sql=$1
   echo "${sql}" | psql -h localhost -p 4566 -d dev -U root 2>&1
+}
+
+function execute_sql_t() {
+  local sql
+  sql=$1
+  echo "${sql}" | psql -h localhost -p 4566 -d dev -U root -t 2>&1
 }
 
 function execute_sql_and_expect() {
@@ -151,42 +195,25 @@ function execute_sql_and_expect() {
   echo "expected string in result: ${expected}"
   query_result=$(execute_sql "${sql}")
   printf "actual result:\n%s\n" "${query_result}"
-  result=$(echo "${query_result}" | grep "${expected}")
+  result=$(echo "${query_result}" | grep -F "${expected}")
   [ -n "${result}" ]
 }
 
-function get_max_committed_epoch() {
-  mce=$(${BACKUP_TEST_RW_ALL_IN_ONE} risectl hummock list-version --verbose 2>&1 | grep max_committed_epoch | sed -n 's/^.*max_committed_epoch: \(.*\),/\1/p')
-  echo "${mce}"
-}
-
-function get_safe_epoch() {
-  safe_epoch=$(${BACKUP_TEST_RW_ALL_IN_ONE} risectl hummock list-version --verbose 2>&1 | grep safe_epoch | sed -n 's/^.*safe_epoch: \(.*\),/\1/p')
-  echo "${safe_epoch}"
+function get_all_sst_paths() {
+  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
+  find "hummock-minio/hummock001" -name "*.data" | sort
 }
 
 function get_total_sst_count() {
-  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
-  find "hummock-minio/hummock001" -name "*.data" |wc -l
+  get_all_sst_paths | wc -l
 }
 
-function get_max_committed_epoch_in_backup() {
-  local id
-  id=$1
-  sed_str="s/.*{\"id\":${id},\"hummock_version_id\":.*,\"ssts\":\[.*\],\"max_committed_epoch\":\([[:digit:]]*\),\"safe_epoch\":.*}.*/\1/p"
-  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
-  cat "hummock-minio/hummock001/backup/manifest.json" | sed -n "${sed_str}"
-}
-
-function get_safe_epoch_in_backup() {
-  local id
-  id=$1
-  sed_str="s/.*{\"id\":${id},\"hummock_version_id\":.*,\"ssts\":\[.*\],\"max_committed_epoch\":.*,\"safe_epoch\":\([[:digit:]]*\).*}.*/\1/p"
-  ${BACKUP_TEST_MCLI} -C "${BACKUP_TEST_MCLI_CONFIG}" \
-  cat "hummock-minio/hummock001/backup/manifest.json" | sed -n "${sed_str}"
-}
-
-function get_min_pinned_snapshot() {
-  s=$(${BACKUP_TEST_RW_ALL_IN_ONE} risectl hummock list-pinned-snapshots 2>&1 | grep "min_pinned_snapshot" | sed -n 's/.*min_pinned_snapshot \(.*\)/\1/p' | sort -n | head -1)
-  echo "${s}"
+function get_table_committed_epoch_in_meta_snapshot() {
+    sql="select id from rw_tables;"
+    table_id=$(execute_sql_t "${sql}")
+    table_id="${table_id#"${table_id%%[![:space:]]*}"}"
+    table_id="${table_id%"${table_id##*[![:space:]]}"}"
+    sql="select state_table_info->'${table_id}'->>'committedEpoch' from rw_meta_snapshot;"
+    query_result=$(execute_sql_t "${sql}")
+    echo ${query_result}
 }

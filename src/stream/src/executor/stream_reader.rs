@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,44 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use either::Either;
-use futures::stream::{select_with_strategy, BoxStream, PollNext, SelectWithStrategy};
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 
-use crate::executor::error::StreamExecutorResult;
 use crate::executor::Message;
+use crate::executor::error::StreamExecutorResult;
 
 type ExecutorMessageStream = BoxStream<'static, StreamExecutorResult<Message>>;
 type StreamReaderData<M> = StreamExecutorResult<Either<Message, M>>;
 type ReaderArm<M> = BoxStream<'static, StreamReaderData<M>>;
-type StreamReaderWithPauseInner<M> =
-    SelectWithStrategy<ReaderArm<M>, ReaderArm<M>, impl FnMut(&mut PollNext) -> PollNext, PollNext>;
+
+mod stream_reader_with_pause {
+    use futures::stream::{PollNext, SelectWithStrategy, select_with_strategy};
+
+    use crate::executor::stream_reader::ReaderArm;
+
+    pub(super) type StreamReaderWithPauseInner<M, const BIASED: bool> = SelectWithStrategy<
+        ReaderArm<M>,
+        ReaderArm<M>,
+        impl FnMut(&mut PollNext) -> PollNext,
+        PollNext,
+    >;
+
+    #[define_opaque(StreamReaderWithPauseInner)]
+    pub(super) fn new_inner<M, const BIASED: bool>(
+        message_stream: ReaderArm<M>,
+        data_stream: ReaderArm<M>,
+    ) -> StreamReaderWithPauseInner<M, BIASED> {
+        let strategy = if BIASED {
+            |_: &mut PollNext| PollNext::Left
+        } else {
+            // The poll strategy is not biased: we poll the two streams in a round robin way.
+            |last: &mut PollNext| last.toggle()
+        };
+        select_with_strategy(message_stream, data_stream, strategy)
+    }
+}
+
+use stream_reader_with_pause::*;
 
 /// [`StreamReaderWithPause`] merges two streams, with one receiving barriers (and maybe other types
 /// of messages) and the other receiving data only (no barrier). The merged stream can be paused
@@ -40,7 +67,7 @@ type StreamReaderWithPauseInner<M> =
 /// priority over the right-hand one. Otherwise, the two streams will be polled in a round robin
 /// fashion.
 pub(super) struct StreamReaderWithPause<const BIASED: bool, M> {
-    inner: StreamReaderWithPauseInner<M>,
+    inner: StreamReaderWithPauseInner<M, BIASED>,
     /// Whether the source stream is paused.
     paused: bool,
 }
@@ -54,24 +81,16 @@ impl<const BIASED: bool, M: Send + 'static> StreamReaderWithPause<BIASED, M> {
     ) -> Self {
         let message_stream_arm = message_stream.map_ok(Either::Left).boxed();
         let data_stream_arm = data_stream.map_ok(Either::Right).boxed();
-        let inner = Self::new_inner(message_stream_arm, data_stream_arm);
+        let inner = new_inner(message_stream_arm, data_stream_arm);
         Self {
             inner,
             paused: false,
         }
     }
 
-    fn new_inner(
-        message_stream: ReaderArm<M>,
-        data_stream: ReaderArm<M>,
-    ) -> StreamReaderWithPauseInner<M> {
-        let strategy = if BIASED {
-            |_: &mut PollNext| PollNext::Left
-        } else {
-            // The poll strategy is not biased: we poll the two streams in a round robin way.
-            |last: &mut PollNext| last.toggle()
-        };
-        select_with_strategy(message_stream, data_stream, strategy)
+    #[expect(dead_code)]
+    pub fn only_left(message_stream: ExecutorMessageStream) -> Self {
+        Self::new(message_stream, futures::stream::empty().boxed())
     }
 
     /// Replace the data stream with a new one for given `stream`. Used for split change.
@@ -87,7 +106,7 @@ impl<const BIASED: bool, M: Send + 'static> StreamReaderWithPause<BIASED, M> {
 
         // Note: create a new `SelectWithStrategy` instead of replacing the source stream arm here,
         // to ensure the internal state of the `SelectWithStrategy` is reset. (#6300)
-        self.inner = Self::new_inner(
+        self.inner = new_inner(
             barrier_receiver_arm,
             data_stream.map_ok(Either::Right).boxed(),
         );
@@ -95,14 +114,18 @@ impl<const BIASED: bool, M: Send + 'static> StreamReaderWithPause<BIASED, M> {
 
     /// Pause the data stream.
     pub fn pause_stream(&mut self) {
-        assert!(!self.paused, "already paused");
+        if self.paused {
+            tracing::warn!("already paused");
+        }
         tracing::info!("data stream paused");
         self.paused = true;
     }
 
-    /// Resume the data stream. Panic if the data stream is not paused.
+    /// Resume the data stream.
     pub fn resume_stream(&mut self) {
-        assert!(self.paused, "not paused");
+        if !self.paused {
+            tracing::warn!("not paused");
+        }
         tracing::info!("data stream resumed");
         self.paused = false;
     }
@@ -131,7 +154,7 @@ impl<const BIASED: bool, M> Stream for StreamReaderWithPause<BIASED, M> {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use futures::{pin_mut, FutureExt};
+    use futures::{FutureExt, pin_mut};
     use risingwave_common::array::StreamChunk;
     use risingwave_common::transaction::transaction_id::TxnId;
     use risingwave_common::util::epoch::test_epoch;

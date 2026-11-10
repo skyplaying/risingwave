@@ -3,123 +3,242 @@ syntax = "proto3";
 package stream_service;
 
 import "common.proto";
+import "connector_service.proto";
 import "hummock.proto";
+import "plan_common.proto";
 import "stream_plan.proto";
 
 option java_package = "com.risingwave.proto";
 option optimize_for = SPEED;
 
-message BuildActorInfo {
-  stream_plan.StreamActor actor = 1;
-  message SubscriptionIds {
-    repeated uint32 subscription_ids = 1;
-  }
-  map<uint32, SubscriptionIds> related_subscriptions = 2;
-}
-
-// Describe the fragments which will be running on this node
-message UpdateActorsRequest {
-  string request_id = 1;
-  repeated BuildActorInfo actors = 2;
-}
-
-message UpdateActorsResponse {
-  common.Status status = 1;
-}
-
-message BroadcastActorInfoTableRequest {
-  repeated common.ActorInfo info = 1;
-}
-
-// Create channels and gRPC connections for a fragment
-message BuildActorsRequest {
-  string request_id = 1;
-  repeated uint32 actor_id = 2;
-}
-
-message BuildActorsResponse {
-  string request_id = 1;
-  common.Status status = 2;
-}
-
-message DropActorsRequest {
-  string request_id = 1;
-  repeated uint32 actor_ids = 2;
-}
-
-message DropActorsResponse {
-  string request_id = 1;
-  common.Status status = 2;
+enum PbIcebergPkIndexSinkRole {
+  PB_ICEBERG_PK_INDEX_SINK_ROLE_UNSPECIFIED = 0;
+  PB_ICEBERG_PK_INDEX_SINK_ROLE_WRITER = 1;
+  PB_ICEBERG_PK_INDEX_SINK_ROLE_POSITION_DELETE_MERGER = 2;
+  PB_ICEBERG_PK_INDEX_SINK_ROLE_COMPACTION_RESOLVER = 3;
 }
 
 message InjectBarrierRequest {
   string request_id = 1;
   stream_plan.Barrier barrier = 2;
-  repeated uint32 actor_ids_to_send = 3;
+  reserved 3;
+  reserved "database_id";
   repeated uint32 actor_ids_to_collect = 4;
+  repeated uint32 table_ids_to_sync = 5;
+  uint64 partial_graph_id = 6;
+
+  message FragmentBuildActorInfo {
+    uint32 fragment_id = 1;
+    stream_plan.StreamNode node = 2;
+    repeated BuildActorInfo actors = 3;
+  }
+
+  message BuildActorInfo {
+    message UpstreamActors {
+      repeated common.ActorInfo actors = 1;
+    }
+    uint32 actor_id = 1;
+    map<uint32, UpstreamActors> fragment_upstreams = 2;
+    repeated stream_plan.Dispatcher dispatchers = 3;
+    common.Buffer vnode_bitmap = 4;
+    string mview_definition = 5;
+    plan_common.ExprContext expr_context = 6;
+    string config_override = 9;
+    repeated uint32 initial_subscriber_ids = 7;
+  }
+
+  repeated FragmentBuildActorInfo actors_to_build = 9;
 }
 
 message BarrierCompleteResponse {
   message CreateMviewProgress {
+    // Note: ideally we should use `executor_id`, but `actor_id` is ok-ish.
+    // See <https://github.com/risingwavelabs/risingwave/issues/6236>.
     uint32 backfill_actor_id = 1;
     bool done = 2;
+    // MV backfill snapshot read epoch (0 for Done / Source backfill)
     uint64 consumed_epoch = 3;
+    // MV backfill snapshot read rows / Source backfilled rows
     uint64 consumed_rows = 4;
+    reserved 5;
+    reserved "pending_epoch_lag";
+    // Buffered rows that are yet to be consumed (used by locality backfill to report precise progress)
+    uint64 buffered_rows = 6;
+    uint32 fragment_id = 7;
+  }
+  message CdcTableBackfillProgress {
+    uint32 actor_id = 1;
+    uint64 epoch = 2;
+    bool done = 3;
+    int64 split_id_start_inclusive = 4;
+    int64 split_id_end_inclusive = 5;
+    uint64 generation = 6;
+    uint32 fragment_id = 7;
   }
   string request_id = 1;
   common.Status status = 2;
   repeated CreateMviewProgress create_mview_progress = 3;
-  message GroupedSstableInfo {
-    uint64 compaction_group_id = 1;
+  message LocalSstableInfo {
+    reserved 1;
+    reserved "compaction_group_id";
     hummock.SstableInfo sst = 2;
     map<uint32, hummock.TableStats> table_stats_map = 3;
+    uint64 created_at = 4;
   }
-  repeated GroupedSstableInfo synced_sstables = 4;
+  repeated LocalSstableInfo synced_sstables = 4;
   uint32 worker_id = 5;
   map<uint32, hummock.TableWatermarks> table_watermarks = 6;
   repeated hummock.SstableInfo old_value_sstables = 7;
-}
-
-// Before starting streaming, the leader node broadcast the actor-host table to needed workers.
-message BroadcastActorInfoTableResponse {
-  common.Status status = 1;
-}
-
-message WaitEpochCommitRequest {
-  uint64 epoch = 1;
-}
-
-message WaitEpochCommitResponse {
-  common.Status status = 1;
+  uint64 partial_graph_id = 8;
+  // prev_epoch of barrier
+  uint64 epoch = 9;
+  reserved 10;
+  reserved "database_id";
+  // Used for refreshable batch source.
+  // SourceExecutor reports the source load is finished, and then
+  // meta will issue a LoadFinish barrier to notify MaterializeExecutor to start diff calculation.
+  message LoadFinishedSource {
+    // The actor that reported the completion event.
+    uint32 reporter_actor_id = 1;
+    // The table ID for the refreshable batch source.
+    uint32 table_id = 2;
+    // The source identifier associated with the finished load.
+    uint32 associated_source_id = 3;
+  }
+  repeated LoadFinishedSource load_finished_sources = 11;
+  map<uint32, hummock.VectorIndexDelta.VectorIndexAdds> vector_index_adds = 12;
+  repeated CdcTableBackfillProgress cdc_table_backfill_progress = 13;
+  reserved 14, 15;
+  reserved "truncate_tables", "refresh_finished_tables";
+  // SourceExecutor reports the source list is finished, and then
+  // meta will issue a ListFinish barrier to notify the source to start loading.
+  message ListFinishedSource {
+    // The actor that reported the completion event.
+    uint32 reporter_actor_id = 1;
+    // The table ID for the refreshable batch source.
+    uint32 table_id = 2;
+    // The source identifier associated with the completed listing.
+    uint32 associated_source_id = 3;
+  }
+  repeated ListFinishedSource list_finished_sources = 16;
+  // SourceExecutor reports that CDC source has updated offset at least once.
+  // Meta will mark the CDC source as created only after receiving this notification.
+  message CdcSourceOffsetUpdated {
+    // The actor that reported the offset update.
+    uint32 reporter_actor_id = 1;
+    // The source identifier for the CDC source.
+    uint32 source_id = 2;
+  }
+  repeated CdcSourceOffsetUpdated cdc_source_offset_updated = 17;
+  message IcebergPkIndexSinkMetadata {
+    uint32 reporter_actor_id = 1;
+    uint32 sink_id = 2;
+    uint64 prev_epoch = 3;
+    PbIcebergPkIndexSinkRole role = 4;
+    connector_service.SinkMetadata metadata = 5;
+  }
+  repeated IcebergPkIndexSinkMetadata iceberg_pk_index_sink_metadata = 18;
+  // A materialize actor has finished its part of a table refresh. Once all materialize actors
+  // of the table have reported, meta finishes the refresh cycle.
+  message RefreshFinishedActor {
+    uint32 reporter_actor_id = 1;
+    uint32 table_id = 2;
+  }
+  repeated RefreshFinishedActor refresh_finished_actors = 19;
+  message TableChangeLogProgress {
+    uint32 fragment_id = 1;
+    uint32 upstream_table_id = 2;
+    uint32 progress_table_id = 3;
+    // Minimum truncate epoch across the vnodes covered by this report.
+    uint64 min_truncate_epoch = 4;
+    // Vnodes covered by this compute node's locally aggregated progress.
+    common.Buffer vnode_bitmap = 5;
+  }
+  repeated TableChangeLogProgress table_change_log_progress = 20;
 }
 
 message StreamingControlStreamRequest {
   message InitRequest {
-    uint64 prev_epoch = 2;
+    reserved 1;
+    reserved "term_id";
+  }
+
+  message CreatePartialGraphRequest {
+    uint64 partial_graph_id = 1;
+    reserved 2;
+    reserved "database_id";
+    // Identifies the database recovery incarnation of this partial graph.
+    string term_id = 3;
+  }
+
+  message RemovePartialGraphRequest {
+    repeated uint64 partial_graph_ids = 1;
+  }
+
+  message ResetPartialGraphsRequest {
+    repeated uint64 partial_graph_ids = 1;
+    reserved 2, 3;
+    reserved "reset_request_id", "database_id";
   }
 
   oneof request {
     InitRequest init = 1;
     InjectBarrierRequest inject_barrier = 2;
+    RemovePartialGraphRequest remove_partial_graph = 3;
+    CreatePartialGraphRequest create_partial_graph = 4;
+    ResetPartialGraphsRequest reset_partial_graphs = 5;
   }
+}
+
+message ScoredError {
+  string err_msg = 1;
+  int32 score = 2;
 }
 
 message StreamingControlStreamResponse {
   message InitResponse {}
+  message ShutdownResponse {}
+  message ReportPartialGraphFailureResponse {
+    uint64 partial_graph_id = 1;
+  }
+
+  message ResetPartialGraphResponse {
+    uint64 partial_graph_id = 1;
+    optional ScoredError root_err = 2;
+    reserved 3;
+    reserved "reset_request_id";
+  }
 
   oneof response {
     InitResponse init = 1;
     BarrierCompleteResponse complete_barrier = 2;
+    ShutdownResponse shutdown = 3;
+    ReportPartialGraphFailureResponse report_partial_graph_failure = 4;
+    ResetPartialGraphResponse reset_partial_graph = 5;
   }
 }
 
+message GetMinUncommittedObjectIdRequest {}
+message GetMinUncommittedObjectIdResponse {
+  uint64 min_uncommitted_object_id = 1;
+}
+
+message WarmUpTableCacheRequest {
+  uint32 table_id = 1;
+  common.Buffer vnode_bitmap = 2;
+  uint64 committed_epoch = 3;
+  // Maximum number of vnodes scanned concurrently on this compute node.
+  uint32 concurrency = 4;
+}
+
+message WarmUpTableCacheResponse {
+  uint64 key_count = 1;
+}
+
 service StreamService {
-  rpc UpdateActors(UpdateActorsRequest) returns (UpdateActorsResponse);
-  rpc BuildActors(BuildActorsRequest) returns (BuildActorsResponse);
-  rpc BroadcastActorInfoTable(BroadcastActorInfoTableRequest) returns (BroadcastActorInfoTableResponse);
-  rpc DropActors(DropActorsRequest) returns (DropActorsResponse);
-  rpc WaitEpochCommit(WaitEpochCommitRequest) returns (WaitEpochCommitResponse);
   rpc StreamingControlStream(stream StreamingControlStreamRequest) returns (stream StreamingControlStreamResponse);
+  rpc GetMinUncommittedObjectId(GetMinUncommittedObjectIdRequest) returns (GetMinUncommittedObjectIdResponse);
+  rpc WarmUpTableCache(WarmUpTableCacheRequest) returns (WarmUpTableCacheResponse);
 }
 
 // TODO: Lifecycle management for actors.

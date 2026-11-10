@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Write;
 use std::iter;
-use std::mem::size_of;
+use std::mem::{ManuallyDrop, size_of};
 
 use risingwave_common_estimate_size::EstimateSize;
-use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::common::Buffer;
+use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::data::{ArrayType, PbArray};
 
 use super::{Array, ArrayBuilder, DataType};
-use crate::buffer::{Bitmap, BitmapBuilder};
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::util::iter_util::ZipEqDebug;
 
 /// `BytesArray` is a collection of Rust `[u8]`s.
@@ -38,9 +39,11 @@ impl Array for BytesArray {
     type RefItem<'a> = &'a [u8];
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> &[u8] {
-        let begin = *self.offset.get_unchecked(idx) as usize;
-        let end = *self.offset.get_unchecked(idx + 1) as usize;
-        self.data.get_unchecked(begin..end)
+        unsafe {
+            let begin = *self.offset.get_unchecked(idx) as usize;
+            let end = *self.offset.get_unchecked(idx + 1) as usize;
+            self.data.get_unchecked(begin..end)
+        }
     }
 
     fn len(&self) -> usize {
@@ -142,19 +145,24 @@ pub struct BytesArrayBuilder {
 impl ArrayBuilder for BytesArrayBuilder {
     type ArrayType = BytesArray;
 
-    fn new(capacity: usize) -> Self {
-        let mut offset = Vec::with_capacity(capacity + 1);
+    /// Creates a new `BytesArrayBuilder`.
+    ///
+    /// `item_capacity` is the number of items to pre-allocate. The size of the preallocated
+    /// buffer of offsets is the number of items plus one.
+    /// No additional memory is pre-allocated for the data buffer.
+    fn new(item_capacity: usize) -> Self {
+        let mut offset = Vec::with_capacity(item_capacity + 1);
         offset.push(0);
         Self {
             offset,
-            data: Vec::with_capacity(capacity),
-            bitmap: BitmapBuilder::with_capacity(capacity),
+            data: Vec::with_capacity(0),
+            bitmap: BitmapBuilder::with_capacity(item_capacity),
         }
     }
 
-    fn with_type(capacity: usize, ty: DataType) -> Self {
+    fn with_type(item_capacity: usize, ty: DataType) -> Self {
         assert_eq!(ty, DataType::Bytea);
-        Self::new(capacity)
+        Self::new(item_capacity)
     }
 
     fn append_n<'a>(&'a mut self, n: usize, value: Option<&'a [u8]>) {
@@ -243,33 +251,13 @@ impl BytesArrayBuilder {
     }
 }
 
+/// Note: dropping an unfinished `BytesWriter` will rollback the partial data
 pub struct BytesWriter<'a> {
     builder: &'a mut BytesArrayBuilder,
 }
 
-impl<'a> BytesWriter<'a> {
-    /// `write_ref` will consume `BytesWriter` and pass the ownership of `builder` to `BytesGuard`.
-    pub fn write_ref(self, value: &[u8]) {
-        self.builder.append(Some(value));
-    }
-
-    /// `begin` will create a `PartialBytesWriter`, which allow multiple appendings to create a new
-    /// record.
-    pub fn begin(self) -> PartialBytesWriter<'a> {
-        PartialBytesWriter {
-            builder: self.builder,
-        }
-    }
-}
-
-pub struct PartialBytesWriter<'a> {
-    builder: &'a mut BytesArrayBuilder,
-}
-
-impl<'a> PartialBytesWriter<'a> {
+impl BytesWriter<'_> {
     /// `write_ref` will append partial dirty data to `builder`.
-    /// `PartialBytesWriter::write_ref` is different from `BytesWriter::write_ref`
-    /// in that it allows us to call it multiple times.
     pub fn write_ref(&mut self, value: &[u8]) {
         // SAFETY: We'll clean the dirty `builder` in the `drop`.
         unsafe { self.builder.append_partial(value) }
@@ -279,12 +267,37 @@ impl<'a> PartialBytesWriter<'a> {
     /// Exactly one new record was appended and the `builder` can be safely used.
     pub fn finish(self) {
         self.builder.finish_partial();
+        let _ = ManuallyDrop::new(self); // Prevent drop
+    }
+
+    /// `rollback` will be called while the entire record is abandoned.
+    /// The partial data was cleaned and the `builder` can be safely used.
+    pub fn rollback(self) {
+        self.builder.rollback_partial();
+        let _ = ManuallyDrop::new(self); // Prevent drop
     }
 }
 
-impl<'a> Drop for PartialBytesWriter<'a> {
+impl Write for BytesWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_ref(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.write_ref(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for BytesWriter<'_> {
     fn drop(&mut self) {
-        // If `finish` is not called, we should rollback the data.
+        // If the writer is dropped without calling `finish` or `rollback`,
+        // we rollback the partial data by default.
         self.builder.rollback_partial();
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::ops::{Deref, DerefMut};
 use itertools::Itertools;
 use risingwave_common::types::Datum;
 
-use super::state::{StateEvictHint, StateKey, WindowState};
+use super::state::{Readiness, StateEvictHint, StateKey, WindowState};
 use crate::Result;
 
 pub struct WindowStates(Vec<Box<dyn WindowState + Send + Sync>>);
@@ -48,6 +48,25 @@ impl WindowStates {
         self.0.iter().all(|state| state.curr_window().is_ready)
     }
 
+    /// Get the readiness of current windows by [`WindowState::readiness`], which are ready only if
+    /// all of them are ready.
+    pub fn readiness(&self) -> Readiness {
+        debug_assert!(self.are_aligned());
+        let mut readiness = Readiness::Ready;
+        for state in &self.0 {
+            readiness = readiness.and(state.readiness());
+            if readiness == Readiness::WaitForInput {
+                break;
+            }
+        }
+        readiness
+    }
+
+    /// Whether no row is retained in all windows.
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|state| state.is_empty())
+    }
+
     /// Slide all windows forward and collect the output and evict hints.
     pub fn slide(&mut self) -> Result<(Vec<Datum>, StateEvictHint)> {
         debug_assert!(self.are_aligned());
@@ -67,6 +86,20 @@ impl WindowStates {
         ))
     }
 
+    /// Slide all windows forward and collect the evict hints, ignoring the output.
+    pub fn slide_no_output(&mut self) -> Result<StateEvictHint> {
+        debug_assert!(self.are_aligned());
+        let mut evict_hint: Option<StateEvictHint> = None;
+        for state in &mut self.0 {
+            let x_evict = state.slide_no_output()?;
+            evict_hint = match evict_hint {
+                Some(evict_hint) => Some(evict_hint.merge(x_evict)),
+                None => Some(x_evict),
+            };
+        }
+        Ok(evict_hint.expect("# of evict hints = # of window states"))
+    }
+
     /// Slide all windows forward and collect the output, ignoring the evict hints.
     pub fn slide_no_evict_hint(&mut self) -> Result<Vec<Datum>> {
         debug_assert!(self.are_aligned());
@@ -83,6 +116,17 @@ impl WindowStates {
         debug_assert!(self.are_aligned());
         for state in &mut self.0 {
             state.slide_no_output()?;
+        }
+        Ok(())
+    }
+
+    /// Slide all windows forward, until the current key is `curr_key`, ignoring the output and evict hints.
+    /// After this method, `self.curr_key() == Some(curr_key)`.
+    /// `curr_key` must exist in the `WindowStates`.
+    pub fn just_slide_to(&mut self, curr_key: &StateKey) -> Result<()> {
+        // TODO(rc): with the knowledge of the old output, we can "jump" to the `curr_key` directly for some window function kind
+        while self.curr_key() != Some(curr_key) {
+            self.just_slide()?;
         }
         Ok(())
     }

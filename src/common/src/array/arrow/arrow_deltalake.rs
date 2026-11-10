@@ -1,10 +1,10 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,16 +22,11 @@ use std::sync::Arc;
 
 use arrow_array::ArrayRef;
 use num_traits::abs;
-use {
-    arrow_array_deltalake as arrow_array, arrow_buffer_deltalake as arrow_buffer,
-    arrow_cast_deltalake as arrow_cast, arrow_schema_deltalake as arrow_schema,
-};
 
-use self::arrow_impl::ToArrow;
+pub use super::arrow_58::{
+    FromArrow, ToArrow, arrow_array, arrow_buffer, arrow_cast, arrow_schema,
+};
 use crate::array::{Array, ArrayError, DataChunk, Decimal, DecimalArray};
-#[expect(clippy::duplicate_mod)]
-#[path = "./arrow_impl.rs"]
-mod arrow_impl;
 
 pub struct DeltaLakeConvert;
 
@@ -99,14 +94,14 @@ impl ToArrow for DeltaLakeConvert {
 mod test {
     use std::sync::Arc;
 
-    use arrow_array::cast::AsArray;
     use arrow_array::ArrayRef;
+    use arrow_array::cast::AsArray;
     use arrow_schema::Field;
-    use {arrow_array_deltalake as arrow_array, arrow_schema_deltalake as arrow_schema};
 
+    use super::*;
     use crate::array::arrow::arrow_deltalake::DeltaLakeConvert;
     use crate::array::{ArrayImpl, Decimal, DecimalArray, ListArray, ListValue};
-    use crate::buffer::Bitmap;
+    use crate::bitmap::Bitmap;
 
     #[test]
     fn test_decimal_list_chunk() {

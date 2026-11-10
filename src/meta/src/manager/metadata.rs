@@ -13,50 +13,35 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::pin::pin;
-use std::time::Duration;
+use std::fmt::{Debug, Formatter};
 
-use futures::future::{select, Either};
-use risingwave_common::catalog::{TableId, TableOption};
-use risingwave_meta_model_v2::SourceId;
+use anyhow::anyhow;
+use itertools::Itertools;
+use risingwave_common::catalog::{DatabaseId, TableId, TableOption};
+use risingwave_common::id::JobId;
+use risingwave_meta_model::{SinkId, SourceId, WorkerId, refresh_job};
 use risingwave_pb::catalog::{PbSource, PbTable};
-use risingwave_pb::common::worker_node::{PbResource, State};
+use risingwave_pb::common::worker_node::{PbResource, Property as AddNodeProperty, State};
 use risingwave_pb::common::{HostAddress, PbWorkerNode, PbWorkerType, WorkerNode, WorkerType};
-use risingwave_pb::meta::add_worker_node_request::Property as AddNodeProperty;
-use risingwave_pb::meta::table_fragments::{ActorStatus, Fragment, PbFragment};
-use risingwave_pb::stream_plan::{PbDispatchStrategy, StreamActor};
-use risingwave_pb::stream_service::BuildActorInfo;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio::time::sleep;
+use risingwave_pb::meta::list_rate_limits_response::RateLimitInfo;
+use risingwave_pb::stream_plan::{PbDispatcherType, PbStreamNode, PbStreamScanType};
+use sea_orm::TransactionTrait;
+use sea_orm::prelude::DateTime;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::barrier::Reschedule;
-use crate::controller::catalog::CatalogControllerRef;
-use crate::controller::cluster::{ClusterControllerRef, WorkerExtraInfo};
-use crate::manager::{
-    CatalogManagerRef, ClusterManagerRef, FragmentManagerRef, LocalNotification,
-    StreamingClusterInfo, WorkerId,
-};
-use crate::model::{ActorId, FragmentId, MetadataModel, TableFragments, TableParallelism};
-use crate::stream::{to_build_actor_info, SplitAssignment};
-use crate::telemetry::MetaTelemetryJobDesc;
 use crate::MetaResult;
+use crate::controller::catalog::CatalogControllerRef;
+use crate::controller::cluster::{ClusterControllerRef, StreamingClusterInfo, WorkerExtraInfo};
+use crate::controller::scale::find_fragment_no_shuffle_dags_detailed;
+use crate::manager::{LocalNotification, NotificationVersion};
+use crate::model::{ActorId, ClusterId, Fragment, FragmentId, StreamJobFragments, SubscriptionId};
+use crate::stream::SplitAssignment;
+use crate::telemetry::MetaTelemetryJobDesc;
 
 #[derive(Clone)]
-pub enum MetadataManager {
-    V1(MetadataManagerV1),
-    V2(MetadataManagerV2),
-}
-
-#[derive(Clone)]
-pub struct MetadataManagerV1 {
-    pub cluster_manager: ClusterManagerRef,
-    pub catalog_manager: CatalogManagerRef,
-    pub fragment_manager: FragmentManagerRef,
-}
-
-#[derive(Clone)]
-pub struct MetadataManagerV2 {
+pub struct MetadataManager {
     pub cluster_controller: ClusterControllerRef,
     pub catalog_controller: CatalogControllerRef,
 }
@@ -64,7 +49,6 @@ pub struct MetadataManagerV2 {
 #[derive(Debug)]
 pub(crate) enum ActiveStreamingWorkerChange {
     Add(WorkerNode),
-    #[expect(dead_code)]
     Remove(WorkerNode),
     Update(WorkerNode),
 }
@@ -72,6 +56,16 @@ pub(crate) enum ActiveStreamingWorkerChange {
 pub struct ActiveStreamingWorkerNodes {
     worker_nodes: HashMap<WorkerId, WorkerNode>,
     rx: UnboundedReceiver<LocalNotification>,
+    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+    meta_manager: Option<MetadataManager>,
+}
+
+impl Debug for ActiveStreamingWorkerNodes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveStreamingWorkerNodes")
+            .field("worker_nodes", &self.worker_nodes)
+            .finish()
+    }
 }
 
 impl ActiveStreamingWorkerNodes {
@@ -79,17 +73,39 @@ impl ActiveStreamingWorkerNodes {
         Self {
             worker_nodes: Default::default(),
             rx: unbounded_channel().1,
+            meta_manager: None,
         }
     }
 
-    /// Return an uninitialized one as a place holder for future initialized
+    #[cfg(test)]
+    pub(crate) fn for_test(worker_nodes: HashMap<WorkerId, WorkerNode>) -> Self {
+        let (tx, rx) = unbounded_channel();
+        let _join_handle = tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await
+        });
+        Self {
+            worker_nodes,
+            rx,
+            meta_manager: None,
+        }
+    }
+
+    /// Return an uninitialized one as a placeholder for future initialized
     pub(crate) async fn new_snapshot(meta_manager: MetadataManager) -> MetaResult<Self> {
         let (nodes, rx) = meta_manager
             .subscribe_active_streaming_compute_nodes()
             .await?;
         Ok(Self {
-            worker_nodes: nodes.into_iter().map(|node| (node.id, node)).collect(),
+            worker_nodes: nodes
+                .into_iter()
+                .filter_map(|node| {
+                    let is_streaming = node.property.as_ref().is_some_and(|p| p.is_streaming);
+                    is_streaming.then_some((node.id, node))
+                })
+                .collect(),
             rx,
+            meta_manager: Some(meta_manager),
         })
     }
 
@@ -97,34 +113,22 @@ impl ActiveStreamingWorkerNodes {
         &self.worker_nodes
     }
 
-    pub(crate) async fn wait_changed(
-        &mut self,
-        verbose_internal: Duration,
-        verbose_fn: impl Fn(&Self),
-    ) -> ActiveStreamingWorkerChange {
-        loop {
-            if let Either::Left((change, _)) =
-                select(pin!(self.changed()), pin!(sleep(verbose_internal))).await
-            {
-                break change;
-            }
-            verbose_fn(self)
-        }
-    }
-
     pub(crate) async fn changed(&mut self) -> ActiveStreamingWorkerChange {
-        let ret = loop {
+        loop {
             let notification = self
                 .rx
                 .recv()
                 .await
                 .expect("notification stopped or uninitialized");
+            fn is_target_worker_node(worker: &WorkerNode) -> bool {
+                worker.r#type == WorkerType::ComputeNode as i32
+                    && worker.property.as_ref().unwrap().is_streaming
+            }
             match notification {
                 LocalNotification::WorkerNodeDeleted(worker) => {
-                    let is_streaming_compute_node = worker.r#type == WorkerType::ComputeNode as i32
-                        && worker.property.as_ref().unwrap().is_streaming;
+                    let is_target_worker_node = is_target_worker_node(&worker);
                     let Some(prev_worker) = self.worker_nodes.remove(&worker.id) else {
-                        if is_streaming_compute_node {
+                        if is_target_worker_node {
                             warn!(
                                 ?worker,
                                 "notify to delete an non-existing streaming compute worker"
@@ -132,7 +136,7 @@ impl ActiveStreamingWorkerNodes {
                         }
                         continue;
                     };
-                    if !is_streaming_compute_node {
+                    if !is_target_worker_node {
                         warn!(
                             ?worker,
                             ?prev_worker,
@@ -141,7 +145,7 @@ impl ActiveStreamingWorkerNodes {
                     }
                     if worker.state == State::Starting as i32 {
                         warn!(
-                            id = worker.id,
+                            id = %worker.id,
                             host = ?worker.host,
                             state = worker.state,
                             "a starting streaming worker is deleted"
@@ -150,9 +154,7 @@ impl ActiveStreamingWorkerNodes {
                     break ActiveStreamingWorkerChange::Remove(prev_worker);
                 }
                 LocalNotification::WorkerNodeActivated(worker) => {
-                    if worker.r#type != WorkerType::ComputeNode as i32
-                        || !worker.property.as_ref().unwrap().is_streaming
-                    {
+                    if !is_target_worker_node(&worker) {
                         if let Some(prev_worker) = self.worker_nodes.remove(&worker.id) {
                             warn!(
                                 ?worker,
@@ -192,90 +194,83 @@ impl ActiveStreamingWorkerNodes {
                     continue;
                 }
             }
-        };
+        }
+    }
 
-        ret
+    #[cfg(debug_assertions)]
+    pub(crate) async fn validate_change(&self) {
+        use risingwave_pb::common::WorkerNode;
+        use thiserror_ext::AsReport;
+        let Some(meta_manager) = &self.meta_manager else {
+            return;
+        };
+        match meta_manager.list_active_streaming_compute_nodes().await {
+            Ok(worker_nodes) => {
+                let ignore_irrelevant_info = |node: &WorkerNode| {
+                    (
+                        node.id,
+                        WorkerNode {
+                            id: node.id,
+                            r#type: node.r#type,
+                            host: node.host.clone(),
+                            property: node.property.clone(),
+                            resource: node.resource.clone(),
+                            ..Default::default()
+                        },
+                    )
+                };
+                let worker_nodes: HashMap<_, _> =
+                    worker_nodes.iter().map(ignore_irrelevant_info).collect();
+                let curr_worker_nodes: HashMap<_, _> = self
+                    .current()
+                    .values()
+                    .map(ignore_irrelevant_info)
+                    .collect();
+                if worker_nodes != curr_worker_nodes {
+                    warn!(
+                        ?worker_nodes,
+                        ?curr_worker_nodes,
+                        "different to global snapshot"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    e = ?e.as_report(),
+                    "failed to list active streaming compute nodes for comparison with the local snapshot",
+                );
+            }
+        }
     }
 }
 
 impl MetadataManager {
-    pub fn new_v1(
-        cluster_manager: ClusterManagerRef,
-        catalog_manager: CatalogManagerRef,
-        fragment_manager: FragmentManagerRef,
-    ) -> Self {
-        Self::V1(MetadataManagerV1 {
-            cluster_manager,
-            catalog_manager,
-            fragment_manager,
-        })
-    }
-
-    pub fn new_v2(
+    pub fn new(
         cluster_controller: ClusterControllerRef,
         catalog_controller: CatalogControllerRef,
     ) -> Self {
-        Self::V2(MetadataManagerV2 {
+        Self {
             cluster_controller,
             catalog_controller,
-        })
-    }
-
-    pub fn as_v1_ref(&self) -> &MetadataManagerV1 {
-        match self {
-            MetadataManager::V1(mgr) => mgr,
-            MetadataManager::V2(_) => panic!("expect v1, found v2"),
-        }
-    }
-
-    pub fn as_v2_ref(&self) -> &MetadataManagerV2 {
-        match self {
-            MetadataManager::V1(_) => panic!("expect v2, found v1"),
-            MetadataManager::V2(mgr) => mgr,
         }
     }
 
     pub async fn get_worker_by_id(&self, worker_id: WorkerId) -> MetaResult<Option<PbWorkerNode>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .cluster_manager
-                .get_worker_by_id(worker_id)
-                .await
-                .map(|w| w.worker_node)),
-            MetadataManager::V2(mgr) => {
-                mgr.cluster_controller
-                    .get_worker_by_id(worker_id as _)
-                    .await
-            }
-        }
+        self.cluster_controller.get_worker_by_id(worker_id).await
     }
 
     pub async fn count_worker_node(&self) -> MetaResult<HashMap<WorkerType, u64>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr.cluster_manager.count_worker_node().await),
-            MetadataManager::V2(mgr) => {
-                let node_map = mgr.cluster_controller.count_worker_by_type().await?;
-                Ok(node_map
-                    .into_iter()
-                    .map(|(ty, cnt)| (ty.into(), cnt as u64))
-                    .collect())
-            }
-        }
+        let node_map = self.cluster_controller.count_worker_by_type().await?;
+        Ok(node_map
+            .into_iter()
+            .map(|(ty, cnt)| (ty.into(), cnt as u64))
+            .collect())
     }
 
     pub async fn get_worker_info_by_id(&self, worker_id: WorkerId) -> Option<WorkerExtraInfo> {
-        match &self {
-            MetadataManager::V1(mgr) => mgr
-                .cluster_manager
-                .get_worker_by_id(worker_id)
-                .await
-                .map(Into::into),
-            MetadataManager::V2(mgr) => {
-                mgr.cluster_controller
-                    .get_worker_info_by_id(worker_id as _)
-                    .await
-            }
-        }
+        self.cluster_controller
+            .get_worker_info_by_id(worker_id as _)
+            .await
     }
 
     pub async fn add_worker_node(
@@ -285,18 +280,10 @@ impl MetadataManager {
         property: AddNodeProperty,
         resource: PbResource,
     ) -> MetaResult<WorkerId> {
-        match &self {
-            MetadataManager::V1(mgr) => mgr
-                .cluster_manager
-                .add_worker_node(r#type, host_address, property, resource)
-                .await
-                .map(|w| w.id),
-            MetadataManager::V2(mgr) => mgr
-                .cluster_controller
-                .add_worker(r#type, host_address, property, resource)
-                .await
-                .map(|id| id as WorkerId),
-        }
+        self.cluster_controller
+            .add_worker(r#type, host_address, property, resource)
+            .await
+            .map(|id| id as WorkerId)
     }
 
     pub async fn list_worker_node(
@@ -304,529 +291,540 @@ impl MetadataManager {
         worker_type: Option<WorkerType>,
         worker_state: Option<State>,
     ) -> MetaResult<Vec<PbWorkerNode>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .cluster_manager
-                .list_worker_node(worker_type, worker_state)
-                .await),
-            MetadataManager::V2(mgr) => {
-                mgr.cluster_controller
-                    .list_workers(worker_type.map(Into::into), worker_state.map(Into::into))
-                    .await
-            }
-        }
+        self.cluster_controller
+            .list_workers(worker_type.map(Into::into), worker_state.map(Into::into))
+            .await
     }
 
     pub async fn subscribe_active_streaming_compute_nodes(
         &self,
     ) -> MetaResult<(Vec<WorkerNode>, UnboundedReceiver<LocalNotification>)> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .cluster_manager
-                .subscribe_active_streaming_compute_nodes()
-                .await),
-            MetadataManager::V2(mgr) => {
-                mgr.cluster_controller
-                    .subscribe_active_streaming_compute_nodes()
-                    .await
-            }
-        }
+        self.cluster_controller
+            .subscribe_active_streaming_compute_nodes()
+            .await
     }
 
     pub async fn list_active_streaming_compute_nodes(&self) -> MetaResult<Vec<PbWorkerNode>> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .cluster_manager
-                .list_active_streaming_compute_nodes()
-                .await),
-            MetadataManager::V2(mgr) => {
-                mgr.cluster_controller.list_active_streaming_workers().await
-            }
-        }
+        self.cluster_controller
+            .list_active_streaming_workers()
+            .await
     }
 
-    pub async fn list_background_creating_jobs(&self) -> MetaResult<Vec<TableId>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                let tables = mgr.catalog_manager.list_creating_background_mvs().await;
-                Ok(tables
-                    .into_iter()
-                    .map(|table| TableId::from(table.id))
-                    .collect())
-            }
-            MetadataManager::V2(mgr) => {
-                let tables = mgr
-                    .catalog_controller
-                    .list_background_creating_mviews()
-                    .await?;
+    pub async fn list_active_serving_compute_nodes(&self) -> MetaResult<Vec<PbWorkerNode>> {
+        self.cluster_controller.list_active_serving_workers().await
+    }
 
-                Ok(tables
-                    .into_iter()
-                    .map(|table| TableId::from(table.table_id as u32))
-                    .collect())
-            }
+    pub async fn list_active_database_ids(&self) -> MetaResult<HashSet<DatabaseId>> {
+        Ok(self
+            .catalog_controller
+            .list_fragment_database_ids(None)
+            .await?
+            .into_iter()
+            .map(|(_, database_id)| database_id)
+            .collect())
+    }
+
+    pub async fn split_fragment_map_by_database<T: Debug>(
+        &self,
+        fragment_map: HashMap<FragmentId, T>,
+    ) -> MetaResult<HashMap<DatabaseId, HashMap<FragmentId, T>>> {
+        let fragment_to_database_map: HashMap<_, _> = self
+            .catalog_controller
+            .list_fragment_database_ids(Some(
+                fragment_map
+                    .keys()
+                    .map(|fragment_id| *fragment_id as _)
+                    .collect(),
+            ))
+            .await?
+            .into_iter()
+            .map(|(fragment_id, database_id)| (fragment_id as FragmentId, database_id))
+            .collect();
+        let mut ret: HashMap<_, HashMap<_, _>> = HashMap::new();
+        for (fragment_id, value) in fragment_map {
+            let database_id = *fragment_to_database_map
+                .get(&fragment_id)
+                .ok_or_else(|| anyhow!("cannot get database_id of fragment {fragment_id}"))?;
+            ret.entry(database_id)
+                .or_default()
+                .try_insert(fragment_id, value)
+                .expect("non duplicate");
         }
+        Ok(ret)
+    }
+
+    pub async fn list_creating_jobs(&self) -> MetaResult<HashSet<JobId>> {
+        Ok(self
+            .catalog_controller
+            .list_creating_jobs(false, None)
+            .await?
+            .into_iter()
+            .map(|(job_id, _, _, _, _)| job_id)
+            .collect())
     }
 
     pub async fn list_sources(&self) -> MetaResult<Vec<PbSource>> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr.catalog_manager.list_sources().await),
-            MetadataManager::V2(mgr) => mgr.catalog_controller.list_sources().await,
-        }
-    }
-
-    pub async fn pre_apply_reschedules(
-        &self,
-        created_actors: HashMap<FragmentId, HashMap<ActorId, (StreamActor, ActorStatus)>>,
-    ) -> HashMap<FragmentId, HashSet<ActorId>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .pre_apply_reschedules(created_actors)
-                    .await
-            }
-
-            // V2 doesn't need to pre apply reschedules.
-            MetadataManager::V2(_) => HashMap::new(),
-        }
-    }
-
-    pub async fn post_apply_reschedules(
-        &self,
-        reschedules: HashMap<FragmentId, Reschedule>,
-        table_parallelism_assignment: HashMap<TableId, TableParallelism>,
-    ) -> MetaResult<()> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .post_apply_reschedules(reschedules, table_parallelism_assignment)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                // temp convert u32 to i32
-                let reschedules = reschedules.into_iter().map(|(k, v)| (k as _, v)).collect();
-
-                mgr.catalog_controller
-                    .post_apply_reschedules(reschedules, table_parallelism_assignment)
-                    .await
-            }
-        }
-    }
-
-    pub async fn running_fragment_parallelisms(
-        &self,
-        id_filter: Option<HashSet<FragmentId>>,
-    ) -> MetaResult<HashMap<FragmentId, usize>> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .fragment_manager
-                .running_fragment_parallelisms(id_filter)
-                .await
-                .into_iter()
-                .map(|(k, v)| (k as FragmentId, v))
-                .collect()),
-            MetadataManager::V2(mgr) => {
-                let id_filter = id_filter.map(|ids| ids.into_iter().map(|id| id as _).collect());
-                Ok(mgr
-                    .catalog_controller
-                    .running_fragment_parallelisms(id_filter)
-                    .await?
-                    .into_iter()
-                    .map(|(k, v)| (k as FragmentId, v))
-                    .collect())
-            }
-        }
+        self.catalog_controller.list_sources().await
     }
 
     /// Get and filter the "**root**" fragments of the specified relations.
     /// The root fragment is the bottom-most fragment of its fragment graph, and can be a `MView` or a `Source`.
     ///
-    /// ## What can be the root fragment
-    /// - For MV, it should have one `MView` fragment.
-    /// - For table, it should have one `MView` fragment and one or two `Source` fragments. `MView` should be the root.
-    /// - For source, it should have one `Source` fragment.
-    ///
-    /// In other words, it's the `MView` fragment if it exists, otherwise it's the `Source` fragment.
-    ///
-    /// ## What do we expect to get for different creating streaming job
-    /// - MV/Sink/Index should have MV upstream fragments for upstream MV/Tables, and Source upstream fragments for upstream shared sources.
-    /// - CDC Table has a Source upstream fragment.
-    /// - Sources and other Tables shouldn't have an upstream fragment.
+    /// See also [`crate::controller::catalog::CatalogController::get_root_fragments`].
     pub async fn get_upstream_root_fragments(
         &self,
         upstream_table_ids: &HashSet<TableId>,
-    ) -> MetaResult<HashMap<TableId, Fragment>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .get_upstream_root_fragments(upstream_table_ids)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let upstream_root_fragments = mgr
-                    .catalog_controller
-                    .get_upstream_root_fragments(
-                        upstream_table_ids
-                            .iter()
-                            .map(|id| id.table_id as _)
-                            .collect(),
-                    )
-                    .await?;
-                Ok(upstream_root_fragments
-                    .into_iter()
-                    .map(|(id, fragment)| ((id as u32).into(), fragment))
-                    .collect())
-            }
-        }
+    ) -> MetaResult<HashMap<JobId, Fragment>> {
+        let upstream_root_fragments = self
+            .catalog_controller
+            .get_root_fragments(upstream_table_ids.iter().map(|id| id.as_job_id()).collect())
+            .await?;
+
+        Ok(upstream_root_fragments)
     }
 
     pub async fn get_streaming_cluster_info(&self) -> MetaResult<StreamingClusterInfo> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr.cluster_manager.get_streaming_cluster_info().await),
-            MetadataManager::V2(mgr) => mgr.cluster_controller.get_streaming_cluster_info().await,
-        }
+        self.cluster_controller.get_streaming_cluster_info().await
     }
 
-    pub async fn get_all_table_options(&self) -> MetaResult<HashMap<u32, TableOption>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr.catalog_manager.get_all_table_options().await),
-            MetadataManager::V2(mgr) => mgr
-                .catalog_controller
-                .get_all_table_options()
-                .await
-                .map(|tops| tops.into_iter().map(|(id, opt)| (id as u32, opt)).collect()),
-        }
+    pub async fn get_all_table_options(&self) -> MetaResult<HashMap<TableId, TableOption>> {
+        self.catalog_controller.get_all_table_options().await
     }
 
-    pub async fn get_table_name_type_mapping(&self) -> MetaResult<HashMap<u32, (String, String)>> {
-        match &self {
-            MetadataManager::V1(mgr) => {
-                Ok(mgr.catalog_manager.get_table_name_and_type_mapping().await)
-            }
-            MetadataManager::V2(mgr) => {
-                let mappings = mgr.catalog_controller.get_table_name_type_mapping().await?;
-                Ok(mappings
-                    .into_iter()
-                    .map(|(id, value)| (id as u32, value))
-                    .collect())
-            }
-        }
-    }
-
-    pub async fn get_created_table_ids(&self) -> MetaResult<Vec<u32>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr.catalog_manager.get_created_table_ids().await),
-            MetadataManager::V2(mgr) => {
-                let table_ids = mgr.catalog_controller.get_created_table_ids().await?;
-                Ok(table_ids.into_iter().map(|id| id as u32).collect())
-            }
-        }
-    }
-
-    pub async fn get_table_catalog_by_ids(&self, ids: Vec<u32>) -> MetaResult<Vec<PbTable>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr.catalog_manager.get_tables(&ids).await),
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .get_table_by_ids(ids.into_iter().map(|id| id as _).collect())
-                    .await
-            }
-        }
-    }
-
-    pub async fn get_downstream_chain_fragments(
+    pub async fn get_table_name_type_mapping(
         &self,
-        job_id: u32,
-    ) -> MetaResult<Vec<(PbDispatchStrategy, PbFragment)>> {
-        match &self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .get_downstream_fragments(job_id.into())
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .get_downstream_chain_fragments(job_id as _)
-                    .await
-            }
-        }
+    ) -> MetaResult<HashMap<TableId, (String, String)>> {
+        self.catalog_controller.get_table_name_type_mapping().await
     }
 
-    pub async fn get_worker_actor_ids(
+    pub async fn get_created_table_ids(&self) -> MetaResult<Vec<TableId>> {
+        self.catalog_controller.get_created_table_ids().await
+    }
+
+    pub async fn get_table_associated_source_id(
         &self,
-        job_ids: HashSet<TableId>,
-    ) -> MetaResult<BTreeMap<WorkerId, Vec<ActorId>>> {
-        match &self {
-            MetadataManager::V1(mgr) => mgr.fragment_manager.table_node_actors(&job_ids).await,
-            MetadataManager::V2(mgr) => {
-                let worker_actors = mgr
-                    .catalog_controller
-                    .get_worker_actor_ids(job_ids.into_iter().map(|id| id.table_id as _).collect())
-                    .await?;
-                Ok(worker_actors
-                    .into_iter()
-                    .map(|(id, actors)| {
-                        (
-                            id as WorkerId,
-                            actors.into_iter().map(|id| id as ActorId).collect(),
-                        )
-                    })
-                    .collect())
-            }
-        }
+        table_id: TableId,
+    ) -> MetaResult<Option<SourceId>> {
+        self.catalog_controller
+            .get_table_associated_source_id(table_id)
+            .await
     }
 
-    pub async fn get_job_id_to_internal_table_ids_mapping(&self) -> Option<Vec<(u32, Vec<u32>)>> {
-        match &self {
-            MetadataManager::V1(mgr) => mgr
-                .fragment_manager
-                .get_mv_id_to_internal_table_ids_mapping(),
-            MetadataManager::V2(mgr) => {
-                let job_internal_table_ids =
-                    mgr.catalog_controller.get_job_internal_table_ids().await;
-                job_internal_table_ids.map(|ids| {
-                    ids.into_iter()
-                        .map(|(id, internal_ids)| {
-                            (
-                                id as u32,
-                                internal_ids.into_iter().map(|id| id as u32).collect(),
-                            )
-                        })
-                        .collect()
-                })
-            }
-        }
+    pub async fn get_table_catalog_by_ids(&self, ids: &[TableId]) -> MetaResult<Vec<PbTable>> {
+        self.catalog_controller
+            .get_table_by_ids(ids.to_vec(), false)
+            .await
     }
 
-    pub async fn get_job_fragments_by_id(&self, id: &TableId) -> MetaResult<TableFragments> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .select_table_fragments_by_table_id(id)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let pb_table_fragments = mgr
-                    .catalog_controller
-                    .get_job_fragments_by_id(id.table_id as _)
-                    .await?;
-                Ok(TableFragments::from_protobuf(pb_table_fragments))
-            }
-        }
+    pub async fn list_refresh_jobs(&self) -> MetaResult<Vec<refresh_job::Model>> {
+        self.catalog_controller.list_refresh_jobs().await
     }
 
-    pub async fn get_running_actors_of_fragment(
+    pub async fn list_refreshing_jobs(
         &self,
-        id: FragmentId,
-    ) -> MetaResult<HashSet<ActorId>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .get_running_actors_of_fragment(id)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let actor_ids = mgr
-                    .catalog_controller
-                    .get_running_actors_of_fragment(id as _)
-                    .await?;
-                Ok(actor_ids.into_iter().map(|id| id as ActorId).collect())
-            }
-        }
+        database_id: Option<DatabaseId>,
+    ) -> MetaResult<Vec<refresh_job::Model>> {
+        self.catalog_controller
+            .list_refreshing_jobs(database_id)
+            .await
     }
 
-    pub async fn get_running_actors_and_upstream_actors_of_fragment(
+    pub async fn list_refreshable_table_ids(&self) -> MetaResult<Vec<TableId>> {
+        self.catalog_controller.list_refreshable_table_ids().await
+    }
+
+    pub async fn ensure_refresh_job(&self, table_id: TableId) -> MetaResult<()> {
+        self.catalog_controller.ensure_refresh_job(table_id).await
+    }
+
+    pub async fn begin_refresh_job(
         &self,
-        id: FragmentId,
-    ) -> MetaResult<HashSet<(ActorId, Vec<ActorId>)>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .get_running_actors_and_upstream_of_fragment(id)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let actor_ids = mgr
-                    .catalog_controller
-                    .get_running_actors_and_upstream_of_fragment(id as _)
-                    .await?;
-                Ok(actor_ids
-                    .into_iter()
-                    .map(|(id, actors)| {
-                        (
-                            id as ActorId,
-                            actors
-                                .into_inner()
-                                .into_iter()
-                                .flat_map(|(_, ids)| ids.into_iter().map(|id| id as ActorId))
-                                .collect(),
-                        )
-                    })
-                    .collect())
-            }
-        }
+        table_id: TableId,
+        trigger_time: DateTime,
+    ) -> MetaResult<bool> {
+        self.catalog_controller
+            .begin_refresh_job(table_id, trigger_time)
+            .await
     }
 
-    pub async fn get_job_fragments_by_ids(
+    pub async fn finish_refresh_job(
         &self,
-        ids: &[TableId],
-    ) -> MetaResult<Vec<TableFragments>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .select_table_fragments_by_ids(ids)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let mut table_fragments = vec![];
-                for id in ids {
-                    let pb_table_fragments = mgr
-                        .catalog_controller
-                        .get_job_fragments_by_id(id.table_id as _)
-                        .await?;
-                    table_fragments.push(TableFragments::from_protobuf(pb_table_fragments));
-                }
-                Ok(table_fragments)
-            }
-        }
+        table_id: TableId,
+        trigger_time: DateTime,
+        success: bool,
+    ) -> MetaResult<bool> {
+        self.catalog_controller
+            .finish_refresh_job(table_id, trigger_time, success)
+            .await
     }
 
-    pub async fn all_node_actors(
+    pub async fn update_refresh_job_interval(
         &self,
-        include_inactive: bool,
-    ) -> MetaResult<HashMap<WorkerId, Vec<BuildActorInfo>>> {
-        let subscriptions = self.get_mv_depended_subscriptions().await?;
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr
-                .fragment_manager
-                .all_node_actors(include_inactive, &subscriptions)
-                .await),
-            MetadataManager::V2(mgr) => {
-                let table_fragments = mgr.catalog_controller.table_fragments().await?;
-                let mut actor_maps = HashMap::new();
-                for (_, fragments) in table_fragments {
-                    let tf = TableFragments::from_protobuf(fragments);
-                    let table_id = tf.table_id();
-                    for (node_id, actors) in tf.worker_actors(include_inactive) {
-                        let node_actors = actor_maps.entry(node_id).or_insert_with(Vec::new);
-                        node_actors.extend(
-                            actors
-                                .into_iter()
-                                .map(|actor| to_build_actor_info(actor, &subscriptions, table_id)),
-                        )
-                    }
-                }
-                Ok(actor_maps)
-            }
-        }
+        table_id: TableId,
+        trigger_interval_secs: Option<i64>,
+    ) -> MetaResult<()> {
+        self.catalog_controller
+            .update_refresh_job_interval(table_id, trigger_interval_secs)
+            .await
     }
 
-    pub async fn worker_actor_count(&self) -> MetaResult<HashMap<WorkerId, usize>> {
-        match &self {
-            MetadataManager::V1(mgr) => Ok(mgr.fragment_manager.node_actor_count().await),
-            MetadataManager::V2(mgr) => {
-                let actor_cnt = mgr.catalog_controller.worker_actor_count().await?;
-                Ok(actor_cnt
-                    .into_iter()
-                    .map(|(id, cnt)| (id as WorkerId, cnt))
-                    .collect())
-            }
-        }
+    pub async fn get_sink_state_table_ids(&self, sink_id: SinkId) -> MetaResult<Vec<TableId>> {
+        self.catalog_controller
+            .get_sink_state_table_ids(sink_id)
+            .await
+    }
+
+    pub async fn get_table_catalog_by_cdc_table_id(
+        &self,
+        cdc_table_id: &String,
+    ) -> MetaResult<Vec<PbTable>> {
+        self.catalog_controller
+            .get_table_by_cdc_table_id(cdc_table_id)
+            .await
+    }
+
+    pub async fn get_downstream_fragments(
+        &self,
+        job_id: JobId,
+    ) -> MetaResult<Vec<(PbDispatcherType, Fragment)>> {
+        self.catalog_controller
+            .get_downstream_fragments(job_id)
+            .await
+    }
+
+    pub async fn get_job_id_to_internal_table_ids_mapping(
+        &self,
+    ) -> Option<Vec<(JobId, Vec<TableId>)>> {
+        self.catalog_controller.get_job_internal_table_ids().await
+    }
+
+    pub async fn get_job_fragments_by_id(&self, job_id: JobId) -> MetaResult<StreamJobFragments> {
+        Ok(self
+            .catalog_controller
+            .get_job_fragments_by_id(job_id)
+            .await?
+            .0)
+    }
+
+    pub fn get_running_actors_of_fragment(&self, id: FragmentId) -> MetaResult<HashSet<ActorId>> {
+        self.catalog_controller
+            .get_running_actors_of_fragment(id as _)
+    }
+
+    // (backfill_actor_id, upstream_source_actor_id)
+    pub async fn get_running_actors_for_source_backfill(
+        &self,
+        source_backfill_fragment_id: FragmentId,
+        source_fragment_id: FragmentId,
+    ) -> MetaResult<HashSet<(ActorId, ActorId)>> {
+        let actor_ids = self
+            .catalog_controller
+            .get_running_actors_for_source_backfill(
+                source_backfill_fragment_id as _,
+                source_fragment_id as _,
+            )
+            .await?;
+        Ok(actor_ids
+            .into_iter()
+            .map(|(id, upstream)| (id as ActorId, upstream as ActorId))
+            .collect())
+    }
+
+    pub fn worker_actor_count(&self) -> MetaResult<HashMap<WorkerId, usize>> {
+        let actor_cnt = self.catalog_controller.worker_actor_count()?;
+        Ok(actor_cnt
+            .into_iter()
+            .map(|(id, cnt)| (id as WorkerId, cnt))
+            .collect())
     }
 
     pub async fn count_streaming_job(&self) -> MetaResult<usize> {
-        match self {
-            MetadataManager::V1(mgr) => Ok(mgr.fragment_manager.count_streaming_job().await),
-            MetadataManager::V2(mgr) => mgr
-                .catalog_controller
-                .list_streaming_job_states()
-                .await
-                .map(|x| x.len()),
-        }
+        self.catalog_controller.count_streaming_jobs().await
     }
 
     pub async fn list_stream_job_desc(&self) -> MetaResult<Vec<MetaTelemetryJobDesc>> {
-        match self {
-            MetadataManager::V1(mgr) => mgr.catalog_manager.list_stream_job_for_telemetry().await,
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .list_stream_job_desc_for_telemetry()
-                    .await
-            }
-        }
+        self.catalog_controller
+            .list_stream_job_desc_for_telemetry()
+            .await
     }
 
     pub async fn update_source_rate_limit_by_source_id(
         &self,
         source_id: SourceId,
         rate_limit: Option<u32>,
-    ) -> MetaResult<HashMap<FragmentId, Vec<ActorId>>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .update_source_rate_limit_by_source_id(source_id, rate_limit)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let fragment_actors = mgr
-                    .catalog_controller
-                    .update_source_rate_limit_by_source_id(source_id as _, rate_limit)
-                    .await?;
-                Ok(fragment_actors
-                    .into_iter()
-                    .map(|(id, actors)| (id as _, actors.into_iter().map(|id| id as _).collect()))
-                    .collect())
-            }
-        }
+    ) -> MetaResult<HashMap<FragmentId, PbStreamNode>> {
+        self.catalog_controller
+            .update_source_rate_limit_by_source_id(source_id as _, rate_limit)
+            .await
     }
 
-    pub async fn update_mv_rate_limit_by_table_id(
+    pub async fn update_backfill_rate_limit_by_job_id(
+        &self,
+        job_id: JobId,
+        rate_limit: Option<u32>,
+    ) -> MetaResult<HashMap<FragmentId, PbStreamNode>> {
+        self.catalog_controller
+            .update_backfill_rate_limit_by_job_id(job_id, rate_limit)
+            .await
+    }
+
+    pub async fn update_sink_rate_limit_by_sink_id(
+        &self,
+        sink_id: SinkId,
+        rate_limit: Option<u32>,
+    ) -> MetaResult<HashMap<FragmentId, PbStreamNode>> {
+        self.catalog_controller
+            .update_sink_rate_limit_by_job_id(sink_id, rate_limit)
+            .await
+    }
+
+    pub async fn update_dml_rate_limit_by_job_id(
+        &self,
+        job_id: JobId,
+        rate_limit: Option<u32>,
+    ) -> MetaResult<HashMap<FragmentId, PbStreamNode>> {
+        self.catalog_controller
+            .update_dml_rate_limit_by_job_id(job_id, rate_limit)
+            .await
+    }
+
+    pub async fn update_sink_props_by_sink_id(
+        &self,
+        sink_id: SinkId,
+        props: BTreeMap<String, String>,
+    ) -> MetaResult<HashMap<String, String>> {
+        let new_props = self
+            .catalog_controller
+            .update_sink_props_by_sink_id(sink_id, props)
+            .await?;
+        Ok(new_props)
+    }
+
+    pub async fn update_iceberg_table_props_by_table_id(
         &self,
         table_id: TableId,
-        rate_limit: Option<u32>,
-    ) -> MetaResult<HashMap<FragmentId, Vec<ActorId>>> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .update_mv_rate_limit_by_table_id(table_id, rate_limit)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                let fragment_actors = mgr
-                    .catalog_controller
-                    .update_mv_rate_limit_by_job_id(table_id.table_id as _, rate_limit)
-                    .await?;
-                Ok(fragment_actors
-                    .into_iter()
-                    .map(|(id, actors)| (id as _, actors.into_iter().map(|id| id as _).collect()))
-                    .collect())
-            }
-        }
+        props: BTreeMap<String, String>,
+        alter_iceberg_table_props: Option<
+            risingwave_pb::meta::alter_connector_props_request::PbExtraOptions,
+        >,
+    ) -> MetaResult<(HashMap<String, String>, SinkId)> {
+        let (new_props, sink_id) = self
+            .catalog_controller
+            .update_iceberg_table_props_by_table_id(table_id, props, alter_iceberg_table_props)
+            .await?;
+        Ok((new_props, sink_id))
     }
 
-    pub async fn update_actor_splits_by_split_assignment(
+    pub async fn update_fragment_rate_limit_by_fragment_id(
+        &self,
+        fragment_id: FragmentId,
+        throttle_type: risingwave_pb::common::ThrottleType,
+        rate_limit: Option<u32>,
+    ) -> MetaResult<PbStreamNode> {
+        self.catalog_controller
+            .update_fragment_rate_limit_by_fragment_id(fragment_id as _, throttle_type, rate_limit)
+            .await
+    }
+
+    #[await_tree::instrument]
+    pub async fn update_fragment_splits(
         &self,
         split_assignment: &SplitAssignment,
     ) -> MetaResult<()> {
-        match self {
-            MetadataManager::V1(mgr) => {
-                mgr.fragment_manager
-                    .update_actor_splits_by_split_assignment(split_assignment)
-                    .await
-            }
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .update_actor_splits(split_assignment)
-                    .await
-            }
-        }
+        let fragment_splits = split_assignment
+            .iter()
+            .map(|(fragment_id, splits)| {
+                (
+                    *fragment_id as _,
+                    splits.values().flatten().cloned().collect_vec(),
+                )
+            })
+            .collect();
+
+        let inner = self.catalog_controller.inner.write().await;
+
+        self.catalog_controller
+            .update_fragment_splits(&inner.db, &fragment_splits)
+            .await
     }
 
-    #[expect(clippy::unused_async)]
     pub async fn get_mv_depended_subscriptions(
         &self,
-    ) -> MetaResult<HashMap<TableId, HashMap<u32, u64>>> {
-        // TODO(subscription): support the correct logic when supporting L0 log store subscriptions
-        Ok(HashMap::new())
+        database_id: Option<DatabaseId>,
+    ) -> MetaResult<HashMap<TableId, HashMap<SubscriptionId, u64>>> {
+        Ok(self
+            .catalog_controller
+            .get_mv_depended_subscriptions(database_id)
+            .await?
+            .into_iter()
+            .map(|(table_id, subscriptions)| {
+                (
+                    table_id,
+                    subscriptions
+                        .into_iter()
+                        .map(|(subscription_id, retention_time)| {
+                            (subscription_id as SubscriptionId, retention_time)
+                        })
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn get_job_max_parallelism(&self, job_id: JobId) -> MetaResult<usize> {
+        self.catalog_controller
+            .get_max_parallelism_by_id(job_id)
+            .await
+    }
+
+    pub async fn get_existing_job_resource_group(
+        &self,
+        streaming_job_id: JobId,
+    ) -> MetaResult<String> {
+        self.catalog_controller
+            .get_existing_job_resource_group(streaming_job_id)
+            .await
+    }
+
+    pub async fn get_database_resource_group(&self, database_id: DatabaseId) -> MetaResult<String> {
+        self.catalog_controller
+            .get_database_resource_group(database_id)
+            .await
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        self.cluster_controller.cluster_id()
+    }
+
+    pub async fn list_rate_limits(&self) -> MetaResult<Vec<RateLimitInfo>> {
+        let rate_limits = self.catalog_controller.list_rate_limits().await?;
+        Ok(rate_limits)
+    }
+
+    pub async fn get_job_backfill_scan_types(
+        &self,
+        job_id: JobId,
+    ) -> MetaResult<HashMap<FragmentId, PbStreamScanType>> {
+        let backfill_types = self
+            .catalog_controller
+            .get_job_fragment_backfill_scan_type(job_id)
+            .await?;
+        Ok(backfill_types)
+    }
+
+    /// Returns jobs containing a scan that cannot be rescheduled online.
+    pub async fn collect_online_unreschedulable_backfill_jobs(
+        &self,
+        job_ids: impl IntoIterator<Item = &JobId>,
+    ) -> MetaResult<HashSet<JobId>> {
+        let mut unreschedulable = HashSet::new();
+
+        for job_id in job_ids {
+            let scan_types = self
+                .catalog_controller
+                .get_job_fragment_backfill_scan_type(*job_id)
+                .await?;
+            if scan_types
+                .values()
+                .any(|scan_type| !scan_type.is_reschedulable(true))
+            {
+                unreschedulable.insert(*job_id);
+            }
+        }
+
+        Ok(unreschedulable)
+    }
+
+    pub async fn collect_reschedule_blocked_jobs_for_creating_jobs(
+        &self,
+        creating_job_ids: impl IntoIterator<Item = &JobId>,
+        is_online: bool,
+    ) -> MetaResult<HashSet<JobId>> {
+        let creating_job_ids: HashSet<_> = creating_job_ids.into_iter().copied().collect();
+        if creating_job_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let inner = self.catalog_controller.inner.read().await;
+        let txn = inner.db.begin().await?;
+
+        let mut initial_fragment_ids = HashSet::new();
+        for job_id in &creating_job_ids {
+            let scan_types = self
+                .catalog_controller
+                .get_job_fragment_backfill_scan_type_in_txn(&txn, *job_id)
+                .await?;
+            initial_fragment_ids.extend(scan_types.into_iter().filter_map(
+                |(fragment_id, scan_type)| {
+                    (!scan_type.is_reschedulable(is_online)).then_some(fragment_id)
+                },
+            ));
+        }
+
+        if !initial_fragment_ids.is_empty() {
+            let upstream_fragments = self
+                .catalog_controller
+                .upstream_fragments_in_txn(&txn, initial_fragment_ids.iter().copied())
+                .await?;
+            initial_fragment_ids.extend(upstream_fragments.into_values().flatten());
+        }
+
+        let mut blocked_fragment_ids = initial_fragment_ids.clone();
+        if !initial_fragment_ids.is_empty() {
+            let initial_fragment_ids = initial_fragment_ids.into_iter().collect_vec();
+            let ensembles =
+                find_fragment_no_shuffle_dags_detailed(&txn, &initial_fragment_ids).await?;
+            for ensemble in ensembles {
+                blocked_fragment_ids.extend(ensemble.fragments());
+            }
+        }
+
+        let mut blocked_job_ids = HashSet::new();
+        if !blocked_fragment_ids.is_empty() {
+            let fragment_ids = blocked_fragment_ids.into_iter().collect_vec();
+            let fragment_job_ids = self
+                .catalog_controller
+                .get_fragment_job_id_in_txn(&txn, fragment_ids)
+                .await?;
+            blocked_job_ids.extend(
+                fragment_job_ids
+                    .into_iter()
+                    .map(|job_id| job_id.as_job_id()),
+            );
+        }
+
+        txn.commit().await?;
+
+        Ok(blocked_job_ids)
+    }
+}
+
+impl MetadataManager {
+    /// Wait for job finishing notification in `TrackingJob::finish`.
+    /// The progress is updated per barrier.
+    #[await_tree::instrument]
+    pub async fn wait_streaming_job_finished(
+        &self,
+        database_id: DatabaseId,
+        id: JobId,
+    ) -> MetaResult<NotificationVersion> {
+        tracing::debug!("wait_streaming_job_finished: {id:?}");
+        let mut mgr = self.catalog_controller.get_inner_write_guard().await;
+        if mgr.streaming_job_is_finished(id).await? {
+            return Ok(self.catalog_controller.current_notification_version().await);
+        }
+        let (tx, rx) = oneshot::channel();
+
+        mgr.register_finish_notifier(database_id, id, tx);
+        drop(mgr);
+        rx.await
+            .map_err(|_| "no received reason".to_owned())
+            .and_then(|result| result)
+            .map_err(|reason| anyhow!("failed to wait streaming job finish: {}", reason).into())
+    }
+
+    pub(crate) async fn notify_finish_failed(&self, database_id: Option<DatabaseId>, err: String) {
+        let mut mgr = self.catalog_controller.get_inner_write_guard().await;
+        mgr.notify_finish_failed(database_id, err);
     }
 }

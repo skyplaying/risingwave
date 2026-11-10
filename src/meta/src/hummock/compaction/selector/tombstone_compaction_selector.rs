@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,40 +13,36 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use risingwave_common::catalog::TableOption;
-use risingwave_hummock_sdk::HummockCompactionTaskId;
+use risingwave_hummock_sdk::{CompactionGroupId, HummockCompactionTaskId};
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
 use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{
     TombstoneReclaimCompactionPicker, TombstoneReclaimPickerState,
 };
-use crate::hummock::compaction::{
-    create_compaction_task, create_overlap_strategy, CompactionDeveloperConfig, CompactionTask,
-    LocalSelectorStatistic,
-};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task, create_overlap_strategy};
 
 #[derive(Default)]
 pub struct TombstoneCompactionSelector {
-    state: HashMap<u64, TombstoneReclaimPickerState>,
+    state: HashMap<CompactionGroupId, TombstoneReclaimPickerState>,
 }
 
 impl CompactionSelector for TombstoneCompactionSelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        _selector_stats: &mut LocalSelectorStatistic,
-        _table_id_to_options: HashMap<u32, TableOption>,
-        developer_config: Arc<CompactionDeveloperConfig>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            developer_config,
+            in_progress_compactions,
+            ..
+        } = context;
         if group.compaction_config.tombstone_reclaim_ratio == 0 {
             // it might cause full-compaction when tombstone_reclaim_ratio == 0
             return None;
@@ -62,6 +58,11 @@ impl CompactionSelector for TombstoneCompactionSelector {
         );
         let state = self.state.entry(group.group_id).or_default();
         let compaction_input = picker.pick_compaction(levels, level_handlers, state)?;
+        if !compaction_input.skip_target_range_conflict_check
+            && in_progress_compactions.has_conflict_with_input(&compaction_input)
+        {
+            return None;
+        }
         compaction_input.add_pending_task(task_id, level_handlers);
 
         Some(create_compaction_task(

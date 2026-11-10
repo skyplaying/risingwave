@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,11 @@ use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_pb::stream_plan::ProjectSetNode;
 
 use super::*;
-use crate::executor::{ProjectSetExecutor, ProjectSetSelectItem};
+use crate::executor::project::{ProjectSetExecutor, ProjectSetSelectItem};
 
 pub struct ProjectSetExecutorBuilder;
+
+impl_stream_node_body!(ProjectSet(ProjectSetNode) => ProjectSetExecutorBuilder);
 
 impl ExecutorBuilder for ProjectSetExecutorBuilder {
     type Node = ProjectSetNode;
@@ -29,6 +31,8 @@ impl ExecutorBuilder for ProjectSetExecutorBuilder {
         node: &Self::Node,
         _store: impl StateStore,
     ) -> StreamResult<Executor> {
+        let chunk_size = params.config.developer.chunk_size;
+
         let [input]: [_; 1] = params.input.try_into().unwrap();
         let select_list: Vec<_> = node
             .get_select_list()
@@ -37,7 +41,7 @@ impl ExecutorBuilder for ProjectSetExecutorBuilder {
                 ProjectSetSelectItem::from_prost(
                     proto,
                     params.eval_error_report.clone(),
-                    params.env.config().developer.chunk_size,
+                    chunk_size,
                 )
             })
             .try_collect()?;
@@ -57,7 +61,6 @@ impl ExecutorBuilder for ProjectSetExecutorBuilder {
             .map(|idx| *idx as usize)
             .collect();
 
-        let chunk_size = params.env.config().developer.chunk_size;
         let exec = ProjectSetExecutor::new(
             params.actor_context,
             input,
@@ -65,6 +68,7 @@ impl ExecutorBuilder for ProjectSetExecutorBuilder {
             chunk_size,
             watermark_derivations,
             nondecreasing_expr_indices,
+            params.eval_error_report,
         );
         Ok((params.info, exec).into())
     }

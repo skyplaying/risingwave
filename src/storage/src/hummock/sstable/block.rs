@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,11 @@ use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::KeyComparator;
+use risingwave_hummock_sdk::key::{FullKey, TableKey};
 use serde::{Deserialize, Serialize};
 
-use super::utils::{bytes_diff_below_max_key_length, xxhash64_verify, CompressionAlgorithm};
+use super::utils::{CompressionAlgorithm, bytes_diff_below_max_key_length, xxhash64_verify};
 use crate::hummock::sstable::utils;
 use crate::hummock::sstable::utils::xxhash64_checksum;
 use crate::hummock::{HummockError, HummockResult};
@@ -143,7 +143,7 @@ impl RestartPoint {
 pub struct Block {
     /// Uncompressed entries data, with restart encoded restart points info.
     data: Bytes,
-    /// Uncompressed entried data length.
+    /// Uncompressed entries data length.
     data_len: usize,
 
     /// Table id of this block.
@@ -258,6 +258,51 @@ impl Block {
 
     pub fn decode_from_raw(buf: Bytes) -> Self {
         let table_id = (&buf[buf.len() - 4..]).get_u32_le();
+        let n_index = (&buf[buf.len() - 8..buf.len() - 4]).get_u32_le() as usize;
+        let index_start = buf.len() - 8 - n_index * RestartPoint::size_of();
+        let (index_entries, remainder) = buf[index_start..buf.len() - 8].as_chunks::<5>();
+        assert!(remainder.is_empty());
+        let mut index_entries = index_entries.iter();
+        let decode_index = |entry: &[u8; 5]| RestartPoint {
+            offset: u32::from_le_bytes(entry[..4].try_into().unwrap()),
+            key_len_type: LenType::from(entry[4] >> 4),
+            value_len_type: LenType::from(entry[4] & 0x0f),
+        };
+        let mut current = decode_index(index_entries.next().unwrap());
+        let mut next = index_entries.next().map(decode_index);
+        let n_restarts = (&buf[index_start - 4..index_start]).get_u32_le() as usize;
+        let data_len = index_start - 4 - n_restarts * size_of::<u32>();
+        let (offsets, remainder) = buf[data_len..index_start - 4].as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let mut restart_points = Vec::with_capacity(n_restarts);
+        for bytes in offsets {
+            let offset = u32::from_le_bytes(*bytes);
+            if let Some(entry) = next.as_ref()
+                && offset >= entry.offset
+            {
+                current = *entry;
+                next = index_entries.next().map(decode_index);
+            }
+            restart_points.push(RestartPoint {
+                offset,
+                key_len_type: current.key_len_type,
+                value_len_type: current.value_len_type,
+            });
+        }
+        Block {
+            data: buf,
+            data_len,
+            restart_points,
+            table_id: TableId::new(table_id),
+            hitmap: Hitmap::default(),
+        }
+    }
+
+    /// Original decoder retained only as a Criterion comparison control.
+    #[cfg(feature = "test")]
+    #[doc(hidden)]
+    pub fn decode_from_raw_legacy_for_bench(buf: Bytes) -> Self {
+        let table_id = (&buf[buf.len() - 4..]).get_u32_le();
         // decode restart_points_type_index
         let n_index = ((&buf[buf.len() - 8..buf.len() - 4]).get_u32_le()) as usize;
         let index_data_len = size_of::<u32>() + n_index * RestartPoint::size_of();
@@ -323,6 +368,13 @@ impl Block {
         self.data.len()
             + self.restart_points.capacity() * std::mem::size_of::<u32>()
             + std::mem::size_of::<u32>()
+    }
+
+    pub fn estimated_memory_weight(&self) -> usize {
+        size_of::<Self>()
+            + self.data.len()
+            + self.restart_points.capacity() * size_of::<RestartPoint>()
+            + Hitmap::<{ Self::HITMAP_ELEMS }>::bytes()
     }
 
     pub fn table_id(&self) -> TableId {
@@ -478,7 +530,7 @@ pub struct BlockBuilder {
     /// Compression algorithm.
     compression_algorithm: CompressionAlgorithm,
 
-    table_id: Option<u32>,
+    table_id: Option<TableId>,
     // restart_points_type_index stores only the restart_point corresponding to each type change,
     // as an index, in order to reduce space usage
     restart_points_type_index: Vec<RestartPoint>,
@@ -502,11 +554,11 @@ impl BlockBuilder {
         }
     }
 
-    pub fn add_for_test(&mut self, full_key: FullKey<&[u8]>, value: &[u8]) {
-        self.add(full_key, value);
-    }
-
-    /// Appends a kv pair to the block.
+    /// Appends a kv pair to the block using pre-encoded key.
+    ///
+    /// This method accepts a pre-encoded key (`table_key` + `epoch`, without `table_id`)
+    /// to avoid redundant encoding operations. This is useful when the caller
+    /// has already encoded the full key and wants to reuse it.
     ///
     /// NOTE: Key must be added in ASCEND order.
     ///
@@ -518,30 +570,48 @@ impl BlockBuilder {
     ///
     /// # Panics
     ///
-    /// Panic if key is not added in ASCEND order.
-    pub fn add(&mut self, full_key: FullKey<&[u8]>, value: &[u8]) {
-        let input_table_id = full_key.user_key.table_id.table_id();
+    /// Panic if key is not added in ASCEND order or `table_id` mismatch.
+    pub fn add(&mut self, table_id: TableId, encoded_key_without_table_id: &[u8], value: &[u8]) {
         match self.table_id {
-            Some(current_table_id) => debug_assert_eq!(current_table_id, input_table_id),
+            Some(current_table_id) => assert_eq!(current_table_id, table_id),
+            None => self.table_id = Some(table_id),
+        }
+        #[cfg(debug_assertions)]
+        self.debug_valid();
+
+        // Call the core implementation with the pre-encoded key
+        self.add_encoded_impl(encoded_key_without_table_id, value);
+    }
+
+    #[cfg(any(test, feature = "test"))]
+    pub fn add_for_test(&mut self, full_key: FullKey<&[u8]>, value: &[u8]) {
+        use risingwave_hummock_sdk::key::TABLE_PREFIX_LEN;
+        let input_table_id = full_key.user_key.table_id;
+        match self.table_id {
+            Some(current_table_id) => assert_eq!(current_table_id, input_table_id),
             None => self.table_id = Some(input_table_id),
         }
         #[cfg(debug_assertions)]
         self.debug_valid();
 
         let mut key: BytesMut = Default::default();
-        full_key.encode_into_without_table_id(&mut key);
+        full_key.encode_into(&mut key);
+
+        // Slice off the table_id prefix to get the key without table_id
+        let encoded_key_without_table_id = &key[TABLE_PREFIX_LEN..];
+
+        // Call the core implementation with encoded key
+        self.add_encoded_impl(encoded_key_without_table_id, value);
+    }
+
+    /// Core implementation that accepts pre-encoded key.
+    /// This is used by both `add` and `add_for_test` to avoid code duplication.
+    fn add_encoded_impl(&mut self, key: &[u8], value: &[u8]) {
         if self.entry_count > 0 {
             debug_assert!(!key.is_empty());
             debug_assert_eq!(
-                KeyComparator::compare_encoded_full_key(&self.last_key[..], &key[..]),
+                KeyComparator::compare_encoded_full_key(&self.last_key[..], key),
                 Ordering::Less,
-                "epoch: {}, table key: {}",
-                full_key.epoch_with_gap.pure_epoch(),
-                u64::from_be_bytes(
-                    full_key.user_key.table_key.as_ref()[0..8]
-                        .try_into()
-                        .unwrap()
-                ),
             );
         }
         // Update restart point if needed and calculate diff key.
@@ -559,7 +629,7 @@ impl BlockBuilder {
             true
         };
 
-        let diff_key = if self.entry_count % self.restart_count == 0 || type_mismatch {
+        let diff_key = if self.entry_count.is_multiple_of(self.restart_count) || type_mismatch {
             let offset = utils::checked_into_u32(self.buf.len()).unwrap_or_else(|_| {
                 panic!(
                     "WARN overflow can't convert buf_len {} into u32 table {:?}",
@@ -578,9 +648,9 @@ impl BlockBuilder {
                 });
             }
 
-            key.as_ref()
+            key
         } else {
-            bytes_diff_below_max_key_length(&self.last_key, &key[..])
+            bytes_diff_below_max_key_length(&self.last_key, key)
         };
 
         let prefix = KeyPrefix::new_without_len(
@@ -595,7 +665,7 @@ impl BlockBuilder {
         self.buf.put_slice(value);
 
         self.last_key.clear();
-        self.last_key.extend_from_slice(&key);
+        self.last_key.extend_from_slice(key);
         self.entry_count += 1;
     }
 
@@ -686,7 +756,7 @@ impl BlockBuilder {
             }),
         );
 
-        self.buf.put_u32_le(self.table_id.unwrap());
+        self.buf.put_u32_le(self.table_id.unwrap().as_raw_id());
         let result_buf = if self.compression_algorithm != CompressionAlgorithm::None {
             self.compress_buf.clear();
             self.compress_buf = Self::compress(
@@ -802,13 +872,77 @@ impl BlockBuilder {
         }
     }
 
-    pub fn table_id(&self) -> Option<u32> {
+    pub fn table_id(&self) -> Option<TableId> {
         self.table_id
     }
 
     fn buf_reserve_size(option: &BlockBuilderOptions) -> usize {
         option.capacity + 1024 + 256
     }
+}
+
+/// Attempts to shorten `block_smallest` key while preserving block boundary correctness.
+///
+/// Returns a shortened key if `prev_block_last < shortened <= block_smallest` can be satisfied
+/// with fewer bytes. This reduces block metadata size by exploiting common prefixes between
+/// adjacent blocks.
+///
+/// Returns `None` if the key cannot be shortened (e.g., keys differ only in the last byte).
+pub fn try_shorten_block_smallest_key(
+    prev_block_last: &FullKey<&[u8]>,
+    block_smallest: &FullKey<&[u8]>,
+) -> Option<FullKey<Vec<u8>>> {
+    /// Returns the length of the longest common prefix between two byte slices.
+    fn lcp_len(a: &[u8], b: &[u8]) -> usize {
+        let min_len = a.len().min(b.len());
+        for i in 0..min_len {
+            if a[i] != b[i] {
+                return i;
+            }
+        }
+        min_len
+    }
+
+    let prev_table_key = prev_block_last.user_key.table_key.as_ref();
+    let next_table_key = block_smallest.user_key.table_key.as_ref();
+    assert_eq!(
+        prev_block_last.user_key.table_id, block_smallest.user_key.table_id,
+        "table ids must match for shortening block smallest key"
+    );
+
+    let lcp = lcp_len(prev_table_key, next_table_key);
+
+    // Shortened key = LCP prefix + first differing byte.
+    // Only shorten if the result is strictly shorter than next_table_key.
+    let shortened_len = lcp + 1;
+    if shortened_len >= next_table_key.len() {
+        return None;
+    }
+
+    // Build candidate key: take LCP + 1 bytes from block_smallest
+    let cand = FullKey::new_with_gap_epoch(
+        block_smallest.user_key.table_id,
+        TableKey(&next_table_key[..shortened_len]),
+        block_smallest.epoch_with_gap,
+    );
+
+    // Invariant: prev_block_last < cand <= block_smallest
+    // This must hold by construction. If violated, it indicates a bug in the shortening logic.
+    // Use assert! (not debug_assert!) to fail fast and prevent writing incorrect keys to storage.
+    assert!(
+        prev_block_last.cmp(&cand).is_lt(),
+        "Invariant violated: prev_block_last >= cand. prev={:?}, cand={:?}",
+        prev_block_last,
+        cand
+    );
+    assert!(
+        cand.cmp(block_smallest).is_le(),
+        "Invariant violated: cand > block_smallest. cand={:?}, block_smallest={:?}",
+        cand,
+        block_smallest
+    );
+
+    Some(cand.copy_into())
 }
 
 #[cfg(test)]
@@ -1053,5 +1187,121 @@ mod tests {
         assert_eq!(block.data_len, blk.data_len);
         assert_eq!(block.table_id, blk.table_id,);
         assert_eq!(block.restart_points, blk.restart_points);
+    }
+
+    #[test]
+    fn test_try_shorten_block_smallest_key() {
+        use risingwave_hummock_sdk::EpochWithGap;
+
+        fn make_full_key(table_id: u32, table_key: &[u8], epoch: u64) -> FullKey<&[u8]> {
+            FullKey::new_with_gap_epoch(
+                TableId::new(table_id),
+                TableKey(table_key),
+                EpochWithGap::new_from_epoch(test_epoch(epoch)),
+            )
+        }
+
+        /// Verifies the invariant: prev < shortened <= next using `FullKey::cmp`
+        fn assert_invariant(
+            prev: &FullKey<&[u8]>,
+            shortened: &FullKey<Vec<u8>>,
+            next: &FullKey<&[u8]>,
+        ) {
+            assert!(
+                prev.cmp(&shortened.to_ref()).is_lt(),
+                "Invariant violated: prev >= shortened. prev={:?}, shortened={:?}",
+                prev,
+                shortened
+            );
+            assert!(
+                shortened.to_ref().cmp(next).is_le(),
+                "Invariant violated: shortened > next. shortened={:?}, next={:?}",
+                shortened,
+                next
+            );
+        }
+
+        // Case 1: Basic shortening - prev="abc", next="abdef" -> cand="abd"
+        {
+            let prev = make_full_key(1, b"abc", 100);
+            let next = make_full_key(1, b"abdef", 100);
+            let result = try_shorten_block_smallest_key(&prev, &next);
+            assert!(result.is_some());
+            let shortened = result.unwrap();
+            assert_eq!(shortened.user_key.table_key.as_ref(), b"abd");
+            assert_invariant(&prev, &shortened, &next);
+        }
+
+        // Case 2: Prefix case - prev="ab", next="abcd" -> cand="abc"
+        {
+            let prev = make_full_key(1, b"ab", 100);
+            let next = make_full_key(1, b"abcd", 100);
+            let result = try_shorten_block_smallest_key(&prev, &next);
+            assert!(result.is_some());
+            let shortened = result.unwrap();
+            assert_eq!(shortened.user_key.table_key.as_ref(), b"abc");
+            assert_invariant(&prev, &shortened, &next);
+        }
+
+        // Case 3: Cannot shorten - only 1 char difference at end
+        {
+            let prev = make_full_key(1, b"abc", 100);
+            let next = make_full_key(1, b"abd", 100);
+            assert!(try_shorten_block_smallest_key(&prev, &next).is_none());
+        }
+
+        // Case 4: Cannot shorten - next is only 1 char longer than LCP
+        {
+            let prev = make_full_key(1, b"abc", 100);
+            let next = make_full_key(1, b"abcd", 100);
+            assert!(try_shorten_block_smallest_key(&prev, &next).is_none());
+        }
+
+        // Case 5: Same table_key, different epoch - cannot shorten
+        {
+            let prev = make_full_key(1, b"abc", 200);
+            let next = make_full_key(1, b"abc", 100);
+            assert!(try_shorten_block_smallest_key(&prev, &next).is_none());
+        }
+
+        // Case 7: Single char keys - cannot shorten
+        {
+            let prev = make_full_key(1, b"a", 100);
+            let next = make_full_key(1, b"b", 100);
+            assert!(try_shorten_block_smallest_key(&prev, &next).is_none());
+        }
+
+        // Case 8: Long common prefix with divergence
+        {
+            let prev = make_full_key(1, b"hello_world_abc", 100);
+            let next = make_full_key(1, b"hello_world_xyz123", 100);
+            let result = try_shorten_block_smallest_key(&prev, &next);
+            assert!(result.is_some());
+            let shortened = result.unwrap();
+            assert_eq!(shortened.user_key.table_key.as_ref(), b"hello_world_x");
+            assert_invariant(&prev, &shortened, &next);
+        }
+
+        // Case 9: Empty common prefix (completely different keys)
+        {
+            let prev = make_full_key(1, b"aaa", 100);
+            let next = make_full_key(1, b"bbbccc", 100);
+            let result = try_shorten_block_smallest_key(&prev, &next);
+            assert!(result.is_some());
+            let shortened = result.unwrap();
+            assert_eq!(shortened.user_key.table_key.as_ref(), b"b");
+            assert_invariant(&prev, &shortened, &next);
+        }
+
+        // Case 10: Minimal shortening - next is exactly 2 chars longer than LCP
+        {
+            let prev = make_full_key(1, b"abc", 100);
+            let next = make_full_key(1, b"abcde", 100);
+            let result = try_shorten_block_smallest_key(&prev, &next);
+            assert!(result.is_some());
+            let shortened = result.unwrap();
+            assert_eq!(shortened.user_key.table_key.as_ref(), b"abcd");
+            assert_invariant(&prev, &shortened, &next);
+        }
     }
 }

@@ -19,14 +19,28 @@ use async_trait::async_trait;
 
 use crate::sink::log_store::{LogStoreReadItem, TruncateOffset};
 use crate::sink::writer::SinkWriter;
-use crate::sink::{LogSinker, Result, SinkLogReader, SinkMetrics};
+use crate::sink::{LogSinker, Result, SinkLogReader, SinkWriterMetrics};
+
+pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE: u64 = 10;
+pub const DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITHOUT_SINK_DECOUPLE: u64 = 1;
+
+pub const ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL: u64 = 60;
+pub const COMMIT_CHECKPOINT_INTERVAL: &str = "commit_checkpoint_interval";
+
+pub fn default_commit_checkpoint_interval() -> u64 {
+    DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+}
+
+pub fn iceberg_default_commit_checkpoint_interval() -> u64 {
+    ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL
+}
 
 /// The `LogSinker` implementation used for commit-decoupled sinks (such as `Iceberg`, `DeltaLake` and `StarRocks`).
 /// The concurrent/frequent commit capability of these sinks is poor, so by leveraging the decoupled log reader,
 /// we delay the checkpoint barrier to make commits less frequent.
 pub struct DecoupleCheckpointLogSinkerOf<W> {
     writer: W,
-    sink_metrics: SinkMetrics,
+    sink_writer_metrics: SinkWriterMetrics,
     commit_checkpoint_interval: NonZeroU64,
 }
 
@@ -35,22 +49,30 @@ impl<W> DecoupleCheckpointLogSinkerOf<W> {
     /// decouple log reader `KvLogStoreReader`.
     pub fn new(
         writer: W,
-        sink_metrics: SinkMetrics,
+        sink_writer_metrics: SinkWriterMetrics,
         commit_checkpoint_interval: NonZeroU64,
     ) -> Self {
         DecoupleCheckpointLogSinkerOf {
             writer,
-            sink_metrics,
+            sink_writer_metrics,
             commit_checkpoint_interval,
         }
     }
 }
 
+pub(crate) fn should_force_commit_on_checkpoint_barrier(
+    vnode_bitmap_updated: bool,
+    is_stop: bool,
+    has_schema_change: bool,
+) -> bool {
+    vnode_bitmap_updated || is_stop || has_schema_change
+}
+
 #[async_trait]
 impl<W: SinkWriter<CommitMetadata = ()>> LogSinker for DecoupleCheckpointLogSinkerOf<W> {
-    async fn consume_log_and_sink(self, log_reader: &mut impl SinkLogReader) -> Result<()> {
+    async fn consume_log_and_sink(self, mut log_reader: impl SinkLogReader) -> Result<!> {
         let mut sink_writer = self.writer;
-        let sink_metrics = self.sink_metrics;
+        log_reader.start_from(None).await?;
         #[derive(Debug)]
         enum LogConsumerState {
             /// Mark that the log consumer is not initialized yet
@@ -67,19 +89,10 @@ impl<W: SinkWriter<CommitMetadata = ()>> LogSinker for DecoupleCheckpointLogSink
 
         let mut current_checkpoint: u64 = 0;
         let commit_checkpoint_interval = self.commit_checkpoint_interval;
+        let sink_writer_metrics = self.sink_writer_metrics;
 
         loop {
             let (epoch, item): (u64, LogStoreReadItem) = log_reader.next_item().await?;
-            if let LogStoreReadItem::UpdateVnodeBitmap(_) = &item {
-                match &state {
-                    LogConsumerState::BarrierReceived { .. } => {}
-                    _ => unreachable!(
-                        "update vnode bitmap can be accepted only right after \
-                    barrier, but current state is {:?}",
-                        state
-                    ),
-                }
-            }
             // begin_epoch when not previously began
             state = match state {
                 LogConsumerState::Uninitialized => {
@@ -95,13 +108,14 @@ impl<W: SinkWriter<CommitMetadata = ()>> LogSinker for DecoupleCheckpointLogSink
                     );
                     LogConsumerState::EpochBegun { curr_epoch: epoch }
                 }
-                LogConsumerState::BarrierReceived { prev_epoch } => {
+                LogConsumerState::BarrierReceived { prev_epoch, .. } => {
                     assert!(
                         epoch > prev_epoch,
                         "new epoch {} should be greater than prev epoch {}",
                         epoch,
                         prev_epoch
                     );
+
                     sink_writer.begin_epoch(epoch).await?;
                     LogConsumerState::EpochBegun { curr_epoch: epoch }
                 }
@@ -113,33 +127,64 @@ impl<W: SinkWriter<CommitMetadata = ()>> LogSinker for DecoupleCheckpointLogSink
                         return Err(e);
                     }
                 }
-                LogStoreReadItem::Barrier { is_checkpoint } => {
+                LogStoreReadItem::Barrier {
+                    is_checkpoint,
+                    new_vnode_bitmap,
+                    is_stop,
+                    schema_change,
+                } => {
                     let prev_epoch = match state {
                         LogConsumerState::EpochBegun { curr_epoch } => curr_epoch,
                         _ => unreachable!("epoch must have begun before handling barrier"),
                     };
                     if is_checkpoint {
                         current_checkpoint += 1;
-                        if current_checkpoint >= commit_checkpoint_interval.get() {
+                        if current_checkpoint >= commit_checkpoint_interval.get()
+                            || should_force_commit_on_checkpoint_barrier(
+                                new_vnode_bitmap.is_some(),
+                                is_stop,
+                                schema_change.is_some(),
+                            )
+                        {
                             let start_time = Instant::now();
                             sink_writer.barrier(true).await?;
-                            sink_metrics
-                                .sink_commit_duration_metrics
-                                .observe(start_time.elapsed().as_millis() as f64);
+                            sink_writer_metrics
+                                .sink_commit_duration
+                                .observe(start_time.elapsed().as_secs_f64());
                             log_reader.truncate(TruncateOffset::Barrier { epoch })?;
+
                             current_checkpoint = 0;
                         } else {
                             sink_writer.barrier(false).await?;
                         }
                     } else {
+                        assert!(new_vnode_bitmap.is_none());
                         sink_writer.barrier(false).await?;
                     }
                     state = LogConsumerState::BarrierReceived { prev_epoch }
                 }
-                LogStoreReadItem::UpdateVnodeBitmap(vnode_bitmap) => {
-                    sink_writer.update_vnode_bitmap(vnode_bitmap).await?;
-                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_force_commit_on_checkpoint_barrier;
+
+    #[test]
+    fn test_should_force_commit_on_checkpoint_barrier() {
+        assert!(!should_force_commit_on_checkpoint_barrier(
+            false, false, false
+        ));
+        assert!(should_force_commit_on_checkpoint_barrier(
+            true, false, false
+        ));
+        assert!(should_force_commit_on_checkpoint_barrier(
+            false, true, false
+        ));
+        assert!(should_force_commit_on_checkpoint_barrier(
+            false, false, true
+        ));
     }
 }

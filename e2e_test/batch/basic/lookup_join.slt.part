@@ -16,6 +16,8 @@ insert into t2 values (1, 3), (1, 5), (4, 10);
 statement ok
 create materialized view t3 as select v1, count(*) as v2 from t2 group by v1;
 
+sleep 1s
+
 query IIII
 select * from t1 left join t3 on t1.v1 = t3.v1 order by t1.v1, t1.v2;
 ----
@@ -78,6 +80,8 @@ insert into t2 values ('do', 'gww'), ('f', 'flow'), ('hi', 'hello');
 statement ok
 create materialized view t3 as select count(*) as v1, v2 from t2 group by v2;
 
+sleep 1s
+
 query IIII
 select * from t1 left join t3 on t1.v2 = t3.v2;
 ----
@@ -136,6 +140,8 @@ create table t5 (v1 decimal);
 statement ok
 create materialized view t6 as select v1, count(*) as v2 from t5 group by v1;
 
+sleep 1s
+
 statement ok
 insert into t1 values (2);
 
@@ -193,6 +199,8 @@ create table t2 (v1 int);
 statement ok
 create materialized view t3 as select v1 from t2 group by v1;
 
+sleep 1s
+
 statement ok
 insert into t1 values (null);
 
@@ -233,6 +241,8 @@ create table t2(c int, d int);
 statement ok
 create index idx on t2(c) include(d);
 
+sleep 1s
+
 statement ok
 insert into t1 values (1,222);
 
@@ -261,6 +271,8 @@ create table t (v int);
 statement ok
 create materialized view mv as select v from t order by v limit 10;
 
+sleep 1s
+
 statement ok
 insert into t values (1);
 
@@ -271,6 +283,37 @@ select mv1.v from mv mv1, mv mv2 where mv1.v = mv2.v;
 
 statement ok
 drop materialized view mv;
+
+statement ok
+drop table t;
+
+# Lookup join on a lookup table with singleton distribution (e.g. a topN materialized view).
+statement ok
+create table t (a int, b int);
+
+statement ok
+create materialized view mv_singleton as select a, b from t order by a limit 100;
+
+sleep 1s
+
+statement ok
+insert into t values (1, 10), (2, 20), (3, 30);
+
+query IIII
+select * from t join mv_singleton on t.a = mv_singleton.a order by t.a;
+----
+1 10 1 10
+2 20 2 20
+3 30 3 30
+
+query IIII
+select * from t left join mv_singleton on t.a = mv_singleton.a where t.a > 1 order by t.a;
+----
+2 20 2 20
+3 30 3 30
+
+statement ok
+drop materialized view mv_singleton;
 
 statement ok
 drop table t;

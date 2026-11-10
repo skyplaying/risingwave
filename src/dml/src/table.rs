@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use futures_async_stream::try_stream;
@@ -23,7 +24,7 @@ use risingwave_common::transaction::transaction_message::TxnMsg;
 use tokio::sync::oneshot;
 
 use crate::error::{DmlError, Result};
-use crate::txn_channel::{txn_channel, Receiver, Sender};
+use crate::txn_channel::{Receiver, Sender, txn_channel};
 
 pub type TableDmlHandleRef = Arc<TableDmlHandle>;
 
@@ -189,9 +190,24 @@ impl WriteHandle {
         assert_eq!(self.txn_state, TxnState::Begin);
         self.txn_state = TxnState::Committed;
         // Await the notifier.
-        let notifier = self.write_txn_control_msg(TxnMsg::End(self.txn_id))?;
+        let notifier = self.write_txn_control_msg(TxnMsg::End(self.txn_id, None))?;
         notifier.await.map_err(|_| DmlError::ReaderClosed)?;
         Ok(())
+    }
+
+    /// Like `end`, but waits until the data has been durably persisted before returning.
+    /// The `DmlExecutor` fires the persistence signal after `try_wait_epoch` succeeds.
+    pub fn end_wait_persistence(mut self) -> Result<impl Future<Output = Result<()>> + 'static> {
+        assert_eq!(self.txn_state, TxnState::Begin);
+        self.txn_state = TxnState::Committed;
+        let (persistence_tx, persistence_rx) = oneshot::channel();
+        let notifier =
+            self.write_txn_control_msg(TxnMsg::End(self.txn_id, Some(persistence_tx)))?;
+        Ok(async move {
+            notifier.await.map_err(|_| DmlError::ReaderClosed)?;
+            persistence_rx.await.map_err(|_| DmlError::ReaderClosed)?;
+            Ok(())
+        })
     }
 
     pub fn rollback(mut self) -> Result<oneshot::Receiver<usize>> {
@@ -252,7 +268,7 @@ impl TableStreamReader {
         while let Some((txn_msg, notifier)) = self.rx.recv().await {
             // Notify about that we've taken the chunk.
             match txn_msg {
-                TxnMsg::Begin(_) | TxnMsg::End(_) | TxnMsg::Rollback(_) => {
+                TxnMsg::Begin(_) | TxnMsg::End(..) | TxnMsg::Rollback(_) => {
                     _ = notifier.send(0);
                 }
                 TxnMsg::Data(_, chunk) => {
@@ -268,7 +284,7 @@ impl TableStreamReader {
         while let Some((txn_msg, notifier)) = self.rx.recv().await {
             // Notify about that we've taken the chunk.
             match &txn_msg {
-                TxnMsg::Begin(_) | TxnMsg::End(_) | TxnMsg::Rollback(_) => {
+                TxnMsg::Begin(_) | TxnMsg::End(..) | TxnMsg::Rollback(_) => {
                     _ = notifier.send(0);
                     yield txn_msg;
                 }
@@ -343,7 +359,7 @@ mod tests {
             write_handle.end().await.unwrap();
         });
 
-        assert_matches!(reader.next().await.unwrap()?, TxnMsg::End(_));
+        assert_matches!(reader.next().await.unwrap()?, TxnMsg::End(..));
 
         Ok(())
     }
@@ -370,6 +386,30 @@ mod tests {
         // Rollback on drop
         drop(write_handle);
         assert_matches!(reader.next().await.unwrap()?, TxnMsg::Rollback(_));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_end_wait_persistence() -> Result<()> {
+        let table_dml_handle = Arc::new(new_table_dml_handle());
+        let mut reader = table_dml_handle.stream_reader().into_stream();
+        let mut write_handle = table_dml_handle
+            .write_handle(TEST_SESSION_ID, TEST_TRANSACTION_ID)
+            .unwrap();
+        write_handle.begin().unwrap();
+
+        assert_matches!(reader.next().await.unwrap()?, TxnMsg::Begin(_));
+
+        let handle = tokio::spawn(async move {
+            write_handle.end_wait_persistence().unwrap().await.unwrap();
+        });
+
+        assert_matches!(reader.next().await.unwrap()?, TxnMsg::End(_, Some(persistence_notifier)) => {
+            persistence_notifier.send(()).unwrap();
+        });
+
+        handle.await.unwrap();
 
         Ok(())
     }

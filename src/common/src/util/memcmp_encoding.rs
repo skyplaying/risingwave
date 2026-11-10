@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,11 @@ use risingwave_common_estimate_size::EstimateSize;
 use serde::{Deserialize, Serialize};
 
 use super::iter_util::{ZipEqDebug, ZipEqFast};
-use crate::array::{ArrayImpl, DataChunk};
+use crate::array::{ArrayImpl, DataChunk, VectorItemType};
 use crate::row::{OwnedRow, Row};
 use crate::types::{
-    DataType, Date, Datum, Int256, ScalarImpl, Serial, Time, Timestamp, Timestamptz, ToDatumRef,
-    F32, F64,
+    DataType, Date, Datum, F32, F64, Int256, ScalarImpl, Serial, Time, Timestamp, Timestamptz,
+    ToDatumRef,
 };
 use crate::util::sort_util::{ColumnOrder, OrderType};
 
@@ -151,9 +151,10 @@ fn calculate_encoded_size_inner(
                 deserializer.deserialize_decimal()?;
                 0 // the len is not used since decimal is not a fixed length type
             }
-            // these two types is var-length and should only be determine at runtime.
+            // these types are var-length and should only be determine at runtime.
             // TODO: need some test for this case (e.g. e2e test)
-            DataType::List { .. } => deserializer.skip_bytes()?,
+            DataType::List { .. } | DataType::Map(_) => deserializer.skip_bytes()?,
+            DataType::Vector(d) => d * size_of::<VectorItemType>(),
             DataType::Struct(t) => t
                 .types()
                 .map(|field| {
@@ -167,6 +168,7 @@ fn calculate_encoded_size_inner(
                 })
                 .try_fold(0, |a, b| b.map(|b| a + b))?,
             DataType::Jsonb => deserializer.skip_bytes()?,
+            DataType::Variant => deserializer.skip_bytes()?,
             DataType::Varchar => deserializer.skip_bytes()?,
             DataType::Bytea => deserializer.skip_bytes()?,
             DataType::Int256 => Int256::MEMCMP_ENCODED_SIZE,
@@ -333,7 +335,7 @@ pub fn decode_row(
 mod tests {
     use std::ops::Neg;
 
-    use rand::thread_rng;
+    use rand::rng as thread_rng;
 
     use super::*;
     use crate::array::{ListValue, StructValue};
@@ -543,7 +545,7 @@ mod tests {
         use rand::seq::SliceRandom;
 
         fn serialize(f: F32) -> MemcmpEncoded {
-            encode_value(&Some(ScalarImpl::from(f)), OrderType::default()).unwrap()
+            encode_value(Some(ScalarImpl::from(f)), OrderType::default()).unwrap()
         }
 
         fn deserialize(data: MemcmpEncoded) -> F32 {

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lint_reasons)]
-#![feature(let_chains)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
 mod server;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use educe::Educe;
 pub use error::{MetaError, MetaResult};
 use redact::Secret;
 use risingwave_common::config::OverrideConfig;
+use risingwave_common::license::LicenseKey;
+use risingwave_common::system_param::StateStoreUrl;
 use risingwave_common::util::meta_addr::MetaAddressStrategy;
 use risingwave_common::util::resource_util;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
 use risingwave_common::{GIT_SHA, RW_VERSION};
 use risingwave_common_heap_profiling::HeapProfiler;
+use risingwave_meta::barrier::snapshot_backfill_max_pending_barrier_num;
 use risingwave_meta::*;
 use risingwave_meta_service::*;
-pub use rpc::{ElectionClient, ElectionMember, EtcdElectionClient};
+use risingwave_sqlparser::ast::SqlOptionRedaction;
+pub use rpc::{ElectionClient, ElectionMember};
 use server::rpc_serve;
 pub use server::started::get as is_server_started;
 
 use crate::manager::MetaOpts;
 
-#[derive(Debug, Clone, Parser, OverrideConfig)]
+#[derive(Educe, Clone, Parser, OverrideConfig)]
+#[educe(Debug)]
 #[command(version, about = "The central metadata management service")]
 pub struct MetaNodeOpts {
     // TODO: use `SocketAddr`
@@ -47,7 +53,7 @@ pub struct MetaNodeOpts {
     /// This would be synonymous with the service's "public address"
     /// or "identifying address".
     /// It will serve as a unique identifier in cluster
-    /// membership and leader election. Must be specified for etcd backend.
+    /// membership and leader election. Must be specified for meta backend.
     #[clap(long, env = "RW_ADVERTISE_ADDR", default_value = "127.0.0.1:5690")]
     pub advertise_addr: String,
 
@@ -59,24 +65,26 @@ pub struct MetaNodeOpts {
     #[clap(long, env = "RW_PROMETHEUS_HOST", alias = "prometheus-host")]
     pub prometheus_listener_addr: Option<String>,
 
-    #[clap(long, hide = true, env = "RW_ETCD_ENDPOINTS", default_value_t = String::from(""))]
-    pub etcd_endpoints: String,
-
-    /// Enable authentication with etcd. By default disabled.
-    #[clap(long, hide = true, env = "RW_ETCD_AUTH")]
-    pub etcd_auth: bool,
-
-    /// Username of etcd, required when --etcd-auth is enabled.
-    #[clap(long, hide = true, env = "RW_ETCD_USERNAME", default_value = "")]
-    pub etcd_username: String,
-
-    /// Password of etcd, required when --etcd-auth is enabled.
-    #[clap(long, hide = true, env = "RW_ETCD_PASSWORD", default_value = "")]
-    pub etcd_password: Secret<String>,
-
     /// Endpoint of the SQL service, make it non-option when SQL service is required.
     #[clap(long, hide = true, env = "RW_SQL_ENDPOINT")]
     pub sql_endpoint: Option<Secret<String>>,
+
+    /// Username of sql backend, required when meta backend set to MySQL or PostgreSQL.
+    #[clap(long, hide = true, env = "RW_SQL_USERNAME", default_value = "")]
+    pub sql_username: String,
+
+    /// Password of sql backend, required when meta backend set to MySQL or PostgreSQL.
+    #[clap(long, hide = true, env = "RW_SQL_PASSWORD", default_value = "")]
+    pub sql_password: Secret<String>,
+
+    /// Database of sql backend, required when meta backend set to MySQL or PostgreSQL.
+    #[clap(long, hide = true, env = "RW_SQL_DATABASE", default_value = "")]
+    pub sql_database: String,
+
+    /// Params for the URL connection, such as `sslmode=disable`.
+    /// Example: `param1=value1&param2=value2`
+    #[clap(long, hide = true, env = "RW_SQL_URL_PARAMS")]
+    pub sql_url_params: Option<String>,
 
     /// The HTTP REST-API address of the Prometheus instance associated to this cluster.
     /// This address is used to serve `PromQL` queries to Prometheus.
@@ -127,7 +135,7 @@ pub struct MetaNodeOpts {
     #[override_opts(path = system.block_size_kb)]
     pub block_size_kb: Option<u32>,
 
-    /// False positive probability of bloom filter.
+    /// Deprecated: Bloom filter is no longer a supported SST filter implementation.
     #[clap(long, hide = true, env = "RW_BLOOM_FALSE_POSITIVE")]
     #[override_opts(path = system.bloom_false_positive)]
     pub bloom_false_positive: Option<f64>,
@@ -135,7 +143,7 @@ pub struct MetaNodeOpts {
     /// State store url
     #[clap(long, hide = true, env = "RW_STATE_STORE")]
     #[override_opts(path = system.state_store)]
-    pub state_store: Option<String>,
+    pub state_store: Option<StateStoreUrl>,
 
     /// Remote directory for storing data and metadata objects.
     #[clap(long, hide = true, env = "RW_DATA_DIRECTORY")]
@@ -171,6 +179,34 @@ pub struct MetaNodeOpts {
     #[deprecated = "connector node has been deprecated."]
     #[clap(long, hide = true, env = "RW_CONNECTOR_RPC_ENDPOINT")]
     pub connector_rpc_endpoint: Option<String>,
+
+    /// The license key to activate enterprise features.
+    #[clap(long, hide = true, env = "RW_LICENSE_KEY")]
+    #[override_opts(path = system.license_key)]
+    pub license_key: Option<LicenseKey>,
+
+    /// The path of the license key file to be watched and hot-reloaded.
+    #[clap(long, env = "RW_LICENSE_KEY_PATH")]
+    pub license_key_path: Option<PathBuf>,
+
+    /// 128-bit AES key for secret store in HEX format.
+    #[clap(long, hide = true, env = "RW_SECRET_STORE_PRIVATE_KEY_HEX")]
+    pub secret_store_private_key_hex: Option<Secret<String>>,
+
+    /// The path of the temp secret file directory.
+    #[clap(
+        long,
+        hide = true,
+        env = "RW_TEMP_SECRET_FILE_DIR",
+        default_value = "./secrets"
+    )]
+    pub temp_secret_file_dir: String,
+
+    /// Address of the serverless backfill controller.
+    /// Needed if meta receives a streaming job with serverless backfill enabled.
+    /// Feature disabled by default.
+    #[clap(long, env = "RW_SBC_ADDR", default_value = "")]
+    pub serverless_backfill_controller_addr: String,
 }
 
 impl risingwave_common::opts::Opts for MetaNodeOpts {
@@ -187,12 +223,16 @@ impl risingwave_common::opts::Opts for MetaNodeOpts {
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use risingwave_common::config::{load_config, MetaBackend, RwConfig};
+use risingwave_common::config::{MetaBackend, RwConfig, load_config};
 use tracing::info;
 
 /// Start meta node
-pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+pub fn start(
+    opts: MetaNodeOpts,
+    shutdown: CancellationToken,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     // WARNING: don't change the function signature. Making it `async fn` will cause
     // slow compile in release mode.
     Box::pin(async move {
@@ -204,31 +244,70 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let listen_addr = opts.listen_addr.parse().unwrap();
         let dashboard_addr = opts.dashboard_host.map(|x| x.parse().unwrap());
         let prometheus_addr = opts.prometheus_listener_addr.map(|x| x.parse().unwrap());
+        let meta_store_config = config.meta.meta_store_config.clone();
         let backend = match config.meta.backend {
-            MetaBackend::Etcd => MetaStoreBackend::Etcd {
-                endpoints: opts
-                    .etcd_endpoints
-                    .split(',')
-                    .map(|x| x.to_string())
-                    .collect(),
-                credentials: match opts.etcd_auth {
-                    true => Some((
-                        opts.etcd_username,
-                        opts.etcd_password.expose_secret().to_string(),
-                    )),
-                    false => None,
-                },
-            },
-            MetaBackend::Mem => MetaStoreBackend::Mem,
+            MetaBackend::Mem => {
+                if opts.sql_endpoint.is_some() {
+                    tracing::warn!("`--sql-endpoint` is ignored when using `mem` backend");
+                }
+                MetaStoreBackend::Mem
+            }
             MetaBackend::Sql => MetaStoreBackend::Sql {
                 endpoint: opts
                     .sql_endpoint
                     .expect("sql endpoint is required")
                     .expose_secret()
-                    .to_string(),
+                    .clone(),
+                config: meta_store_config,
+            },
+            MetaBackend::Sqlite => MetaStoreBackend::Sql {
+                endpoint: format!(
+                    "sqlite://{}?mode=rwc",
+                    opts.sql_endpoint
+                        .expect("sql endpoint is required")
+                        .expose_secret()
+                ),
+                config: meta_store_config,
+            },
+            MetaBackend::Postgres => MetaStoreBackend::Sql {
+                endpoint: format!(
+                    "postgres://{}:{}@{}/{}{}",
+                    opts.sql_username,
+                    opts.sql_password.expose_secret(),
+                    opts.sql_endpoint
+                        .expect("sql endpoint is required")
+                        .expose_secret(),
+                    opts.sql_database,
+                    if let Some(params) = &opts.sql_url_params
+                        && !params.is_empty()
+                    {
+                        format!("?{}", params)
+                    } else {
+                        "".to_owned()
+                    }
+                ),
+                config: meta_store_config,
+            },
+            MetaBackend::Mysql => MetaStoreBackend::Sql {
+                endpoint: format!(
+                    "mysql://{}:{}@{}/{}{}",
+                    opts.sql_username,
+                    opts.sql_password.expose_secret(),
+                    opts.sql_endpoint
+                        .expect("sql endpoint is required")
+                        .expose_secret(),
+                    opts.sql_database,
+                    if let Some(params) = &opts.sql_url_params
+                        && !params.is_empty()
+                    {
+                        format!("?{}", params)
+                    } else {
+                        "".to_owned()
+                    }
+                ),
+                config: meta_store_config,
             },
         };
-
         validate_config(&config);
 
         let total_memory_bytes = resource_util::memory::system_memory_available_bytes();
@@ -237,22 +316,31 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         // Run a background heap profiler
         heap_profiler.start();
 
+        let secret_store_private_key = opts
+            .secret_store_private_key_hex
+            .map(|key| hex::decode(key.expose_secret()).unwrap());
         let max_heartbeat_interval =
             Duration::from_secs(config.meta.max_heartbeat_interval_secs as u64);
         let max_idle_ms = config.meta.dangerous_max_idle_secs.unwrap_or(0) * 1000;
         let in_flight_barrier_nums = config.streaming.in_flight_barrier_nums;
+        let snapshot_backfill_finish_max_lagged_barriers = config
+            .streaming
+            .snapshot_backfill_finish_max_lagged_barriers;
+        let snapshot_backfill_barrier_amplification_factor = config
+            .streaming
+            .snapshot_backfill_barrier_amplification_factor;
         let privatelink_endpoint_default_tags =
             opts.privatelink_endpoint_default_tags.map(|tags| {
                 tags.split(',')
                     .map(|s| {
                         let key_val = s.split_once('=').unwrap();
-                        (key_val.0.to_string(), key_val.1.to_string())
+                        (key_val.0.to_owned(), key_val.1.to_owned())
                     })
                     .collect()
             });
 
         let add_info = AddressInfo {
-            advertise_addr: opts.advertise_addr.to_owned(),
+            advertise_addr: opts.advertise_addr.clone(),
             listen_addr,
             prometheus_addr,
             dashboard_addr,
@@ -261,7 +349,7 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         const MIN_TIMEOUT_INTERVAL_SEC: u64 = 20;
         let compaction_task_max_progress_interval_secs = {
             let retry_config = &config.storage.object_store.retry;
-            let max_streming_read_timeout_ms = (retry_config.streaming_read_attempt_timeout_ms
+            let max_streaming_read_timeout_ms = (retry_config.streaming_read_attempt_timeout_ms
                 + retry_config.req_backoff_max_delay_ms)
                 * retry_config.streaming_read_retry_attempts as u64;
             let max_streaming_upload_timeout_ms = (retry_config
@@ -274,7 +362,7 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let max_read_timeout_ms = (retry_config.read_attempt_timeout_ms
                 + retry_config.req_backoff_max_delay_ms)
                 * retry_config.read_retry_attempts as u64;
-            let max_timeout_ms = max_streming_read_timeout_ms
+            let max_timeout_ms = max_streaming_read_timeout_ms
                 .max(max_upload_timeout_ms)
                 .max(max_streaming_upload_timeout_ms)
                 .max(max_read_timeout_ms)
@@ -282,13 +370,17 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             max_timeout_ms / 1000
         } + MIN_TIMEOUT_INTERVAL_SEC;
 
-        let (mut join_handle, leader_lost_handle, shutdown_send) = rpc_serve(
+        Box::pin(rpc_serve(
             add_info,
             backend,
             max_heartbeat_interval,
             config.meta.meta_leader_lease_secs,
+            config.server.clone(),
             MetaOpts {
                 enable_recovery: !config.meta.disable_recovery,
+                clean_all_foreground_jobs_on_recovery: config
+                    .meta
+                    .clean_all_foreground_jobs_on_recovery,
                 disable_automatic_parallelism_control: config
                     .meta
                     .disable_automatic_parallelism_control,
@@ -300,23 +392,90 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                     .meta
                     .parallelism_control_trigger_first_delay_sec,
                 in_flight_barrier_nums,
+                snapshot_backfill_finish_max_lagged_barriers,
+                snapshot_backfill_barrier_amplification_factor,
                 max_idle_ms,
                 compaction_deterministic_test: config.meta.enable_compaction_deterministic,
                 default_parallelism: config.meta.default_parallelism,
                 vacuum_interval_sec: config.meta.vacuum_interval_sec,
+                time_travel_vacuum_interval_sec: config
+                    .meta
+                    .developer
+                    .time_travel_vacuum_interval_sec,
+                time_travel_vacuum_max_version_count: config
+                    .meta
+                    .developer
+                    .time_travel_vacuum_max_version_count,
                 vacuum_spin_interval_ms: config.meta.vacuum_spin_interval_ms,
+                iceberg_gc_interval_sec: config.meta.iceberg_gc_interval_sec,
+                iceberg_orphan_file_cleanup_interval_sec: config
+                    .meta
+                    .iceberg_orphan_file_cleanup_interval_sec,
+                iceberg_compaction_report_timeout_sec: config
+                    .meta
+                    .iceberg_compaction_report_timeout_sec,
+                iceberg_compaction_config_refresh_interval_sec: config
+                    .meta
+                    .iceberg_compaction_config_refresh_interval_sec,
+                iceberg_compaction_schedule_on_startup: config
+                    .meta
+                    .iceberg_compaction_schedule_on_startup,
                 hummock_version_checkpoint_interval_sec: config
                     .meta
                     .hummock_version_checkpoint_interval_sec,
                 enable_hummock_data_archive: config.meta.enable_hummock_data_archive,
+                checkpoint_compression_algorithm: config.meta.checkpoint_compression_algorithm,
+                checkpoint_read_chunk_size: config.meta.checkpoint_read_chunk_size,
+                checkpoint_read_max_in_flight_chunks: config
+                    .meta
+                    .checkpoint_read_max_in_flight_chunks,
+                hummock_time_travel_snapshot_interval: config
+                    .meta
+                    .hummock_time_travel_snapshot_interval,
+                hummock_time_travel_sst_info_fetch_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_sst_info_fetch_batch_size,
+                hummock_time_travel_sst_info_insert_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_sst_info_insert_batch_size,
+                hummock_time_travel_epoch_version_insert_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_epoch_version_insert_batch_size,
+                hummock_time_travel_delta_fetch_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_delta_fetch_batch_size,
+                hummock_gc_history_insert_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_gc_history_insert_batch_size,
+                hummock_time_travel_filter_out_objects_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_filter_out_objects_batch_size,
+                hummock_time_travel_filter_out_objects_v1: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_filter_out_objects_v1,
+                hummock_time_travel_filter_out_objects_list_version_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_filter_out_objects_list_version_batch_size,
+                hummock_time_travel_filter_out_objects_list_delta_batch_size: config
+                    .meta
+                    .developer
+                    .hummock_time_travel_filter_out_objects_list_delta_batch_size,
                 min_delta_log_num_for_hummock_version_checkpoint: config
                     .meta
                     .min_delta_log_num_for_hummock_version_checkpoint,
                 min_sst_retention_time_sec: config.meta.min_sst_retention_time_sec,
                 full_gc_interval_sec: config.meta.full_gc_interval_sec,
-                collect_gc_watermark_spin_interval_sec: config
-                    .meta
-                    .collect_gc_watermark_spin_interval_sec,
+                full_gc_object_limit: config.meta.full_gc_object_limit,
+                gc_history_retention_time_sec: config.meta.gc_history_retention_time_sec,
+                max_inflight_time_travel_query: config.meta.max_inflight_time_travel_query,
                 enable_committed_sst_sanity_check: config.meta.enable_committed_sst_sanity_check,
                 periodic_compaction_interval_sec: config.meta.periodic_compaction_interval_sec,
                 node_num_monitor_interval_sec: config.meta.node_num_monitor_interval_sec,
@@ -335,13 +494,23 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 periodic_tombstone_reclaim_compaction_interval_sec: config
                     .meta
                     .periodic_tombstone_reclaim_compaction_interval_sec,
-                periodic_split_compact_group_interval_sec: config
+                periodic_scheduling_compaction_group_split_interval_sec: config
                     .meta
-                    .periodic_split_compact_group_interval_sec,
-                split_group_size_limit: config.meta.split_group_size_limit,
-                min_table_split_size: config.meta.move_table_size_limit,
-                table_write_throughput_threshold: config.meta.table_write_throughput_threshold,
-                min_table_split_write_throughput: config.meta.min_table_split_write_throughput,
+                    .periodic_scheduling_compaction_group_split_interval_sec,
+                enable_compaction_group_normalize: config.meta.enable_compaction_group_normalize,
+                max_normalize_splits_per_round: config.meta.max_normalize_splits_per_round,
+                periodic_scheduling_compaction_group_merge_interval_sec: config
+                    .meta
+                    .periodic_scheduling_compaction_group_merge_interval_sec,
+                compaction_group_merge_dimension_threshold: config
+                    .meta
+                    .compaction_group_merge_dimension_threshold,
+                table_high_write_throughput_threshold: config
+                    .meta
+                    .table_high_write_throughput_threshold,
+                table_low_write_throughput_threshold: config
+                    .meta
+                    .table_low_write_throughput_threshold,
                 partition_vnode_count: config.meta.partition_vnode_count,
                 compact_task_table_size_partition_threshold_low: config
                     .meta
@@ -356,8 +525,8 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                     .meta
                     .compaction_task_max_heartbeat_interval_secs,
                 compaction_task_max_progress_interval_secs,
+                compaction_task_id_refill_capacity: config.meta.compaction_task_id_refill_capacity,
                 compaction_config: Some(config.meta.compaction_config),
-                cut_table_size_limit: config.meta.cut_table_size_limit,
                 hybrid_partition_node_count: config.meta.hybrid_partition_vnode_count,
                 event_log_enabled: config.meta.event_log_enabled,
                 event_log_channel_max_size: config.meta.event_log_channel_max_size,
@@ -373,58 +542,127 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                     .developer
                     .enable_check_task_level_overlap,
                 enable_dropped_column_reclaim: config.meta.enable_dropped_column_reclaim,
+                split_group_size_ratio: config.meta.split_group_size_ratio,
+                refresh_scheduler_interval_sec: config
+                    .streaming
+                    .developer
+                    .refresh_scheduler_interval_sec,
+                table_write_throughput_retention_seconds: config
+                    .meta
+                    .table_write_throughput_retention_seconds,
                 object_store_config: config.storage.object_store,
                 max_trivial_move_task_count_per_loop: config
                     .meta
                     .developer
                     .max_trivial_move_task_count_per_loop,
                 max_get_task_probe_times: config.meta.developer.max_get_task_probe_times,
-                secret_store_private_key: config.meta.secret_store_private_key,
+                secret_store_private_key,
+                temp_secret_file_dir: opts.temp_secret_file_dir,
+                actor_cnt_per_worker_parallelism_hard_limit: config
+                    .meta
+                    .developer
+                    .actor_cnt_per_worker_parallelism_hard_limit,
+                actor_cnt_per_worker_parallelism_soft_limit: config
+                    .meta
+                    .developer
+                    .actor_cnt_per_worker_parallelism_soft_limit,
+                table_change_log_insert_batch_size: config
+                    .meta
+                    .developer
+                    .table_change_log_insert_batch_size,
+                table_change_log_delete_batch_size: config
+                    .meta
+                    .developer
+                    .table_change_log_delete_batch_size,
+                table_change_log_truncate_interval_sec: config
+                    .meta
+                    .developer
+                    .table_change_log_truncate_interval_sec,
+                license_key_path: opts.license_key_path,
+                compute_client_config: config.meta.developer.compute_client_config.clone(),
+                stream_client_config: config.meta.developer.stream_client_config.clone(),
+                frontend_client_config: config.meta.developer.frontend_client_config.clone(),
+                sql_option_redaction: Arc::new(SqlOptionRedaction::new(
+                    config.batch.redact_sql_option_keywords,
+                    config.batch.redact_sql_option_allowlist,
+                )),
+                cdc_table_split_init_sleep_interval_splits: config
+                    .meta
+                    .cdc_table_split_init_sleep_interval_splits,
+                cdc_table_split_init_sleep_duration_millis: config
+                    .meta
+                    .cdc_table_split_init_sleep_duration_millis,
+                cdc_table_split_init_insert_batch_size: config
+                    .meta
+                    .cdc_table_split_init_insert_batch_size,
+
+                enable_legacy_table_migration: config.meta.enable_legacy_table_migration,
+                pause_on_next_bootstrap_offline: config.meta.pause_on_next_bootstrap_offline,
+                serverless_backfill_controller_addr: opts.serverless_backfill_controller_addr,
             },
             config.system.into_init_system_params(),
-            Default::default(),
-        )
+            config.session_init,
+            shutdown,
+        ))
         .await
         .unwrap();
-
-        tracing::info!("Meta server listening at {}", listen_addr);
-
-        match leader_lost_handle {
-            None => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("receive ctrl+c");
-                        shutdown_send.send(()).unwrap();
-                        join_handle.await.unwrap()
-                    }
-                    res = &mut join_handle => res.unwrap(),
-                };
-            }
-            Some(mut handle) => {
-                tokio::select! {
-                    _ = &mut handle => {
-                        tracing::info!("receive leader lost signal");
-                        // When we lose leadership, we will exit as soon as possible.
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("receive ctrl+c");
-                        shutdown_send.send(()).unwrap();
-                        join_handle.await.unwrap();
-                        handle.abort();
-                    }
-                    res = &mut join_handle => {
-                        res.unwrap();
-                        handle.abort();
-                    },
-                };
-            }
-        };
     })
 }
 
 fn validate_config(config: &RwConfig) {
     if config.meta.meta_leader_lease_secs <= 2 {
-        let error_msg = "meta leader lease secs should be larger than 2";
+        let error_msg = "`meta_leader_lease_secs` must be greater than 2";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.parallelism_control_batch_size == 0 {
+        let error_msg = "`parallelism_control_batch_size` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.checkpoint_read_chunk_size == 0 {
+        let error_msg = "`checkpoint_read_chunk_size` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.checkpoint_read_max_in_flight_chunks == 0 {
+        let error_msg = "`checkpoint_read_max_in_flight_chunks` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.compaction_task_id_refill_capacity == 0 {
+        let error_msg = "`compaction_task_id_refill_capacity` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.iceberg_compaction_report_timeout_sec == 0 {
+        let error_msg = "`iceberg_compaction_report_timeout_sec` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    if config.meta.iceberg_compaction_config_refresh_interval_sec == 0 {
+        let error_msg = "`iceberg_compaction_config_refresh_interval_sec` must be greater than 0";
+        tracing::error!(error_msg);
+        panic!("{}", error_msg);
+    }
+
+    // A snapshot backfill partial graph drains its queued catch-up barriers only when a new
+    // upstream barrier arrives, and that barrier is queued first, so the queue shrinks by at
+    // most `limit - 1` per upstream barrier. A limit of 1 could never empty the queue.
+    if snapshot_backfill_max_pending_barrier_num(
+        config.streaming.in_flight_barrier_nums,
+        config
+            .streaming
+            .snapshot_backfill_barrier_amplification_factor,
+    ) < 2
+    {
+        let error_msg = "`in_flight_barrier_nums` times `snapshot_backfill_barrier_amplification_factor` must be at least 2";
         tracing::error!(error_msg);
         panic!("{}", error_msg);
     }

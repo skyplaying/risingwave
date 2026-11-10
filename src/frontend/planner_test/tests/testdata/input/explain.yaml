@@ -13,6 +13,13 @@
     explain (logical, trace) select * from t1 join t2 on v1=v2;
   expected_outputs:
   - explain_output
+- id: explain trace should output partial results even if it fails
+  sql: |
+    create table t1(v1 int);
+    create table t2(v2 int);
+    explain (logical, trace) create materialized view m1 as select * from t1 join t2 on v1>v2;
+  expected_outputs:
+  - explain_output
 - sql: |
     explain (logical) create table t1(v1 int);
   expected_outputs:
@@ -23,5 +30,17 @@
   - explain_output
 - sql: |
     explain create table t (v1 int, v2 varchar) with ( connector = 'kafka', kafka.topic = 'kafka_3_partition_topic', kafka.brokers = '127.0.0.1:1234', kafka.scan.startup.mode='earliest'  ) FORMAT PLAIN ENCODE JSON;
+  expected_outputs:
+  - explain_output
+- sql: |
+    explain create table t (v1 int, v2 varchar) append only with ( connector = 'kafka', kafka.topic = 'kafka_3_partition_topic', kafka.brokers = '127.0.0.1:1234', kafka.scan.startup.mode='earliest'  ) FORMAT PLAIN ENCODE JSON;
+  expected_outputs:
+  - explain_output
+- sql: |
+    explain create table t (v1 int, v2 varchar primary key) with ( connector = 'kafka', kafka.topic = 'kafka_3_partition_topic', kafka.brokers = '127.0.0.1:1234', kafka.scan.startup.mode='earliest'  ) FORMAT PLAIN ENCODE JSON;
+  expected_outputs:
+  - explain_output
+- sql: |
+    explain create table t (v1 int, v2 varchar primary key) append only with ( connector = 'kafka', kafka.topic = 'kafka_3_partition_topic', kafka.brokers = '127.0.0.1:1234', kafka.scan.startup.mode='earliest'  ) FORMAT PLAIN ENCODE JSON;
   expected_outputs:
   - explain_output

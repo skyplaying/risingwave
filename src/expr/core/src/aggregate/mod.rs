@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,19 @@ use std::fmt::Debug;
 use std::ops::Range;
 
 use anyhow::anyhow;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use itertools::Itertools;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::types::{DataType, Datum};
 use risingwave_common_estimate_size::EstimateSize;
 
+use crate::expr::build_from_prost;
 use crate::sig::FuncBuilder;
 use crate::{ExprError, Result};
 
 // aggregate definition
 mod def;
+mod scalar_wrapper;
 // user defined aggregate function
 mod user_defined;
 
@@ -143,20 +145,22 @@ pub fn build_retractable(agg: &AggCall) -> Result<BoxedAggregateFunction> {
 /// NOTE: This function ignores argument indices, `column_orders`, `filter` and `distinct` in
 /// `AggCall`. Such operations should be done in batch or streaming executors.
 pub fn build(agg: &AggCall, prefer_append_only: bool) -> Result<BoxedAggregateFunction> {
-    if agg.kind == AggKind::UserDefined {
-        return user_defined::new_user_defined(agg);
-    }
+    // handle special kinds
+    let kind = match &agg.agg_type {
+        AggType::UserDefined(udf) => {
+            return user_defined::new_user_defined(&agg.return_type, udf);
+        }
+        AggType::WrapScalar(scalar) => {
+            return Ok(Box::new(scalar_wrapper::ScalarWrapper::new(
+                agg.args.arg_types()[0].clone(),
+                build_from_prost(scalar)?,
+            )));
+        }
+        AggType::Builtin(kind) => kind,
+    };
 
-    let sig = crate::sig::FUNCTION_REGISTRY
-        .get(agg.kind, agg.args.arg_types(), &agg.return_type)
-        .ok_or_else(|| {
-            ExprError::UnsupportedFunction(format!(
-                "{}({}) -> {}",
-                agg.kind.to_protobuf().as_str_name().to_ascii_lowercase(),
-                agg.args.arg_types().iter().format(", "),
-                agg.return_type,
-            ))
-        })?;
+    // find the signature for builtin aggregation
+    let sig = crate::sig::FUNCTION_REGISTRY.get(*kind, agg.args.arg_types(), &agg.return_type)?;
 
     if let FuncBuilder::Aggregate {
         append_only: Some(f),

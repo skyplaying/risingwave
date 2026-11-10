@@ -1,7 +1,6 @@
 ---
-version: "3"
 x-image: &image
-  image: ${RW_IMAGE:-risingwavelabs/risingwave:v1.9.1-rc.2}
+  image: ${RW_IMAGE:-risingwavelabs/risingwave:v3.0.0}
 services:
   risingwave-standalone:
     <<: *image
@@ -22,22 +21,26 @@ services:
                     --prometheus-listener-addr 0.0.0.0:1250 \
                     --advertise-addr 0.0.0.0:5688 \
                     --async-stack-trace verbose \
-                    #--parallelism 4 \
-                    #--total-memory-bytes 8589934592 \
+                    --parallelism 8 \
+                    --total-memory-bytes 21474836480 \
                     --role both \
-                    --meta-address http://0.0.0.0:5690\" \
+                    --meta-address http://0.0.0.0:5690 \
+                    --memory-manager-target-bytes 22333829939 \" \
                  --frontend-opts=\" \
                    --config-path /risingwave.toml \
                    --listen-addr 0.0.0.0:4566 \
                    --advertise-addr 0.0.0.0:4566 \
                    --prometheus-listener-addr 0.0.0.0:1250 \
                    --health-check-listener-addr 0.0.0.0:6786 \
-                   --meta-addr http://0.0.0.0:5690\" \
+                   --meta-addr http://0.0.0.0:5690 \
+                   --frontend-total-memory-bytes=4294967296\" \
                  --compactor-opts=\" \
+                   --config-path /risingwave.toml \
                    --listen-addr 0.0.0.0:6660 \
                    --prometheus-listener-addr 0.0.0.0:1250 \
                    --advertise-addr 0.0.0.0:6660 \
-                   --meta-address http://0.0.0.0:5690\""
+                   --meta-address http://0.0.0.0:5690 \
+                   --compactor-total-memory-bytes=4294967296\""
     expose:
       - "6660"
       - "4566"
@@ -59,13 +62,16 @@ services:
       RUST_BACKTRACE: "1"
       # If ENABLE_TELEMETRY is not set, telemetry will start by default
       ENABLE_TELEMETRY: ${ENABLE_TELEMETRY:-true}
+      RW_TELEMETRY_TYPE: ${RW_TELEMETRY_TYPE:-"docker-compose"}
+      RW_SECRET_STORE_PRIVATE_KEY_HEX: ${RW_SECRET_STORE_PRIVATE_KEY_HEX:-0123456789abcdef0123456789abcdef}
+      RW_LICENSE_KEY: ${RW_LICENSE_KEY:-}
     container_name: risingwave-standalone
     healthcheck:
       test:
         - CMD-SHELL
         - bash -c 'printf \"GET / HTTP/1.1\n\n\" > /dev/tcp/127.0.0.1/6660; exit $$?;'
         - bash -c 'printf \"GET / HTTP/1.1\n\n\" > /dev/tcp/127.0.0.1/5688; exit $$?;'
-        - bash -c 'printf \"GET / HTTP/1.1\n\n\" > /dev/tcp/127.0.0.1/4566; exit $$?;'
+        - bash -c '> /dev/tcp/127.0.0.1/4566; exit $$?;'
         - bash -c 'printf \"GET / HTTP/1.1\n\n\" > /dev/tcp/127.0.0.1/5690; exit $$?;'
       interval: 1s
       timeout: 5s
@@ -99,12 +105,12 @@ services:
 
   grafana-0:
     image: "grafana/grafana-oss:latest"
-    command: []
+    command: [ ]
     expose:
       - "3001"
     ports:
       - "3001:3001"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "grafana-0:/var/lib/grafana"
       - "./grafana.ini:/etc/grafana/grafana.ini"
@@ -137,7 +143,7 @@ services:
     ports:
       - "9301:9301"
       - "9400:9400"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "minio-0:/data"
     entrypoint: "
@@ -181,7 +187,7 @@ services:
       - "9500"
     ports:
       - "9500:9500"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "prometheus-0:/prometheus"
       - "./prometheus.yaml:/etc/prometheus/prometheus.yml"
@@ -197,7 +203,7 @@ services:
     restart: always
 
   message_queue:
-    image: "docker.vectorized.io/vectorized/redpanda:latest"
+    image: "redpandadata/redpanda:latest"
     command:
       - redpanda
       - start
@@ -224,7 +230,7 @@ services:
       - "9092:9092"
       - "9644:9644"
       - "8081:8081"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "message_queue:/var/lib/redpanda/data"
     environment: {}

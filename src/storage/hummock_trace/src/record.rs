@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ use risingwave_pb::meta::SubscribeResponse;
 
 use crate::{
     LocalStorageId, StorageType, TracedHummockReadEpoch, TracedInitOptions, TracedNewLocalOptions,
-    TracedReadOptions, TracedSealCurrentEpochOptions,
+    TracedReadOptions, TracedSealCurrentEpochOptions, TracedTryWaitEpochOptions,
 };
 
 pub type RecordId = u64;
@@ -146,10 +146,7 @@ pub enum Operation {
     IterNext(RecordId),
 
     /// Sync operation of Hummock.
-    Sync(u64),
-
-    /// Seal operation of Hummock.
-    Seal(u64, bool),
+    Sync(Vec<(u64, Vec<u32>)>),
 
     /// `MetaMessage` operation of Hummock.
     MetaMessage(Box<TracedSubResp>),
@@ -167,23 +164,13 @@ pub enum Operation {
     LocalStorageInit(TracedInitOptions),
 
     /// Try wait epoch
-    TryWaitEpoch(TracedHummockReadEpoch),
-
-    /// clear shared buffer
-    ClearSharedBuffer(u64),
+    TryWaitEpoch(TracedHummockReadEpoch, TracedTryWaitEpochOptions),
 
     /// Seal current epoch
     SealCurrentEpoch {
         epoch: u64,
         opts: TracedSealCurrentEpochOptions,
     },
-
-    /// validate read epoch
-    ValidateReadEpoch(TracedHummockReadEpoch),
-
-    LocalStorageEpoch,
-
-    LocalStorageIsDirty,
 
     TryFlush,
 
@@ -227,8 +214,8 @@ impl Encode for TracedBytes {
     }
 }
 
-impl Decode for TracedBytes {
-    fn decode<D: bincode::de::Decoder>(
+impl<C> Decode<C> for TracedBytes {
+    fn decode<D: bincode::de::Decoder<Context = C>>(
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
         let buf: Vec<u8> = Decode::decode(decoder)?;
@@ -237,8 +224,8 @@ impl Decode for TracedBytes {
     }
 }
 
-impl<'de> bincode::BorrowDecode<'de> for TracedBytes {
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(
+impl<'de, C> bincode::BorrowDecode<'de, C> for TracedBytes {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = C>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let buf: Vec<u8> = Decode::decode(decoder)?;
@@ -299,9 +286,6 @@ pub enum OperationResult {
     Sync(TraceResult<usize>),
     NotifyHummock(TraceResult<()>),
     TryWaitEpoch(TraceResult<()>),
-    ValidateReadEpoch(TraceResult<()>),
-    LocalStorageEpoch(TraceResult<u64>),
-    LocalStorageIsDirty(TraceResult<bool>),
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -321,25 +305,25 @@ impl Encode for TracedSubResp {
     }
 }
 
-impl Decode for TracedSubResp {
-    fn decode<D: bincode::de::Decoder>(
+impl<C> Decode<C> for TracedSubResp {
+    fn decode<D: bincode::de::Decoder<Context = C>>(
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
         let buf: Vec<u8> = Decode::decode(decoder)?;
         let resp = Message::decode(&buf[..]).map_err(|_| {
-            DecodeError::OtherString("failed to decode subscribeResponse".to_string())
+            DecodeError::OtherString("failed to decode subscribeResponse".to_owned())
         })?;
         Ok(Self(resp))
     }
 }
 
-impl<'de> bincode::BorrowDecode<'de> for TracedSubResp {
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(
+impl<'de, C> bincode::BorrowDecode<'de, C> for TracedSubResp {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = C>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let buf: Vec<u8> = Decode::decode(decoder)?;
         let resp = Message::decode(&buf[..]).map_err(|_| {
-            DecodeError::OtherString("failed to decode subscribeResponse".to_string())
+            DecodeError::OtherString("failed to decode subscribeResponse".to_owned())
         })?;
         Ok(Self(resp))
     }
@@ -363,16 +347,16 @@ mod tests {
     // test atomic id
     #[tokio::test(flavor = "multi_thread")]
     async fn test_atomic_id() {
-        let gen = Arc::new(UniqueIdGenerator::new(AtomicU64::new(0)));
+        let r#gen = Arc::new(UniqueIdGenerator::new(AtomicU64::new(0)));
         let mut handles = Vec::new();
         let ids_lock = Arc::new(Mutex::new(HashSet::new()));
         let count: u64 = 5000;
 
         for _ in 0..count {
             let ids = ids_lock.clone();
-            let gen = gen.clone();
+            let r#gen = r#gen.clone();
             handles.push(tokio::spawn(async move {
-                let id = gen.next();
+                let id = r#gen.next();
                 ids.lock().insert(id);
             }));
         }

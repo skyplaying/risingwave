@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,23 +19,24 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use icelake::types::{
-    create_transform_function, Any as IcelakeDataType, BoxedTransformFunction, Transform,
-};
-use risingwave_common::array::arrow::{FromArrow, IcebergArrowConvert, ToArrow};
+use iceberg::spec::{PrimitiveType, Transform, Type as IcebergType};
+use iceberg::transform::{BoxedTransformFunction, create_transform_function};
+use risingwave_common::array::arrow::{IcebergArrowConvert, arrow_schema_iceberg};
 use risingwave_common::array::{ArrayRef, DataChunk};
 use risingwave_common::ensure;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{DataType, Datum};
-use risingwave_expr::expr::BoxedExpression;
-use risingwave_expr::{build_function, ExprError, Result};
+use risingwave_expr::expr::{
+    BoxedExpression, ExpressionInfo, SyncExpression, SyncExpressionBoxExt,
+};
+use risingwave_expr::{ExprError, Result, build_function};
 use thiserror_ext::AsReport;
 
 pub struct IcebergTransform {
-    child: BoxedExpression,
+    child: Arc<dyn SyncExpression>,
     transform: BoxedTransformFunction,
-    input_arrow_type: arrow_schema::DataType,
-    output_arrow_field: arrow_schema::Field,
+    input_arrow_type: arrow_schema_iceberg::DataType,
+    output_arrow_field: arrow_schema_iceberg::Field,
     return_type: DataType,
 }
 
@@ -48,39 +49,40 @@ impl std::fmt::Debug for IcebergTransform {
     }
 }
 
-#[async_trait::async_trait]
-impl risingwave_expr::expr::Expression for IcebergTransform {
+impl ExpressionInfo for IcebergTransform {
     fn return_type(&self) -> DataType {
         self.return_type.clone()
     }
+}
 
-    async fn eval(&self, data_chunk: &DataChunk) -> Result<ArrayRef> {
-        // Get the child array
-        let array = self.child.eval(data_chunk).await?;
+impl SyncExpression for IcebergTransform {
+    fn eval(&self, data_chunk: &DataChunk) -> Result<ArrayRef> {
+        let array = self.child.eval(data_chunk)?;
         // Convert to arrow array
-        let arrow_array = IcebergArrowConvert.to_array(&self.input_arrow_type, &array)?;
+        let arrow_array = IcebergArrowConvert.to_arrow_array(&self.input_arrow_type, &array)?;
         // Transform
         let res_array = self.transform.transform(arrow_array).unwrap();
         // Convert back to array ref and return it
-        Ok(Arc::new(
-            IcebergArrowConvert.from_array(&self.output_arrow_field, &res_array)?,
-        ))
+        Ok(Arc::new(IcebergArrowConvert.array_from_arrow_array(
+            &self.output_arrow_field,
+            &res_array,
+        )?))
     }
 
-    async fn eval_row(&self, _row: &OwnedRow) -> Result<Datum> {
+    fn eval_row(&self, _row: &OwnedRow) -> Result<Datum> {
         Err(ExprError::Internal(anyhow!(
             "eval_row in iceberg_transform is not supported yet"
         )))
     }
 }
 
-#[build_function("iceberg_transform(varchar, any) -> any", type_infer = "panic")]
+#[build_function("iceberg_transform(varchar, any) -> any", type_infer = "unreachable")]
 fn build(return_type: DataType, mut children: Vec<BoxedExpression>) -> Result<BoxedExpression> {
     let transform_type = {
         let datum = children[0].eval_const()?.unwrap();
         let str = datum.as_utf8();
         Transform::from_str(str).map_err(|_| ExprError::InvalidParam {
-            name: "transform type in icberg_transform",
+            name: "transform type in iceberg_transform",
             reason: format!("Fail to parse {str} as iceberg transform type").into(),
         })?
     };
@@ -100,11 +102,11 @@ fn build(return_type: DataType, mut children: Vec<BoxedExpression>) -> Result<Bo
         .data_type()
         .clone();
     let output_arrow_field = IcebergArrowConvert.to_arrow_field("", &return_type)?;
-    let input_type = IcelakeDataType::try_from(input_arrow_type.clone()).map_err(|err| {
+    let input_type = iceberg::arrow::arrow_type_to_type(&input_arrow_type).map_err(|err| {
         ExprError::InvalidParam {
             name: "input type in iceberg_transform",
             reason: format!(
-                "Failed to convert input type to icelake type, got error: {}",
+                "Failed to convert input type to iceberg type, got error: {}",
                 err.as_report()
             )
             .into(),
@@ -119,8 +121,8 @@ fn build(return_type: DataType, mut children: Vec<BoxedExpression>) -> Result<Bo
             )
             .into()
         })?;
-    let actual_res_type = IcelakeDataType::try_from(
-        IcebergArrowConvert
+    let actual_res_type = iceberg::arrow::arrow_type_to_type(
+        &IcebergArrowConvert
             .to_arrow_field("", &return_type)?
             .data_type()
             .clone(),
@@ -128,31 +130,49 @@ fn build(return_type: DataType, mut children: Vec<BoxedExpression>) -> Result<Bo
     .map_err(|err| ExprError::InvalidParam {
         name: "return type in iceberg_transform",
         reason: format!(
-            "Failed to convert return type to icelake type, got error: {}",
+            "Failed to convert return type to iceberg type, got error: {}",
             err.as_report()
         )
         .into(),
     })?;
+
     ensure!(
-        expect_res_type == actual_res_type,
+        (expect_res_type == actual_res_type)
+            ||
+            // This is a confusing stuff.<https://github.com/apache/iceberg/pull/11749>
+            (matches!(transform_type, Transform::Day) && matches!(actual_res_type, IcebergType::Primitive(PrimitiveType::Int))),
         ExprError::InvalidParam {
             name: "return type in iceberg_transform",
             reason: format!(
-                "Expect return type {:?} but got {:?}",
-                expect_res_type, actual_res_type
+                "Expect return type {:?} but got {:?}, RisingWave return type is {:?}, input type is {:?}, transform type is {:?}",
+                expect_res_type,
+                actual_res_type,
+                return_type,
+                (input_type, input_arrow_type),
+                transform_type
             )
             .into()
         }
     );
 
-    Ok(Box::new(IcebergTransform {
-        child: children.remove(1),
-        transform: create_transform_function(&transform_type)
-            .map_err(|err| ExprError::Internal(err.into()))?,
+    let child = match children.remove(1) {
+        BoxedExpression::Sync(child) => child,
+        BoxedExpression::Async(_) => {
+            return Err(ExprError::Internal(anyhow!(
+                "async child in iceberg_transform is not supported"
+            )));
+        }
+    };
+    let transform = create_transform_function(&transform_type)
+        .map_err(|err| ExprError::Internal(err.into()))?;
+    Ok(IcebergTransform {
+        child,
+        transform,
         input_arrow_type,
         output_arrow_field,
         return_type,
-    }))
+    }
+    .boxed())
 }
 
 #[cfg(test)]
@@ -189,12 +209,12 @@ mod test {
     #[tokio::test]
     async fn test_year_month_day_hour() {
         let (input, expected) = DataChunk::from_pretty(
-            "TZ                                  i i i i
-            1970-01-01T00:00:00.000000000+00:00  0 0 0 0
-            1971-02-01T01:00:00.000000000+00:00  1 13 396 9505
-            1972-03-01T02:00:00.000000000+00:00  2 26 790 18962
-            1970-05-01T06:00:00.000000000+00:00  0 4 120 2886
-            1970-06-01T07:00:00.000000000+00:00  0 5 151 3631",
+            "TZ                                  i i D i
+            1970-01-01T00:00:00.000000000+00:00  0 0 1970-01-01 0
+            1971-02-01T01:00:00.000000000+00:00  1 13 1971-02-01 9505
+            1972-03-01T02:00:00.000000000+00:00  2 26 1972-03-01 18962
+            1970-05-01T06:00:00.000000000+00:00  0 4 1970-05-01 2886
+            1970-06-01T07:00:00.000000000+00:00  0 5 1970-06-01 3631",
         )
         .split_column_at(1);
 

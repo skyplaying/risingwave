@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use risingwave_sqlparser::tokenizer::Tokenizer;
 /// Input SQL, output AST.
 fn main() {
     let mut sql = String::new();
-    #[allow(clippy::significant_drop_in_scrutinee)]
+
     for line in std::io::stdin().lock().lines() {
         sql += &line.unwrap();
         if !sql.ends_with(';') {

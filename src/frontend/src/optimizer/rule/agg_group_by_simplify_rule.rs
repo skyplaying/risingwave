@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_expr::aggregate::AggKind;
+use risingwave_expr::aggregate::PbAggKind;
 
-use super::super::plan_node::*;
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::expr::InputRef;
 use crate::optimizer::plan_node::generic::{Agg, GenericPlanRef};
+use crate::optimizer::plan_node::*;
 use crate::utils::{Condition, IndexSet};
 
 /// Use functional dependencies to simplify aggregation's group by
@@ -26,7 +26,7 @@ use crate::utils::{Condition, IndexSet};
 /// After
 /// group by b, `first_value`(a), `first_value`(c),
 pub struct AggGroupBySimplifyRule {}
-impl Rule for AggGroupBySimplifyRule {
+impl Rule<Logical> for AggGroupBySimplifyRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let agg: &LogicalAgg = plan.as_logical_agg()?;
         let (agg_calls, group_key, grouping_sets, agg_input, _two_phase) = agg.clone().decompose();
@@ -35,10 +35,16 @@ impl Rule for AggGroupBySimplifyRule {
         }
         let functional_dependency = agg_input.functional_dependency();
         let group_key = group_key.to_vec();
-        if !functional_dependency.is_key(&group_key) {
+        if group_key.is_empty() || !functional_dependency.is_key(&group_key) {
             return None;
         }
-        let minimized_group_key = functional_dependency.minimize_key(&group_key);
+        let mut minimized_group_key = functional_dependency.minimize_key(&group_key);
+        // The minimized key is empty when the input has at most one row. Keep one group key
+        // column, otherwise the grouped agg would become a simple agg, which outputs one row
+        // instead of zero rows on empty input.
+        if minimized_group_key.is_empty() {
+            minimized_group_key.push(group_key[0]);
+        }
         if minimized_group_key.len() < group_key.len() {
             let new_group_key = IndexSet::from(minimized_group_key);
             let new_group_key_len = new_group_key.len();
@@ -47,14 +53,13 @@ impl Rule for AggGroupBySimplifyRule {
                 if !new_group_key.contains(i) {
                     let data_type = agg_input.schema().fields[i].data_type();
                     new_agg_calls.push(PlanAggCall {
-                        agg_kind: AggKind::InternalLastSeenValue,
+                        agg_type: PbAggKind::InternalLastSeenValue.into(),
                         return_type: data_type.clone(),
                         inputs: vec![InputRef::new(i, data_type)],
                         distinct: false,
                         order_by: vec![],
                         filter: Condition::true_cond(),
                         direct_args: vec![],
-                        user_defined: None,
                     });
                 }
             }

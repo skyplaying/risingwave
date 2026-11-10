@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use super::generic::GenericPlanRef;
-use super::{EndoPlan, LogicalShare, PlanNodeId, PlanRef, PlanTreeNodeUnary, VisitPlan};
-use crate::optimizer::plan_visitor;
+use super::{
+    EndoPlan, LogicalPlanRef as PlanRef, LogicalShare, PlanTreeNodeUnary, ShareNode, VisitPlan,
+};
+use crate::optimizer::{ShareId, plan_visitor};
 use crate::utils::{Endo, Visit};
 
 pub trait Semantics<V: Hash + Eq> {
@@ -75,7 +76,7 @@ impl PlanRef {
 
 #[derive(Default)]
 struct Counter {
-    counts: HashMap<PlanNodeId, u64>,
+    counts: HashMap<ShareId, u64>,
 }
 
 impl Counter {
@@ -92,7 +93,11 @@ impl VisitPlan for Counter {
     where
         F: FnMut(&mut Self),
     {
-        if !self.counts.get(&plan.id()).is_some_and(|c| *c > 1) {
+        let share_id = plan
+            .as_logical_share()
+            .expect("dag cache is only used for shares")
+            .share_id();
+        if self.counts.get(&share_id).is_none_or(|c| *c <= 1) {
             f(self);
         }
     }
@@ -102,7 +107,7 @@ impl Visit<PlanRef> for Counter {
     fn visit(&mut self, t: &PlanRef) {
         if let Some(s) = t.as_logical_share() {
             self.counts
-                .entry(s.id())
+                .entry(s.share_id())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
         }
@@ -111,8 +116,8 @@ impl Visit<PlanRef> for Counter {
 }
 
 struct Pruner<'a> {
-    counts: &'a HashMap<PlanNodeId, u64>,
-    cache: HashMap<PlanNodeId, PlanRef>,
+    counts: &'a HashMap<ShareId, u64>,
+    cache: HashMap<ShareId, PlanRef>,
 }
 
 impl EndoPlan for Pruner<'_> {
@@ -120,9 +125,13 @@ impl EndoPlan for Pruner<'_> {
     where
         F: FnMut(&mut Self) -> PlanRef,
     {
-        self.cache.get(&plan.id()).cloned().unwrap_or_else(|| {
+        let share_id = plan
+            .as_logical_share()
+            .expect("dag cache is only used for shares")
+            .share_id();
+        self.cache.get(&share_id).cloned().unwrap_or_else(|| {
             let res = f(self);
-            self.cache.entry(plan.id()).or_insert(res).clone()
+            self.cache.entry(share_id).or_insert(res).clone()
         })
     }
 }
@@ -133,7 +142,11 @@ impl Endo<PlanRef> for Pruner<'_> {
             // Prune if share node has only one parent
             // or it just shares a scan
             // or it doesn't share any scan or source.
-            *self.counts.get(&s.id()).expect("Unprocessed shared node.") == 1
+            *self
+                .counts
+                .get(&s.share_id())
+                .expect("Unprocessed shared node.")
+                == 1
                 || s.input().as_logical_scan().is_some()
                 || !(plan_visitor::has_logical_scan(s.input())
                     || plan_visitor::has_logical_source(s.input()))

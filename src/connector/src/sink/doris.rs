@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,35 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use base64::engine::general_purpose;
 use base64::Engine;
+use base64::engine::general_purpose;
 use bytes::{BufMut, Bytes, BytesMut};
 use risingwave_common::array::{Op, StreamChunk};
-use risingwave_common::buffer::Bitmap;
 use risingwave_common::catalog::Schema;
 use risingwave_common::types::DataType;
-use serde::Deserialize;
-use serde_derive::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 use thiserror_ext::AsReport;
 use with_options::WithOptions;
 
 use super::doris_starrocks_connector::{
-    HeaderBuilder, InserterInner, InserterInnerBuilder, DORIS_DELETE_SIGN, DORIS_SUCCESS_STATUS,
+    DORIS_DELETE_SIGN, DORIS_SUCCESS_STATUS, HeaderBuilder, InserterInner, InserterInnerBuilder,
     POOL_IDLE_TIMEOUT,
 };
-use super::{Result, SinkError, SINK_TYPE_APPEND_ONLY, SINK_TYPE_OPTION, SINK_TYPE_UPSERT};
-use crate::sink::encoder::{JsonEncoder, RowEncoder};
-use crate::sink::writer::{LogSinkerOf, SinkWriterExt};
-use crate::sink::{DummySinkCommitCoordinator, Sink, SinkParam, SinkWriter, SinkWriterParam};
+use super::{
+    Result, SINK_TYPE_APPEND_ONLY, SINK_TYPE_OPTION, SINK_TYPE_UPSERT, SinkError, SinkWriterMetrics,
+};
+use crate::enforce_secret::EnforceSecret;
+use crate::sink::encoder::{DorisJsonConfig, JsonEncoder, RowEncoder};
+use crate::sink::writer::{LogSinkerOf, SinkWriter, SinkWriterExt};
+use crate::sink::{Sink, SinkParam, SinkWriterParam};
 
 pub const DORIS_SINK: &str = "doris";
+
+const fn default_stream_load_http_timeout_ms() -> u64 {
+    30 * 1000
+}
 
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct DorisCommon {
@@ -54,6 +58,14 @@ pub struct DorisCommon {
     pub database: String,
     #[serde(rename = "doris.table")]
     pub table: String,
+    #[serde(rename = "doris.partial_update")]
+    pub partial_update: Option<String>,
+}
+
+impl EnforceSecret for DorisCommon {
+    const ENFORCE_SECRET_PROPERTIES: phf::Set<&'static str> = phf::phf_set! {
+        "doris.password", "doris.user"
+    };
 }
 
 impl DorisCommon {
@@ -75,9 +87,30 @@ pub struct DorisConfig {
     pub common: DorisCommon,
 
     pub r#type: String, // accept "append-only" or "upsert"
+
+    /// The timeout in milliseconds for stream load http request, defaults to 30 seconds.
+    #[serde(
+        rename = "doris.stream_load.http.timeout.ms",
+        default = "default_stream_load_http_timeout_ms"
+    )]
+    #[serde_as(as = "DisplayFromStr")]
+    #[with_option(allow_alter_on_fly)]
+    pub stream_load_http_timeout_ms: u64,
+
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::HashMap<String, String>,
 }
+
+crate::impl_sink_unknown_fields!(DorisConfig);
+
+impl EnforceSecret for DorisConfig {
+    fn enforce_one(prop: &str) -> crate::error::ConnectorResult<()> {
+        DorisCommon::enforce_one(prop)
+    }
+}
+
 impl DorisConfig {
-    pub fn from_hashmap(properties: HashMap<String, String>) -> Result<Self> {
+    pub fn from_btreemap(properties: BTreeMap<String, String>) -> Result<Self> {
         let config =
             serde_json::from_value::<DorisConfig>(serde_json::to_value(properties).unwrap())
                 .map_err(|e| SinkError::Config(anyhow!(e)))?;
@@ -99,6 +132,17 @@ pub struct DorisSink {
     schema: Schema,
     pk_indices: Vec<usize>,
     is_append_only: bool,
+}
+
+impl EnforceSecret for DorisSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            DorisConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
 }
 
 impl DorisSink {
@@ -125,8 +169,10 @@ impl DorisSink {
             .collect();
 
         let rw_fields_name = self.schema.fields();
-        if rw_fields_name.len().ne(&doris_columns_desc.len()) {
-            return Err(SinkError::Doris("The length of the RisingWave column must be equal to the length of the doris column".to_string()));
+        if rw_fields_name.len() > doris_columns_desc.len() {
+            return Err(SinkError::Doris(
+                "The columns of the sink must be equal to or a superset of the target table's columns.".to_owned(),
+            ));
         }
 
         for i in rw_fields_name {
@@ -136,9 +182,10 @@ impl DorisSink {
                     i.name
                 ))
             })?;
-            if !Self::check_and_correct_column_type(&i.data_type, value.to_string())? {
+            if !Self::check_and_correct_column_type(&i.data_type, value.clone())? {
                 return Err(SinkError::Doris(format!(
-                    "Column type don't match, column name is {:?}. doris type is {:?} risingwave type is {:?} ",i.name,value,i.data_type
+                    "Column type don't match, column name is {:?}. doris type is {:?} risingwave type is {:?} ",
+                    i.name, value, i.data_type
                 )));
             }
         }
@@ -149,6 +196,8 @@ impl DorisSink {
         rw_data_type: &DataType,
         doris_data_type: String,
     ) -> Result<bool> {
+        let doris_data_type = doris_data_type.to_ascii_uppercase();
+        let is_variant = doris_data_type.contains("VARIANT");
         match rw_data_type {
             risingwave_common::types::DataType::Boolean => Ok(doris_data_type.contains("BOOLEAN")),
             risingwave_common::types::DataType::Int16 => Ok(doris_data_type.contains("SMALLINT")),
@@ -159,39 +208,55 @@ impl DorisSink {
             risingwave_common::types::DataType::Decimal => Ok(doris_data_type.contains("DECIMAL")),
             risingwave_common::types::DataType::Date => Ok(doris_data_type.contains("DATE")),
             risingwave_common::types::DataType::Varchar => {
-                Ok(doris_data_type.contains("STRING") | doris_data_type.contains("VARCHAR"))
+                Ok(
+                    doris_data_type.contains("STRING")
+                        || doris_data_type.contains("VARCHAR")
+                        || is_variant,
+                )
             }
             risingwave_common::types::DataType::Time => {
-                Err(SinkError::Doris("doris can not support Time".to_string()))
+                Err(SinkError::Doris("TIME is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned()))
             }
             risingwave_common::types::DataType::Timestamp => {
                 Ok(doris_data_type.contains("DATETIME"))
             }
             risingwave_common::types::DataType::Timestamptz => Err(SinkError::Doris(
-                "TIMESTAMP WITH TIMEZONE is not supported for Doris sink as Doris doesn't store time values with timezone information. Please convert to TIMESTAMP first.".to_string(),
+                "TIMESTAMP WITH TIMEZONE is not supported for Doris sink as Doris doesn't store time values with timezone information. Please convert to TIMESTAMP first.".to_owned(),
             )),
             risingwave_common::types::DataType::Interval => Err(SinkError::Doris(
-                "doris can not support Interval".to_string(),
+                "INTERVAL is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned(),
             )),
             risingwave_common::types::DataType::Struct(_) => Ok(doris_data_type.contains("STRUCT")),
             risingwave_common::types::DataType::List(_) => Ok(doris_data_type.contains("ARRAY")),
             risingwave_common::types::DataType::Bytea => {
-                Err(SinkError::Doris("doris can not support Bytea".to_string()))
+                Err(SinkError::Doris("BYTEA is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned()))
             }
-            risingwave_common::types::DataType::Jsonb => Ok(doris_data_type.contains("JSON")),
+            risingwave_common::types::DataType::Jsonb => {
+                Ok(doris_data_type.contains("JSON") || is_variant)
+            }
+            risingwave_common::types::DataType::Variant => {
+                Err(SinkError::Doris("VARIANT is not supported for Doris sink.".to_owned()))
+            }
             risingwave_common::types::DataType::Serial => Ok(doris_data_type.contains("BIGINT")),
             risingwave_common::types::DataType::Int256 => {
-                Err(SinkError::Doris("doris can not support Int256".to_string()))
+                Err(SinkError::Doris("INT256 is not supported for Doris sink.".to_owned()))
             }
+            risingwave_common::types::DataType::Map(_) => {
+                Err(SinkError::Doris("MAP is not supported for Doris sink.".to_owned()))
+            }
+            DataType::Vector(_) => {
+                Err(SinkError::Doris("VECTOR is not supported for Doris sink.".to_owned()))
+            },
         }
     }
 }
 
 impl Sink for DorisSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = LogSinkerOf<DorisSinkWriter>;
 
     const SINK_NAME: &'static str = DORIS_SINK;
+
+    crate::impl_validate_sink_unknown_fields!();
 
     async fn new_log_sinker(&self, writer_param: SinkWriterParam) -> Result<Self::LogSinker> {
         Ok(DorisSinkWriter::new(
@@ -201,13 +266,14 @@ impl Sink for DorisSink {
             self.is_append_only,
         )
         .await?
-        .into_log_sinker(writer_param.sink_metrics))
+        .into_log_sinker(SinkWriterMetrics::new(&writer_param)))
     }
 
     async fn validate(&self) -> Result<()> {
         if !self.is_append_only && self.pk_indices.is_empty() {
             return Err(SinkError::Config(anyhow!(
-                "Primary key not defined for upsert doris sink (please define in `primary_key` field)")));
+                "Primary key not defined for upsert doris sink (please define in `primary_key` field)"
+            )));
         }
         // check reachability
         let client = self.config.common.build_get_client();
@@ -240,13 +306,9 @@ impl TryFrom<SinkParam> for DorisSink {
 
     fn try_from(param: SinkParam) -> std::result::Result<Self, Self::Error> {
         let schema = param.schema();
-        let config = DorisConfig::from_hashmap(param.properties)?;
-        DorisSink::new(
-            config,
-            schema,
-            param.downstream_pk,
-            param.sink_type.is_append_only(),
-        )
+        let pk_indices = param.downstream_pk_or_empty();
+        let config = DorisConfig::from_btreemap(param.properties)?;
+        DorisSink::new(config, schema, pk_indices, param.sink_type.is_append_only())
     }
 }
 
@@ -258,21 +320,26 @@ impl DorisSinkWriter {
         is_append_only: bool,
     ) -> Result<Self> {
         let mut decimal_map = HashMap::default();
+        let mut variant_columns = HashSet::default();
         let doris_schema = config
             .common
             .build_get_client()
             .get_schema_from_doris()
             .await?;
-        doris_schema.properties.iter().for_each(|s| {
-            if let Some(v) = s.get_decimal_pre_scale() {
+        for s in &doris_schema.properties {
+            if let Some(v) = s.get_decimal_pre_scale()? {
                 decimal_map.insert(s.name.clone(), v);
             }
-        });
+            if s.is_variant() {
+                variant_columns.insert(s.name.clone());
+            }
+        }
 
         let header_builder = HeaderBuilder::new()
             .add_common_header()
             .set_user_password(config.common.user.clone(), config.common.password.clone())
             .add_json_format()
+            .set_partial_columns(config.common.partial_update.clone())
             .add_read_json_by_line();
         let header = if !is_append_only {
             header_builder.add_hidden_column().build()
@@ -285,6 +352,7 @@ impl DorisSinkWriter {
             config.common.database.clone(),
             config.common.table.clone(),
             header,
+            config.stream_load_http_timeout_ms,
         )?;
         Ok(Self {
             config,
@@ -293,7 +361,14 @@ impl DorisSinkWriter {
             inserter_inner_builder: doris_insert_builder,
             is_append_only,
             client: None,
-            row_encoder: JsonEncoder::new_with_doris(schema, None, decimal_map),
+            row_encoder: JsonEncoder::new_with_doris(
+                schema,
+                None,
+                DorisJsonConfig {
+                    decimal_scale: decimal_map,
+                    variant_columns,
+                },
+            ),
         })
     }
 
@@ -305,7 +380,7 @@ impl DorisSinkWriter {
             let row_json_string = Value::Object(self.row_encoder.encode(row)?).to_string();
             self.client
                 .as_mut()
-                .ok_or_else(|| SinkError::Doris("Can't find doris sink insert".to_string()))?
+                .ok_or_else(|| SinkError::Doris("Can't find doris sink insert".to_owned()))?
                 .write(row_json_string.into())
                 .await?;
         }
@@ -317,53 +392,41 @@ impl DorisSinkWriter {
             match op {
                 Op::Insert => {
                     let mut row_json_value = self.row_encoder.encode(row)?;
-                    row_json_value.insert(
-                        DORIS_DELETE_SIGN.to_string(),
-                        Value::String("0".to_string()),
-                    );
+                    row_json_value
+                        .insert(DORIS_DELETE_SIGN.to_owned(), Value::String("0".to_owned()));
                     let row_json_string = serde_json::to_string(&row_json_value).map_err(|e| {
                         SinkError::Doris(format!("Json derialize error: {}", e.as_report()))
                     })?;
                     self.client
                         .as_mut()
-                        .ok_or_else(|| {
-                            SinkError::Doris("Can't find doris sink insert".to_string())
-                        })?
+                        .ok_or_else(|| SinkError::Doris("Can't find doris sink insert".to_owned()))?
                         .write(row_json_string.into())
                         .await?;
                 }
                 Op::Delete => {
                     let mut row_json_value = self.row_encoder.encode(row)?;
-                    row_json_value.insert(
-                        DORIS_DELETE_SIGN.to_string(),
-                        Value::String("1".to_string()),
-                    );
+                    row_json_value
+                        .insert(DORIS_DELETE_SIGN.to_owned(), Value::String("1".to_owned()));
                     let row_json_string = serde_json::to_string(&row_json_value).map_err(|e| {
                         SinkError::Doris(format!("Json derialize error: {}", e.as_report()))
                     })?;
                     self.client
                         .as_mut()
-                        .ok_or_else(|| {
-                            SinkError::Doris("Can't find doris sink insert".to_string())
-                        })?
+                        .ok_or_else(|| SinkError::Doris("Can't find doris sink insert".to_owned()))?
                         .write(row_json_string.into())
                         .await?;
                 }
                 Op::UpdateDelete => {}
                 Op::UpdateInsert => {
                     let mut row_json_value = self.row_encoder.encode(row)?;
-                    row_json_value.insert(
-                        DORIS_DELETE_SIGN.to_string(),
-                        Value::String("0".to_string()),
-                    );
+                    row_json_value
+                        .insert(DORIS_DELETE_SIGN.to_owned(), Value::String("0".to_owned()));
                     let row_json_string = serde_json::to_string(&row_json_value).map_err(|e| {
                         SinkError::Doris(format!("Json derialize error: {}", e.as_report()))
                     })?;
                     self.client
                         .as_mut()
-                        .ok_or_else(|| {
-                            SinkError::Doris("Can't find doris sink insert".to_string())
-                        })?
+                        .ok_or_else(|| SinkError::Doris("Can't find doris sink insert".to_owned()))?
                         .write(row_json_string.into())
                         .await?;
                 }
@@ -399,13 +462,9 @@ impl SinkWriter for DorisSinkWriter {
             let client = self
                 .client
                 .take()
-                .ok_or_else(|| SinkError::Doris("Can't find doris inserter".to_string()))?;
+                .ok_or_else(|| SinkError::Doris("Can't find doris inserter".to_owned()))?;
             client.finish().await?;
         }
-        Ok(())
-    }
-
-    async fn update_vnode_bitmap(&mut self, _vnode_bitmap: Arc<Bitmap>) -> Result<()> {
         Ok(())
     }
 }
@@ -485,12 +544,53 @@ pub struct DorisField {
     aggregation_type: String,
 }
 impl DorisField {
-    pub fn get_decimal_pre_scale(&self) -> Option<u8> {
+    pub fn get_decimal_pre_scale(&self) -> Result<Option<u8>> {
         if self.r#type.contains("DECIMAL") {
-            Some(self.scale.clone().unwrap().parse::<u8>().unwrap())
+            let scale = self
+                .scale
+                .as_ref()
+                .ok_or_else(|| {
+                    SinkError::Doris(format!(
+                        "In doris, the type of {} is DECIMAL, but `scale` is not found",
+                        self.name
+                    ))
+                })?
+                .parse::<u8>()
+                .map_err(|err| {
+                    SinkError::Doris(format!(
+                        "Unable to convert decimal's scale to u8. error: {:?}",
+                        err.kind()
+                    ))
+                })?;
+            Ok(Some(scale))
         } else {
-            None
+            Ok(None)
         }
+    }
+
+    pub fn is_variant(&self) -> bool {
+        self.r#type.to_ascii_uppercase().contains("VARIANT")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_common::types::DataType;
+
+    use super::DorisSink;
+
+    #[test]
+    fn test_jsonb_can_write_to_variant() {
+        assert!(
+            DorisSink::check_and_correct_column_type(&DataType::Jsonb, "VARIANT".into()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_varchar_can_write_to_variant() {
+        assert!(
+            DorisSink::check_and_correct_column_type(&DataType::Varchar, "VARIANT".into()).unwrap()
+        );
     }
 }
 

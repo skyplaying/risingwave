@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 #[derive(Copy, Default, Debug, Clone, PartialEq, Eq)]
 // Some variants are never constructed so allow dead code here.
-#[allow(dead_code)]
+
 pub enum IsolationLevel {
     #[default]
     ReadCommitted,

@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,18 +16,14 @@
 //!
 //! This should the default arrow version to be used in our system.
 //!
-//! The corresponding version of arrow is currently used by `udf` and `iceberg` sink.
+//! The corresponding version of arrow is currently used by `udf`.
 
 use std::sync::Arc;
 
-pub use arrow_impl::{FromArrow, ToArrow};
-use {arrow_array, arrow_buffer, arrow_cast, arrow_schema};
-
+pub use super::arrow_58::{
+    FromArrow, ToArrow, arrow_array, arrow_buffer, arrow_cast, arrow_schema,
+};
 use crate::array::{ArrayError, ArrayImpl, DataType, DecimalArray, JsonbArray};
-
-#[expect(clippy::duplicate_mod)]
-#[path = "./arrow_impl.rs"]
-mod arrow_impl;
 
 /// Arrow conversion for UDF.
 #[derive(Default, Debug)]
@@ -124,8 +120,16 @@ impl FromArrow for UdfArrowConvert {
 
 #[cfg(test)]
 mod tests {
+
+    use arrow_array::Array as _;
+
     use super::*;
     use crate::array::*;
+
+    /// Wraps an array's own type into a nameless field for the `from_*_array` calls.
+    fn typed_field(array: &impl arrow_array::Array) -> arrow_schema::Field {
+        arrow_schema::Field::new("", array.data_type().clone(), true)
+    }
 
     #[test]
     fn struct_array() {
@@ -143,10 +147,11 @@ mod tests {
         );
 
         // Empty array - arrow to risingwave conversion.
-        let test_arr_2 = arrow_array::StructArray::from(vec![]);
+        let test_arr_2 = arrow_array::StructArray::new_empty_fields(0, None);
+        let test_arr_2_field = typed_field(&test_arr_2);
         assert_eq!(
             UdfArrowConvert::default()
-                .from_struct_array(&test_arr_2)
+                .from_struct_array(&test_arr_2_field, &test_arr_2)
                 .unwrap()
                 .len(),
             0
@@ -174,8 +179,9 @@ mod tests {
             ),
         ])
         .unwrap();
+        let struct_field = typed_field(&test_arrow_struct_array);
         let actual_risingwave_struct_array = UdfArrowConvert::default()
-            .from_struct_array(&test_arrow_struct_array)
+            .from_struct_array(&struct_field, &test_arrow_struct_array)
             .unwrap()
             .into_struct();
         let expected_risingwave_struct_array = StructArray::new(
@@ -199,9 +205,131 @@ mod tests {
         let arrow = UdfArrowConvert::default()
             .list_to_arrow(&data_type, &array)
             .unwrap();
+        let list_field = typed_field(&arrow);
         let rw_array = UdfArrowConvert::default()
-            .from_list_array(arrow.as_any().downcast_ref().unwrap())
+            .from_list_array(&list_field, arrow.as_any().downcast_ref().unwrap())
             .unwrap();
         assert_eq!(rw_array.as_list(), &array);
+    }
+
+    #[test]
+    fn map() {
+        let map_type = MapType::from_kv(DataType::Varchar, DataType::Int32);
+        let rw_map_type = DataType::Map(map_type.clone());
+        let mut builder = MapArrayBuilder::with_type(3, rw_map_type.clone());
+        builder.append_owned(Some(
+            MapValue::try_from_kv(
+                ListValue::from_str("{a,b,c}", &DataType::Varchar.list()).unwrap(),
+                ListValue::from_str("{1,2,3}", &DataType::Int32.list()).unwrap(),
+            )
+            .unwrap(),
+        ));
+        builder.append_owned(None);
+        builder.append_owned(Some(
+            MapValue::try_from_kv(
+                ListValue::from_str("{a,c}", &DataType::Varchar.list()).unwrap(),
+                ListValue::from_str("{1,3}", &DataType::Int32.list()).unwrap(),
+            )
+            .unwrap(),
+        ));
+        let rw_array = builder.finish();
+
+        let arrow_map_type = UdfArrowConvert::default()
+            .map_type_to_arrow(&map_type)
+            .unwrap();
+        expect_test::expect![[r#"
+            Map(
+                Field {
+                    name: "entries",
+                    data_type: Struct(
+                        [
+                            Field {
+                                name: "key",
+                                data_type: Utf8,
+                            },
+                            Field {
+                                name: "value",
+                                data_type: Int32,
+                                nullable: true,
+                            },
+                        ],
+                    ),
+                },
+                false,
+            )
+        "#]]
+        .assert_debug_eq(&arrow_map_type);
+        let rw_map_type_new = UdfArrowConvert::default()
+            .from_field(&arrow_schema::Field::new(
+                "map",
+                arrow_map_type.clone(),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(rw_map_type, rw_map_type_new);
+        let arrow = UdfArrowConvert::default()
+            .map_to_arrow(&arrow_map_type, &rw_array)
+            .unwrap();
+        expect_test::expect![[r#"
+            MapArray
+            [
+              StructArray
+            -- validity:
+            [
+              valid,
+              valid,
+              valid,
+            ]
+            [
+            -- child 0: "key" (Utf8)
+            StringArray
+            [
+              "a",
+              "b",
+              "c",
+            ]
+            -- child 1: "value" (Int32)
+            PrimitiveArray<Int32>
+            [
+              1,
+              2,
+              3,
+            ]
+            ],
+              null,
+              StructArray
+            -- validity:
+            [
+              valid,
+              valid,
+            ]
+            [
+            -- child 0: "key" (Utf8)
+            StringArray
+            [
+              "a",
+              "c",
+            ]
+            -- child 1: "value" (Int32)
+            PrimitiveArray<Int32>
+            [
+              1,
+              3,
+            ]
+            ],
+            ]"#]]
+        .assert_eq(
+            &format!("{:#?}", arrow)
+                .lines()
+                .map(|s| s.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        let map_field = typed_field(&arrow);
+        let rw_array_new = UdfArrowConvert::default()
+            .from_map_array(&map_field, arrow.as_any().downcast_ref().unwrap())
+            .unwrap();
+        assert_eq!(&rw_array, rw_array_new.as_map());
     }
 }

@@ -24,12 +24,12 @@ pub use rpc_server::SimServer;
 mod service;
 
 use std::net::SocketAddr;
-use std::ops::{Range, RangeBounds};
+use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use madsim::rand::{thread_rng, RngCore};
-use madsim::time::{sleep, Duration};
+use madsim::rand::{RngCore, thread_rng};
+use madsim::time::{Duration, sleep};
 use risingwave_common::range::RangeBoundsExt;
 
 use self::client::Client;
@@ -118,7 +118,7 @@ pub struct SimObjectStore {
 impl ObjectStore for SimObjectStore {
     type StreamingUploader = SimStreamingUploader;
 
-    fn get_object_prefix(&self, _obj_id: u64) -> String {
+    fn get_object_prefix(&self, _obj_id: u64, _use_new_object_prefix_strategy: bool) -> String {
         String::default()
     }
 
@@ -180,7 +180,7 @@ impl ObjectStore for SimObjectStore {
     async fn streaming_read(
         &self,
         path: &str,
-        range: Range<usize>,
+        range: impl ObjectRangeBounds,
     ) -> ObjectResult<ObjectDataStream> {
         let path = path.to_string();
         let resp = self
@@ -221,7 +221,18 @@ impl ObjectStore for SimObjectStore {
         }
     }
 
-    async fn list(&self, path: &str) -> ObjectResult<ObjectMetadataIter> {
+    async fn list(
+        &self,
+        path: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
+        if let Some(start_after) = start_after {
+            tracing::warn!(start_after, "start_after is ignored by SimObjectStore");
+        }
+        if let Some(limit) = limit {
+            tracing::warn!(limit, "limit is ignored by SimObjectStore");
+        }
         let path = path.to_string();
         let resp = self
             .client

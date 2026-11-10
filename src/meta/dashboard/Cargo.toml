@@ -6,7 +6,6 @@ homepage = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = "1"
@@ -14,21 +13,20 @@ axum = { workspace = true }
 axum-embed = "0.1"
 bytes = "1"
 mime_guess = "2"
-reqwest = "0.12.2"
+reqwest = "0.13.4"
 rust-embed = { version = "8", features = ["interpolate-folder-path", "mime-guess"] }
 thiserror-ext = { workspace = true }
 tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.44", features = ["full"] }
 tracing-subscriber = "0.3"
 
 [build-dependencies]
 anyhow = "1"
 cargo-emit = "0.2"
 dircpy = "0.3"
-npm_rs = "1"
 
 [lints]
 workspace = true

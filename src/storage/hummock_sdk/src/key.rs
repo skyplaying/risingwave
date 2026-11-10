@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use risingwave_common::catalog::TableId;
 use risingwave_common::hash::VirtualNode;
 use risingwave_common_estimate_size::EstimateSize;
-use serde::{Deserialize, Serialize};
 
 use crate::{EpochWithGap, HummockEpoch};
 
@@ -55,14 +54,21 @@ pub fn is_empty_key_range(key_range: &TableKeyRange) -> bool {
     }
 }
 
-// returning left inclusive and right exclusive
-pub fn vnode_range(range: &TableKeyRange) -> (usize, usize) {
-    let (left, right) = range;
-    let left = match left {
+/// Returns left inclusive and right exclusive vnode index of the given range.
+///
+/// # Vnode count unawareness
+///
+/// Note that this function is not aware of the vnode count that is actually used in this table.
+/// For example, if the total vnode count is 256, `Unbounded` can be a correct end bound for vnode 255,
+/// but this function will still return `Excluded(256)`.
+///
+/// See also [`vnode`] and [`end_bound_of_vnode`] which hold such invariant.
+pub fn vnode_range<T: AsRef<[u8]>>(range: &impl RangeBounds<TableKey<T>>) -> (usize, usize) {
+    let left = match range.start_bound() {
         Included(key) | Excluded(key) => key.vnode_part().to_index(),
         Unbounded => 0,
     };
-    let right = match right {
+    let right = match range.end_bound() {
         Included(key) => key.vnode_part().to_index() + 1,
         Excluded(key) => {
             let (vnode, inner_key) = key.split_vnode();
@@ -74,12 +80,20 @@ pub fn vnode_range(range: &TableKeyRange) -> (usize, usize) {
                 vnode.to_index() + 1
             }
         }
-        Unbounded => VirtualNode::COUNT,
+        Unbounded => VirtualNode::MAX_REPRESENTABLE.to_index() + 1,
     };
     (left, right)
 }
 
-// Ensure there is only one vnode involved in table key range and return the vnode
+/// Ensure there is only one vnode involved in table key range and return the vnode.
+///
+/// # Vnode count unawareness
+///
+/// Note that this function is not aware of the vnode count that is actually used in this table.
+/// For example, if the total vnode count is 256, `Unbounded` can be a correct end bound for vnode 255,
+/// but this function will still require `Excluded(256)`.
+///
+/// See also [`vnode_range`] and [`end_bound_of_vnode`] which hold such invariant.
 pub fn vnode(range: &TableKeyRange) -> VirtualNode {
     let (l, r_exclusive) = vnode_range(range);
     assert_eq!(r_exclusive - l, 1);
@@ -277,7 +291,6 @@ pub fn prev_epoch(epoch: &[u8]) -> Vec<u8> {
 /// compute the next full key of the given full key
 ///
 /// if the `user_key` has no successor key, the result will be a empty vec
-
 pub fn next_full_key(full_key: &[u8]) -> Vec<u8> {
     let (user_key, epoch) = split_key_epoch(full_key);
     let prev_epoch = prev_epoch(epoch);
@@ -300,7 +313,6 @@ pub fn next_full_key(full_key: &[u8]) -> Vec<u8> {
 /// compute the prev full key of the given full key
 ///
 /// if the `user_key` has no predecessor key, the result will be a empty vec
-
 pub fn prev_full_key(full_key: &[u8]) -> Vec<u8> {
     let (user_key, epoch) = split_key_epoch(full_key);
     let next_epoch = next_epoch(epoch);
@@ -320,8 +332,15 @@ pub fn prev_full_key(full_key: &[u8]) -> Vec<u8> {
     }
 }
 
+/// [`Unbounded`] if the vnode is the maximum representable value (i.e. [`VirtualNode::MAX_REPRESENTABLE`]),
+/// otherwise [`Excluded`] the next vnode.
+///
+/// Note that this function is not aware of the vnode count that is actually used in this table.
+/// For example, if the total vnode count is 256, `Unbounded` can be a correct end bound for vnode 255,
+/// but this function will still return `Excluded(256)`. See also [`vnode`] and [`vnode_range`] which
+/// rely on such invariant.
 pub fn end_bound_of_vnode(vnode: VirtualNode) -> Bound<Bytes> {
-    if vnode == VirtualNode::MAX {
+    if vnode == VirtualNode::MAX_REPRESENTABLE {
         Unbounded
     } else {
         let end_bound_index = vnode.to_index() + 1;
@@ -420,7 +439,7 @@ impl SetSlice<Bytes> for Bytes {
     }
 }
 
-pub trait CopyFromSlice {
+pub trait CopyFromSlice: Send + 'static {
     fn copy_from_slice(slice: &[u8]) -> Self;
 }
 
@@ -436,19 +455,17 @@ impl CopyFromSlice for Bytes {
     }
 }
 
+impl CopyFromSlice for () {
+    fn copy_from_slice(_: &[u8]) -> Self {}
+}
+
 /// [`TableKey`] is an internal concept in storage. It's a wrapper around the key directly from the
 /// user, to make the code clearer and avoid confusion with encoded [`UserKey`] and [`FullKey`].
 ///
 /// Its name come from the assumption that Hummock is always accessed by a table-like structure
 /// identified by a [`TableId`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
-pub struct TableKey<T: AsRef<[u8]>>(
-    #[serde(bound(
-        serialize = "T: serde::Serialize + serde_bytes::Serialize",
-        deserialize = "T: serde::Deserialize<'de> + serde_bytes::Deserialize<'de>"
-    ))]
-    pub T,
-);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct TableKey<T: AsRef<[u8]>>(pub T);
 
 impl<T: AsRef<[u8]>> Debug for TableKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -473,6 +490,21 @@ impl<T: AsRef<[u8]>> DerefMut for TableKey<T> {
 impl<T: AsRef<[u8]>> AsRef<[u8]> for TableKey<T> {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
+    }
+}
+
+impl TableKey<Bytes> {
+    pub fn split_vnode_bytes(&self) -> (VirtualNode, Bytes) {
+        debug_assert!(
+            self.0.len() >= VirtualNode::SIZE,
+            "too short table key: {:?}",
+            self.0.as_ref()
+        );
+        let (vnode, _) = self.0.split_first_chunk::<{ VirtualNode::SIZE }>().unwrap();
+        (
+            VirtualNode::from_be_bytes(*vnode),
+            self.0.slice(VirtualNode::SIZE..),
+        )
     }
 }
 
@@ -516,7 +548,7 @@ impl EstimateSize for TableKey<Bytes> {
     }
 }
 
-impl<'a> TableKey<&'a [u8]> {
+impl TableKey<&[u8]> {
     pub fn copy_into<T: CopyFromSlice + AsRef<[u8]>>(&self) -> TableKey<T> {
         TableKey(T::copy_from_slice(self.as_ref()))
     }
@@ -542,25 +574,17 @@ pub fn gen_key_from_str(vnode: VirtualNode, payload: &str) -> TableKey<Bytes> {
 /// will group these two values into one struct for convenient filtering.
 ///
 /// The encoded format is | `table_id` | `table_key` |.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct UserKey<T: AsRef<[u8]>> {
     // When comparing `UserKey`, we first compare `table_id`, then `table_key`. So the order of
     // declaration matters.
     pub table_id: TableId,
-    #[serde(bound(
-        serialize = "T: serde::Serialize + serde_bytes::Serialize",
-        deserialize = "T: serde::Deserialize<'de> + serde_bytes::Deserialize<'de>"
-    ))]
     pub table_key: TableKey<T>,
 }
 
 impl<T: AsRef<[u8]>> Debug for UserKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "UserKey {{ {}, {:?} }}",
-            self.table_id.table_id, self.table_key
-        )
+        write!(f, "UserKey {{ {}, {:?} }}", self.table_id, self.table_key)
     }
 }
 
@@ -582,20 +606,11 @@ impl<T: AsRef<[u8]>> UserKey<T> {
 
     /// Encode in to a buffer.
     pub fn encode_into(&self, buf: &mut impl BufMut) {
-        buf.put_u32(self.table_id.table_id());
+        buf.put_u32(self.table_id.as_raw_id());
         buf.put_slice(self.table_key.as_ref());
     }
 
     pub fn encode_table_key_into(&self, buf: &mut impl BufMut) {
-        buf.put_slice(self.table_key.as_ref());
-    }
-
-    /// Encode in to a buffer.
-    ///
-    /// length prefixed requires 4B more than its `encoded_len()`
-    pub fn encode_length_prefixed(&self, mut buf: impl BufMut) {
-        buf.put_u32(self.table_id.table_id());
-        buf.put_u32(self.table_key.as_ref().len() as u32);
         buf.put_slice(self.table_key.as_ref());
     }
 
@@ -643,7 +658,7 @@ impl<'a> UserKey<&'a [u8]> {
     }
 }
 
-impl<'a, T: AsRef<[u8]> + Clone> UserKey<&'a T> {
+impl<T: AsRef<[u8]> + Clone> UserKey<&T> {
     pub fn cloned(self) -> UserKey<T> {
         UserKey {
             table_id: self.table_id,
@@ -655,16 +670,6 @@ impl<'a, T: AsRef<[u8]> + Clone> UserKey<&'a T> {
 impl<T: AsRef<[u8]>> UserKey<T> {
     pub fn as_ref(&self) -> UserKey<&[u8]> {
         UserKey::new(self.table_id, TableKey(self.table_key.as_ref()))
-    }
-}
-
-impl UserKey<Vec<u8>> {
-    pub fn decode_length_prefixed(buf: &mut &[u8]) -> Self {
-        let table_id = buf.get_u32();
-        let len = buf.get_u32() as usize;
-        let data = buf[..len].to_vec();
-        buf.advance(len);
-        UserKey::new(TableId::new(table_id), TableKey(data))
     }
 }
 
@@ -758,12 +763,6 @@ impl<T: AsRef<[u8]>> FullKey<T> {
         );
         self.encode_into(&mut buf);
         buf
-    }
-
-    // Encode in to a buffer.
-    pub fn encode_into_without_table_id(&self, buf: &mut impl BufMut) {
-        self.user_key.encode_table_key_into(buf);
-        buf.put_u64(self.epoch_with_gap.as_u64());
     }
 
     pub fn encode_reverse_epoch(&self) -> Vec<u8> {
@@ -882,48 +881,82 @@ impl<T: AsRef<[u8]> + Ord + Eq> PartialOrd for FullKey<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PointRange<T: AsRef<[u8]>> {
-    // When comparing `PointRange`, we first compare `left_user_key`, then
-    // `is_exclude_left_key`. Therefore the order of declaration matters.
-    #[serde(bound(
-        serialize = "T: serde::Serialize + serde_bytes::Serialize",
-        deserialize = "T: serde::Deserialize<'de> + serde_bytes::Deserialize<'de>"
-    ))]
-    pub left_user_key: UserKey<T>,
-    /// `PointRange` represents the left user key itself if `is_exclude_left_key==false`
-    /// while represents the right δ Neighborhood of the left user key if
-    /// `is_exclude_left_key==true`.
-    pub is_exclude_left_key: bool,
-}
+pub mod range_delete_backward_compatibility_serde_struct {
+    use bytes::{Buf, BufMut};
+    use risingwave_common::catalog::TableId;
+    use serde::{Deserialize, Serialize};
 
-impl<T: AsRef<[u8]>> PointRange<T> {
-    pub fn from_user_key(left_user_key: UserKey<T>, is_exclude_left_key: bool) -> Self {
-        Self {
-            left_user_key,
-            is_exclude_left_key,
+    #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    pub struct TableKey(Vec<u8>);
+
+    #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    #[serde(from = "UserKeySerde", into = "UserKeySerde")]
+    pub struct UserKey {
+        // When comparing `UserKey`, we first compare `table_id`, then `table_key`. So the order of
+        // declaration matters.
+        pub table_id: TableId,
+        pub table_key: TableKey,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    pub struct TableIdSerde {
+        table_id: u32,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    struct UserKeySerde {
+        table_id: TableIdSerde,
+        table_key: TableKey,
+    }
+
+    impl From<UserKeySerde> for UserKey {
+        fn from(value: UserKeySerde) -> Self {
+            Self {
+                table_id: TableId::new(value.table_id.table_id),
+                table_key: value.table_key,
+            }
         }
     }
 
-    pub fn as_ref(&self) -> PointRange<&[u8]> {
-        PointRange::from_user_key(self.left_user_key.as_ref(), self.is_exclude_left_key)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.left_user_key.is_empty()
-    }
-}
-
-impl<'a> PointRange<&'a [u8]> {
-    pub fn to_vec(&self) -> PointRange<Vec<u8>> {
-        self.copy_into()
-    }
-
-    pub fn copy_into<T: CopyFromSlice + AsRef<[u8]>>(&self) -> PointRange<T> {
-        PointRange {
-            left_user_key: self.left_user_key.copy_into(),
-            is_exclude_left_key: self.is_exclude_left_key,
+    impl From<UserKey> for UserKeySerde {
+        fn from(value: UserKey) -> Self {
+            Self {
+                table_id: TableIdSerde {
+                    table_id: value.table_id.as_raw_id(),
+                },
+                table_key: value.table_key,
+            }
         }
+    }
+
+    impl UserKey {
+        pub fn decode_length_prefixed(buf: &mut &[u8]) -> Self {
+            let table_id = buf.get_u32();
+            let len = buf.get_u32() as usize;
+            let data = buf[..len].to_vec();
+            buf.advance(len);
+            UserKey {
+                table_id: TableId::new(table_id),
+                table_key: TableKey(data),
+            }
+        }
+
+        pub fn encode_length_prefixed(&self, mut buf: impl BufMut) {
+            buf.put_u32(self.table_id.as_raw_id());
+            buf.put_u32(self.table_key.0.as_slice().len() as u32);
+            buf.put_slice(self.table_key.0.as_slice());
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    pub struct PointRange {
+        // When comparing `PointRange`, we first compare `left_user_key`, then
+        // `is_exclude_left_key`. Therefore the order of declaration matters.
+        pub left_user_key: UserKey,
+        /// `PointRange` represents the left user key itself if `is_exclude_left_key==false`
+        /// while represents the right δ Neighborhood of the left user key if
+        /// `is_exclude_left_key==true`.
+        pub is_exclude_left_key: bool,
     }
 }
 
@@ -946,7 +979,7 @@ impl EmptySliceRef for Vec<u8> {
 }
 
 const EMPTY_SLICE: &[u8] = b"";
-impl<'a> EmptySliceRef for &'a [u8] {
+impl EmptySliceRef for &[u8] {
     fn empty_slice_ref<'b>() -> &'b Self {
         &EMPTY_SLICE
     }
@@ -967,7 +1000,7 @@ pub fn bound_table_key_range<T: AsRef<[u8]> + EmptySliceRef>(
         Included(b) => Included(UserKey::new(table_id, TableKey(&b.0))),
         Excluded(b) => Excluded(UserKey::new(table_id, TableKey(&b.0))),
         Unbounded => {
-            if let Some(next_table_id) = table_id.table_id().checked_add(1) {
+            if let Some(next_table_id) = table_id.as_raw_id().checked_add(1) {
                 Excluded(UserKey::new(
                     next_table_id.into(),
                     TableKey(T::empty_slice_ref()),
@@ -1006,7 +1039,7 @@ impl<T: AsRef<[u8]> + Ord + Eq, const SKIP_DEDUP: bool> FullKeyTracker<T, SKIP_D
     /// use risingwave_hummock_sdk::EpochWithGap;
     /// use risingwave_hummock_sdk::key::{FullKey, FullKeyTracker, TableKey};
     ///
-    /// let table_id = TableId { table_id: 1 };
+    /// let table_id = TableId::new(1);
     /// let full_key1 = FullKey::new(table_id, TableKey(Bytes::from("c")), 5 << EPOCH_AVAILABLE_BITS);
     /// let mut a: FullKeyTracker<_> = FullKeyTracker::<Bytes>::new(full_key1.clone());
     ///
@@ -1251,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uesr_key_order() {
+    fn test_user_key_order() {
         let a = UserKey::new(TableId::new(1), TableKey(b"aaa".to_vec()));
         let b = UserKey::new(TableId::new(2), TableKey(b"aaa".to_vec()));
         let c = UserKey::new(TableId::new(2), TableKey(b"bbb".to_vec()));
@@ -1299,7 +1332,7 @@ mod tests {
                 Excluded(TableKey(concat(234, b"")))
             )
         );
-        let max_vnode = VirtualNode::COUNT - 1;
+        let max_vnode = VirtualNode::MAX_REPRESENTABLE.to_index();
         assert_eq!(
             prefixed_range_with_vnode(
                 (Bound::<Bytes>::Unbounded, Bound::<Bytes>::Unbounded),
@@ -1332,7 +1365,7 @@ mod tests {
             Excluded(b"1".as_slice()),
             Unbounded,
         ];
-        for vnode in 0..VirtualNode::COUNT {
+        for vnode in 0..VirtualNode::MAX_COUNT {
             for left in &left_bound {
                 for right in &right_bound {
                     assert_eq!(

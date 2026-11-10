@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use risingwave_common::catalog::TableOption;
+use bytes::Bytes;
+use risingwave_common::catalog::{TableId, TableOption};
 use risingwave_common::util::epoch::Epoch;
 use risingwave_hummock_sdk::compaction_group::StateTableId;
-use risingwave_hummock_sdk::key_range::KeyRangeCommon;
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::{InputLevel, KeyRange, SstableInfo};
+use risingwave_hummock_sdk::key_range::{KeyRange, KeyRangeCommon};
+use risingwave_hummock_sdk::level::{InputLevel, Levels};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 
 use super::CompactionInput;
 use crate::hummock::level_handler::LevelHandler;
@@ -46,7 +47,7 @@ impl TtlPickerState {
 
     pub fn init(&mut self, key_range: KeyRange) {
         self.last_select_end_bound = KeyRange {
-            left: vec![],
+            left: Bytes::default(),
             right: key_range.left.clone(),
             right_exclusive: true,
         };
@@ -60,12 +61,12 @@ impl TtlPickerState {
 }
 
 pub struct TtlReclaimCompactionPicker {
-    table_id_to_ttl: HashMap<u32, u32>,
+    table_id_to_ttl: HashMap<TableId, u32>,
 }
 
 impl TtlReclaimCompactionPicker {
-    pub fn new(table_id_to_options: HashMap<StateTableId, TableOption>) -> Self {
-        let table_id_to_ttl: HashMap<u32, u32> = table_id_to_options
+    pub fn new(table_id_to_options: &HashMap<StateTableId, TableOption>) -> Self {
+        let table_id_to_ttl: HashMap<TableId, u32> = table_id_to_options
             .iter()
             .filter(|id_to_option| {
                 let table_option = id_to_option.1;
@@ -78,7 +79,7 @@ impl TtlReclaimCompactionPicker {
     }
 
     fn filter(&self, sst: &SstableInfo, current_epoch_physical_time: u64) -> bool {
-        let table_id_in_sst = sst.table_ids.iter().cloned().collect::<HashSet<u32>>();
+        let table_id_in_sst = sst.table_ids.iter().cloned().collect::<HashSet<_>>();
         let expire_epoch =
             Epoch::from_physical_time(current_epoch_physical_time - MIN_TTL_EXPIRE_INTERVAL_MS);
 
@@ -137,9 +138,9 @@ impl TtlReclaimCompactionPicker {
             let last_sst = reclaimed_level.table_infos.last().unwrap();
 
             let key_range_this_round = KeyRange {
-                left: first_sst.key_range.as_ref().unwrap().left.clone(),
-                right: last_sst.key_range.as_ref().unwrap().right.clone(),
-                right_exclusive: last_sst.key_range.as_ref().unwrap().right_exclusive,
+                left: first_sst.key_range.left.clone(),
+                right: last_sst.key_range.right.clone(),
+                right_exclusive: last_sst.key_range.right_exclusive,
             };
 
             state.init(key_range_this_round);
@@ -148,11 +149,7 @@ impl TtlReclaimCompactionPicker {
         let current_epoch_physical_time = Epoch::now().physical_time();
 
         for sst in &reclaimed_level.table_infos {
-            let unmatched_sst = sst
-                .key_range
-                .as_ref()
-                .unwrap()
-                .sstable_overlap(&state.last_select_end_bound);
+            let unmatched_sst = sst.key_range.sstable_overlap(&state.last_select_end_bound);
 
             if unmatched_sst
                 || level_handler.is_pending_compact(&sst.sst_id)
@@ -173,13 +170,13 @@ impl TtlReclaimCompactionPicker {
 
         let select_last_sst = select_input_ssts.last().unwrap();
         state.last_select_end_bound.full_key_extend(&KeyRange {
-            left: vec![],
-            right: select_last_sst.key_range.as_ref().unwrap().right.clone(),
-            right_exclusive: select_last_sst.key_range.as_ref().unwrap().right_exclusive,
+            left: Bytes::default(),
+            right: select_last_sst.key_range.right.clone(),
+            right_exclusive: select_last_sst.key_range.right_exclusive,
         });
 
         Some(CompactionInput {
-            select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
+            select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
             total_file_count: select_input_ssts.len() as _,
             input_levels: vec![
                 InputLevel {
@@ -201,11 +198,16 @@ impl TtlReclaimCompactionPicker {
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use itertools::Itertools;
+    use risingwave_common::catalog::TableId;
+    use risingwave_hummock_sdk::level::Level;
+    use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
+    use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
+    pub use risingwave_pb::hummock::LevelType;
     use risingwave_pb::hummock::compact_task;
-    pub use risingwave_pb::hummock::{Level, LevelType};
 
     use super::*;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
@@ -216,6 +218,7 @@ mod test {
     use crate::hummock::compaction::selector::{CompactionSelector, TtlCompactionSelector};
     use crate::hummock::compaction::{CompactionDeveloperConfig, LocalSelectorStatistic};
     use crate::hummock::model::CompactionGroup;
+    use crate::hummock::test_utils::compaction_selector_context;
 
     #[test]
     fn test_ttl_reclaim_compaction_selector() {
@@ -244,7 +247,7 @@ mod test {
             ),
             Level {
                 level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table_with_ids_and_epochs(2, 1, 0, 100, 1, vec![2], expired_epoch, 0),
                     generate_table_with_ids_and_epochs(
@@ -347,24 +350,31 @@ mod test {
 
         {
             let sst_10 = levels[3].table_infos.get_mut(8).unwrap();
-            assert_eq!(10, sst_10.get_sst_id());
-            sst_10.key_range.as_mut().unwrap().right_exclusive = true;
+            assert_eq!(10, sst_10.sst_id);
+            *sst_10 = SstableInfoInner {
+                key_range: KeyRange {
+                    right_exclusive: true,
+                    ..sst_10.key_range.clone()
+                },
+                ..sst_10.get_inner()
+            }
+            .into();
         }
 
         assert_eq!(levels.len(), 4);
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
         let mut levels_handler = (0..5).map(LevelHandler::new).collect_vec();
         let mut local_stats = LocalSelectorStatistic::default();
         let mut selector = TtlCompactionSelector::default();
         {
-            let table_id_to_options: HashMap<u32, TableOption> = (2..=10)
+            let table_id_to_options: HashMap<TableId, TableOption> = (2..=10)
                 .map(|table_id| {
                     (
-                        table_id as u32,
+                        table_id.into(),
                         TableOption {
                             retention_seconds: Some(5_u32),
                         },
@@ -375,12 +385,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    table_id_to_options,
-                    Arc::new(CompactionDeveloperConfig::default()),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &table_id_to_options,
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -388,10 +403,8 @@ mod test {
             assert_eq!(task.input.input_levels[0].level_idx, 4);
             assert_eq!(task.input.input_levels[0].table_infos.len(), 1);
 
-            let mut start_id = 2;
-            for sst in &task.input.input_levels[0].table_infos {
-                assert_eq!(start_id, sst.get_sst_id());
-                start_id += 1;
+            for (i, sst) in task.input.input_levels[0].table_infos.iter().enumerate() {
+                assert_eq!(2 + i as u64, sst.sst_id);
             }
 
             assert_eq!(task.input.input_levels[1].level_idx, 4);
@@ -410,10 +423,10 @@ mod test {
                 }
             }
 
-            let table_id_to_options: HashMap<u32, TableOption> = (2..=10)
+            let table_id_to_options: HashMap<TableId, TableOption> = (2..=10)
                 .map(|table_id| {
                     (
-                        table_id as u32,
+                        table_id.into(),
                         TableOption {
                             retention_seconds: Some(5_u32),
                         },
@@ -425,12 +438,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    table_id_to_options.clone(),
-                    Arc::new(CompactionDeveloperConfig::default()),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &table_id_to_options,
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -442,7 +460,7 @@ mod test {
 
             let mut start_id = 3;
             for sst in &task.input.input_levels[0].table_infos {
-                assert_eq!(start_id, sst.get_sst_id());
+                assert_eq!(start_id, sst.sst_id);
                 start_id += 1;
             }
 
@@ -458,12 +476,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    table_id_to_options.clone(),
-                    Arc::new(CompactionDeveloperConfig::default()),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &table_id_to_options,
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -478,7 +501,7 @@ mod test {
                 compact_task::TaskType::Ttl
             ));
             for sst in &task.input.input_levels[0].table_infos {
-                assert_eq!(start_id, sst.get_sst_id());
+                assert_eq!(start_id, sst.sst_id);
                 start_id += 1;
             }
         }
@@ -492,10 +515,10 @@ mod test {
 
             // rebuild selector
             selector = TtlCompactionSelector::default();
-            let mut table_id_to_options: HashMap<u32, TableOption> = (2..=10)
+            let mut table_id_to_options: HashMap<TableId, TableOption> = (2..=10)
                 .map(|table_id| {
                     (
-                        table_id as u32,
+                        table_id.into(),
                         TableOption {
                             retention_seconds: Some(7200),
                         },
@@ -504,7 +527,7 @@ mod test {
                 .collect();
 
             table_id_to_options.insert(
-                5,
+                5.into(),
                 TableOption {
                     retention_seconds: Some(5),
                 },
@@ -514,12 +537,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    table_id_to_options,
-                    Arc::new(CompactionDeveloperConfig::default()),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &table_id_to_options,
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -529,7 +557,7 @@ mod test {
             // test table_option_filter
             assert_eq!(task.input.input_levels[0].table_infos.len(), 1);
             let select_sst = &task.input.input_levels[0].table_infos.first().unwrap();
-            assert_eq!(select_sst.get_sst_id(), 5);
+            assert_eq!(select_sst.sst_id, 5);
 
             assert_eq!(task.input.input_levels[1].level_idx, 4);
             assert_eq!(task.input.input_levels[1].table_infos.len(), 0);
@@ -555,12 +583,17 @@ mod test {
             // // pick ttl reclaim
             let task = selector.pick_compaction(
                 1,
-                &group_config,
-                &levels,
-                &mut levels_handler,
-                &mut local_stats,
-                HashMap::default(),
-                Arc::new(CompactionDeveloperConfig::default()),
+                compaction_selector_context(
+                    &group_config,
+                    &levels,
+                    &BTreeSet::new(),
+                    &mut levels_handler,
+                    &mut local_stats,
+                    &HashMap::default(),
+                    Arc::new(CompactionDeveloperConfig::default()),
+                    &Default::default(),
+                    &HummockVersionStateTableInfo::empty(),
+                ),
             );
 
             // empty table_options does not select any files
@@ -577,10 +610,10 @@ mod test {
 
             // rebuild selector
             selector = TtlCompactionSelector::default();
-            let mut table_id_to_options: HashMap<u32, TableOption> = (2..=10)
+            let mut table_id_to_options: HashMap<TableId, TableOption> = (2..=10)
                 .map(|table_id| {
                     (
-                        table_id as u32,
+                        table_id.into(),
                         TableOption {
                             retention_seconds: Some(5_u32),
                         },
@@ -590,21 +623,21 @@ mod test {
 
             // cut range [2,3,4] [6,7] [10]
             table_id_to_options.insert(
-                5,
+                5.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
             );
 
             table_id_to_options.insert(
-                8,
+                8.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
             );
 
             table_id_to_options.insert(
-                9,
+                9.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
@@ -617,12 +650,17 @@ mod test {
                 let task = selector
                     .pick_compaction(
                         1,
-                        &group_config,
-                        &levels,
-                        &mut levels_handler,
-                        &mut local_stats,
-                        table_id_to_options.clone(),
-                        Arc::new(CompactionDeveloperConfig::default()),
+                        compaction_selector_context(
+                            &group_config,
+                            &levels,
+                            &BTreeSet::new(),
+                            &mut levels_handler,
+                            &mut local_stats,
+                            &table_id_to_options,
+                            Arc::new(CompactionDeveloperConfig::default()),
+                            &Default::default(),
+                            &HummockVersionStateTableInfo::empty(),
+                        ),
                     )
                     .unwrap();
 
@@ -635,7 +673,7 @@ mod test {
                 let select_sst = &task.input.input_levels[0]
                     .table_infos
                     .iter()
-                    .map(|sst| sst.get_sst_id())
+                    .map(|sst| sst.sst_id)
                     .collect_vec();
                 assert!(select_sst.is_sorted());
                 assert_eq!(expect_task_sst_id_range[index], *select_sst);
@@ -660,10 +698,10 @@ mod test {
 
             // rebuild selector
             selector = TtlCompactionSelector::default();
-            let mut table_id_to_options: HashMap<u32, TableOption> = (2..=10)
+            let mut table_id_to_options: HashMap<TableId, TableOption> = (2..=10)
                 .map(|table_id| {
                     (
-                        table_id as u32,
+                        table_id.into(),
                         TableOption {
                             retention_seconds: Some(5_u32),
                         },
@@ -673,21 +711,21 @@ mod test {
 
             // cut range [2,3,4] [6,7] [10]
             table_id_to_options.insert(
-                5,
+                5.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
             );
 
             table_id_to_options.insert(
-                8,
+                8.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
             );
 
             table_id_to_options.insert(
-                9,
+                9.into(),
                 TableOption {
                     retention_seconds: Some(7200_u32),
                 },
@@ -698,7 +736,7 @@ mod test {
             for (index, x) in expect_task_file_count.iter().enumerate() {
                 if index == expect_task_file_count.len() - 1 {
                     table_id_to_options.insert(
-                        5,
+                        5.into(),
                         TableOption {
                             retention_seconds: Some(5_u32),
                         },
@@ -709,12 +747,17 @@ mod test {
                 let task = selector
                     .pick_compaction(
                         1,
-                        &group_config,
-                        &levels,
-                        &mut levels_handler,
-                        &mut local_stats,
-                        table_id_to_options.clone(),
-                        Arc::new(CompactionDeveloperConfig::default()),
+                        compaction_selector_context(
+                            &group_config,
+                            &levels,
+                            &BTreeSet::new(),
+                            &mut levels_handler,
+                            &mut local_stats,
+                            &table_id_to_options,
+                            Arc::new(CompactionDeveloperConfig::default()),
+                            &Default::default(),
+                            &HummockVersionStateTableInfo::empty(),
+                        ),
                     )
                     .unwrap();
 
@@ -727,7 +770,7 @@ mod test {
                 let select_sst = &task.input.input_levels[0]
                     .table_infos
                     .iter()
-                    .map(|sst| sst.get_sst_id())
+                    .map(|sst| sst.sst_id)
                     .collect_vec();
                 assert!(select_sst.is_sorted());
                 assert_eq!(expect_task_sst_id_range[index], *select_sst);

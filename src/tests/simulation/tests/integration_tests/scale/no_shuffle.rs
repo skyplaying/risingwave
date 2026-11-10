@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,15 @@
 use anyhow::Result;
 use itertools::Itertools;
 use risingwave_simulation::cluster::{Cluster, Configuration};
-use risingwave_simulation::ctl_ext::predicate::{identity_contains, no_identity_contains};
+use risingwave_simulation::ctl_ext::predicate::identity_contains;
 use risingwave_simulation::utils::AssertResult;
 
 #[tokio::test]
 async fn test_delta_join() -> Result<()> {
-    let mut cluster = Cluster::start(Configuration::for_scale_no_shuffle()).await?;
+    let configuration = Configuration::for_scale_no_shuffle();
+
+    let total_cores = configuration.compute_node_cores * configuration.compute_nodes;
+    let mut cluster = Cluster::start(configuration).await?;
     let mut session = cluster.start_session();
 
     session.run("set rw_implicit_flush = true;").await?;
@@ -34,11 +37,6 @@ async fn test_delta_join() -> Result<()> {
     session
         .run("create table b (b1 int primary key, b2 int);")
         .await?;
-    let [t1, t2]: [_; 2] = cluster
-        .locate_fragments([identity_contains("materialize")])
-        .await?
-        .try_into()
-        .unwrap();
 
     session
         .run("create materialized view v as select * from a join b on a.a1 = b.b1;")
@@ -47,12 +45,6 @@ async fn test_delta_join() -> Result<()> {
         .locate_fragments([identity_contains("lookup")])
         .await?;
     assert_eq!(lookup_fragments.len(), 2, "failed to plan delta join");
-    let union_fragment = cluster
-        .locate_one_fragment([
-            identity_contains("union"),
-            no_identity_contains("materialize"), // skip union for table
-        ])
-        .await?;
 
     let mut test_times = 0;
     macro_rules! test_works {
@@ -80,45 +72,78 @@ async fn test_delta_join() -> Result<()> {
                 .assert_result_eq(result);
 
             #[allow(unused_assignments)]
-            test_times += 1;
+            {
+                test_times += 1;
+            }
         };
     }
 
     test_works!();
 
     // Scale-in one side
-    cluster.reschedule(format!("{}-[0]", t1.id())).await?;
+    cluster
+        .run(format!(
+            "alter table a set parallelism = {}",
+            total_cores - 1
+        ))
+        .await?;
+
     test_works!();
 
     // Scale-in both sides together
     cluster
-        .reschedule(format!("{}-[2];{}-[0,2]", t1.id(), t2.id()))
+        .run(format!(
+            "alter table a set parallelism = {}",
+            total_cores - 2
+        ))
         .await?;
+
+    cluster
+        .run(format!(
+            "alter table b set parallelism = {}",
+            total_cores - 2
+        ))
+        .await?;
+
     test_works!();
 
     // Scale-out one side
-    cluster.reschedule(format!("{}+[0]", t2.id())).await?;
+    cluster
+        .run(format!(
+            "alter table a set parallelism = {}",
+            total_cores - 1
+        ))
+        .await?;
+
     test_works!();
 
     // Scale-out both sides together
     cluster
-        .reschedule(format!("{}+[0,2];{}+[2]", t1.id(), t2.id()))
+        .run(format!("alter table a set parallelism = {}", total_cores))
         .await?;
+
+    cluster
+        .run(format!("alter table b set parallelism = {}", total_cores))
+        .await?;
+
     test_works!();
 
     // Scale-in join with union
     cluster
-        .reschedule(format!("{}-[5];{}-[5]", t1.id(), union_fragment.id()))
+        .run(format!(
+            "alter table a set parallelism = {}",
+            total_cores - 1
+        ))
         .await?;
-    test_works!();
 
-    let result = cluster
-        .reschedule(format!("{}-[0]", lookup_fragments[0].id()))
-        .await;
-    assert!(
-        result.is_err(),
-        "directly scale-in lookup (downstream) should fail"
-    );
+    cluster
+        .run(format!(
+            "alter table b set parallelism = {}",
+            total_cores - 1
+        ))
+        .await?;
+
+    test_works!();
 
     Ok(())
 }
@@ -133,39 +158,11 @@ async fn test_share_multiple_no_shuffle_upstream() -> Result<()> {
         .run("create materialized view mv as with cte as (select a, sum(b) sum from t group by a) select count(*) from cte c1 join cte c2 on c1.a = c2.a;")
         .await?;
 
-    let fragment = cluster
-        .locate_one_fragment([identity_contains("hashagg")])
-        .await?;
-
-    cluster.reschedule(fragment.reschedule([0], [])).await?;
-    cluster.reschedule(fragment.reschedule([], [0])).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_resolve_no_shuffle_upstream() -> Result<()> {
-    let mut cluster = Cluster::start(Configuration::for_scale_no_shuffle()).await?;
-    let mut session = cluster.start_session();
-
-    session.run("create table t (v int);").await?;
-    session
-        .run("create materialized view m1 as select * from t;")
-        .await?;
-
-    let fragment = cluster
-        .locate_one_fragment([identity_contains("StreamTableScan")])
-        .await?;
-
-    let result = cluster.reschedule(fragment.reschedule([0], [])).await;
-
-    assert!(result.is_err());
-
     cluster
-        .reschedule_resolve_no_shuffle(fragment.reschedule([0], []))
+        .run("alter materialized view mv set parallelism = 1;")
         .await?;
     cluster
-        .reschedule_resolve_no_shuffle(fragment.reschedule([], [0]))
+        .run("alter materialized view mv set parallelism = adaptive;")
         .await?;
 
     Ok(())

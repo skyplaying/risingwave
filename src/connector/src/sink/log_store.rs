@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,38 +15,48 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::future::{poll_fn, Future};
+use std::future::{Future, pending, poll_fn};
+use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Instant;
 
+use await_tree::InstrumentAwait;
+use futures::future::BoxFuture;
 use futures::{TryFuture, TryFutureExt};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bail;
-use risingwave_common::buffer::Bitmap;
-use risingwave_common::metrics::LabelGuardedIntCounter;
+use risingwave_common::bitmap::Bitmap;
+use risingwave_common::metrics::{LabelGuardedIntCounter, RelabeledAggregatedIntGauge};
 use risingwave_common::util::epoch::{EpochPair, INVALID_EPOCH};
-
-use crate::sink::SinkMetrics;
+use risingwave_common_estimate_size::EstimateSize;
+use risingwave_common_rate_limit::{RateLimit, RateLimiter};
+use risingwave_pb::stream_plan::PbSinkSchemaChange;
+use tokio::select;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub type LogStoreResult<T> = Result<T, anyhow::Error>;
 pub type ChunkId = usize;
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TruncateOffset {
     Chunk { epoch: u64, chunk_id: ChunkId },
     Barrier { epoch: u64 },
 }
 
-impl PartialOrd for TruncateOffset {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl Ord for TruncateOffset {
+    fn cmp(&self, other: &Self) -> Ordering {
         let extract = |offset: &TruncateOffset| match offset {
             TruncateOffset::Chunk { epoch, chunk_id } => (*epoch, *chunk_id),
             TruncateOffset::Barrier { epoch } => (*epoch, usize::MAX),
         };
-        let this = extract(self);
-        let other = extract(other);
-        this.partial_cmp(&other)
+        extract(self).cmp(&extract(other))
+    }
+}
+
+impl PartialOrd for TruncateOffset {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -84,7 +94,7 @@ impl TruncateOffset {
             } => {
                 if epoch != *offset_epoch {
                     bail!(
-                        "new item epoch {} not match current chunk offset epoch {}",
+                        "new item epoch {} does not match current chunk offset epoch {}",
                         epoch,
                         offset_epoch
                     );
@@ -95,7 +105,7 @@ impl TruncateOffset {
             } => {
                 if epoch <= *offset_epoch {
                     bail!(
-                        "new item epoch {} not exceed barrier offset epoch {}",
+                        "new item epoch {} does not exceed barrier offset epoch {}",
                         epoch,
                         offset_epoch
                     );
@@ -114,8 +124,35 @@ pub enum LogStoreReadItem {
     },
     Barrier {
         is_checkpoint: bool,
+        new_vnode_bitmap: Option<Arc<Bitmap>>,
+        is_stop: bool,
+        schema_change: Option<PbSinkSchemaChange>,
     },
-    UpdateVnodeBitmap(Arc<Bitmap>),
+}
+
+pub trait LogWriterPostFlushCurrentEpochFn<'a> = FnOnce() -> BoxFuture<'a, LogStoreResult<()>>;
+
+#[must_use]
+pub struct LogWriterPostFlushCurrentEpoch<'a>(
+    Box<dyn LogWriterPostFlushCurrentEpochFn<'a> + Send + 'a>,
+);
+
+impl<'a> LogWriterPostFlushCurrentEpoch<'a> {
+    pub fn new(f: impl LogWriterPostFlushCurrentEpochFn<'a> + Send + 'a) -> Self {
+        Self(Box::new(f))
+    }
+
+    pub async fn post_yield_barrier(self) -> LogStoreResult<()> {
+        self.0().await
+    }
+}
+
+pub struct FlushCurrentEpochOptions {
+    pub is_checkpoint: bool,
+    pub new_vnode_bitmap: Option<Arc<Bitmap>>,
+    pub is_stop: bool,
+    pub schema_change: Option<PbSinkSchemaChange>,
+    pub wait_log_store_flush: bool,
 }
 
 pub trait LogWriter: Send {
@@ -136,14 +173,8 @@ pub trait LogWriter: Send {
     fn flush_current_epoch(
         &mut self,
         next_epoch: u64,
-        is_checkpoint: bool,
-    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_;
-
-    /// Update the vnode bitmap of the log writer
-    fn update_vnode_bitmap(
-        &mut self,
-        new_vnodes: Arc<Bitmap>,
-    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_;
+        options: FlushCurrentEpochOptions,
+    ) -> impl Future<Output = LogStoreResult<LogWriterPostFlushCurrentEpoch<'_>>> + Send + '_;
 
     fn pause(&mut self) -> LogStoreResult<()>;
 
@@ -153,6 +184,12 @@ pub trait LogWriter: Send {
 pub trait LogReader: Send + Sized + 'static {
     /// Initialize the log reader. Usually function as waiting for log writer to be initialized.
     fn init(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_;
+
+    /// Consume log store from given `start_offset` or aligned start offset recorded previously.
+    fn start_from(
+        &mut self,
+        start_offset: Option<u64>,
+    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_;
 
     /// Emit the next item.
     ///
@@ -168,12 +205,12 @@ pub trait LogReader: Send + Sized + 'static {
     /// Reset the log reader to after the latest truncate offset
     ///
     /// The return flag means whether the log store support rewind
-    fn rewind(
-        &mut self,
-    ) -> impl Future<Output = LogStoreResult<(bool, Option<Bitmap>)>> + Send + '_;
+    fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_;
 }
 
 pub trait LogStoreFactory: Send + 'static {
+    const ALLOW_REWIND: bool;
+    const REBUILD_SINK_ON_UPDATE_VNODE_BITMAP: bool;
     type Reader: LogReader;
     type Writer: LogWriter;
 
@@ -183,6 +220,20 @@ pub trait LogStoreFactory: Send + 'static {
 pub struct TransformChunkLogReader<F: Fn(StreamChunk) -> StreamChunk, R: LogReader> {
     f: F,
     inner: R,
+}
+
+pub struct TruncateBarrierLogReader<R: LogReader> {
+    inner: R,
+    pending_barriers: VecDeque<u64>,
+}
+
+impl<R: LogReader> TruncateBarrierLogReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending_barriers: VecDeque::new(),
+        }
+    }
 }
 
 impl<F: Fn(StreamChunk) -> StreamChunk + Send + 'static, R: LogReader> LogReader
@@ -208,10 +259,63 @@ impl<F: Fn(StreamChunk) -> StreamChunk + Send + 'static, R: LogReader> LogReader
         self.inner.truncate(offset)
     }
 
-    fn rewind(
-        &mut self,
-    ) -> impl Future<Output = LogStoreResult<(bool, Option<Bitmap>)>> + Send + '_ {
+    fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
         self.inner.rewind()
+    }
+
+    fn start_from(
+        &mut self,
+        start_offset: Option<u64>,
+    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.inner.start_from(start_offset)
+    }
+}
+
+impl<R: LogReader> LogReader for TruncateBarrierLogReader<R> {
+    async fn init(&mut self) -> LogStoreResult<()> {
+        self.pending_barriers.clear();
+        self.inner.init().await
+    }
+
+    async fn next_item(&mut self) -> LogStoreResult<(u64, LogStoreReadItem)> {
+        let (epoch, item) = self.inner.next_item().await?;
+        if matches!(item, LogStoreReadItem::Barrier { .. }) {
+            self.pending_barriers.push_back(epoch);
+        }
+        Ok((epoch, item))
+    }
+
+    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
+        while let Some(front_epoch) = self.pending_barriers.front().copied() {
+            match (TruncateOffset::Barrier { epoch: front_epoch }).cmp(&offset) {
+                Ordering::Less => {
+                    self.inner
+                        .truncate(TruncateOffset::Barrier { epoch: front_epoch })?;
+                    self.pending_barriers.pop_front();
+                }
+                Ordering::Equal => {
+                    self.inner.truncate(offset)?;
+                    self.pending_barriers.pop_front();
+                    return Ok(());
+                }
+                Ordering::Greater => {
+                    self.inner.truncate(offset)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.inner.truncate(offset)?;
+        Ok(())
+    }
+
+    async fn rewind(&mut self) -> LogStoreResult<()> {
+        self.pending_barriers.clear();
+        self.inner.rewind().await
+    }
+
+    async fn start_from(&mut self, start_offset: Option<u64>) -> LogStoreResult<()> {
+        self.pending_barriers.clear();
+        self.inner.start_from(start_offset).await
     }
 }
 
@@ -219,11 +323,11 @@ pub struct BackpressureMonitoredLogReader<R: LogReader> {
     inner: R,
     /// Start time to wait for new future after poll ready
     wait_new_future_start_time: Option<Instant>,
-    wait_new_future_duration_ns: LabelGuardedIntCounter<3>,
+    wait_new_future_duration_ns: LabelGuardedIntCounter,
 }
 
 impl<R: LogReader> BackpressureMonitoredLogReader<R> {
-    fn new(inner: R, wait_new_future_duration_ns: LabelGuardedIntCounter<3>) -> Self {
+    fn new(inner: R, wait_new_future_duration_ns: LabelGuardedIntCounter) -> Self {
         Self {
             inner,
             wait_new_future_start_time: None,
@@ -255,23 +359,35 @@ impl<R: LogReader> LogReader for BackpressureMonitoredLogReader<R> {
         self.inner.truncate(offset)
     }
 
-    fn rewind(
-        &mut self,
-    ) -> impl Future<Output = LogStoreResult<(bool, Option<Bitmap>)>> + Send + '_ {
+    fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
         self.inner.rewind().inspect_ok(|_| {
             self.wait_new_future_start_time = None;
         })
+    }
+
+    fn start_from(
+        &mut self,
+        start_offset: Option<u64>,
+    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.inner.start_from(start_offset)
     }
 }
 
 pub struct MonitoredLogReader<R: LogReader> {
     inner: R,
     read_epoch: u64,
-    metrics: SinkMetrics,
+    metrics: LogReaderMetrics,
+}
+
+pub struct LogReaderMetrics {
+    pub log_store_latest_read_epoch: RelabeledAggregatedIntGauge,
+    pub log_store_read_rows: LabelGuardedIntCounter,
+    pub log_store_read_bytes: LabelGuardedIntCounter,
+    pub log_store_reader_wait_new_future_duration_ns: LabelGuardedIntCounter,
 }
 
 impl<R: LogReader> MonitoredLogReader<R> {
-    pub fn new(inner: R, metrics: SinkMetrics) -> Self {
+    pub fn new(inner: R, metrics: LogReaderMetrics) -> Self {
         Self {
             inner,
             read_epoch: INVALID_EPOCH,
@@ -282,31 +398,281 @@ impl<R: LogReader> MonitoredLogReader<R> {
 
 impl<R: LogReader> LogReader for MonitoredLogReader<R> {
     async fn init(&mut self) -> LogStoreResult<()> {
-        self.inner.init().await
+        self.inner.init().instrument_await("log_reader_init").await
     }
 
     async fn next_item(&mut self) -> LogStoreResult<(u64, LogStoreReadItem)> {
-        self.inner.next_item().await.inspect(|(epoch, item)| {
-            if self.read_epoch != *epoch {
-                self.read_epoch = *epoch;
-                self.metrics.log_store_latest_read_epoch.set(*epoch as _);
-            }
-            if let LogStoreReadItem::StreamChunk { chunk, .. } = item {
-                self.metrics
-                    .log_store_read_rows
-                    .inc_by(chunk.cardinality() as _);
-            }
-        })
+        self.inner
+            .next_item()
+            .instrument_await("log_reader_next_item")
+            .await
+            .inspect(|(epoch, item)| {
+                if self.read_epoch != *epoch {
+                    self.read_epoch = *epoch;
+                    self.metrics.log_store_latest_read_epoch.set(*epoch as _);
+                }
+                if let LogStoreReadItem::StreamChunk { chunk, .. } = item {
+                    self.metrics
+                        .log_store_read_rows
+                        .inc_by(chunk.cardinality() as _);
+                    self.metrics
+                        .log_store_read_bytes
+                        .inc_by(chunk.estimated_size() as u64);
+                }
+            })
     }
 
     fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
         self.inner.truncate(offset)
     }
 
-    fn rewind(
+    fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.inner.rewind().instrument_await("log_reader_rewind")
+    }
+
+    fn start_from(
         &mut self,
-    ) -> impl Future<Output = LogStoreResult<(bool, Option<Bitmap>)>> + Send + '_ {
-        self.inner.rewind()
+        start_offset: Option<u64>,
+    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.inner.start_from(start_offset)
+    }
+}
+
+#[derive(Copy, Clone, PartialOrd, PartialEq, Debug)]
+struct UpstreamChunkOffset(TruncateOffset);
+#[derive(Copy, Clone, PartialOrd, PartialEq)]
+struct DownstreamChunkOffset(TruncateOffset);
+
+struct RateLimitedLogReaderCore<R: LogReader> {
+    inner: R,
+    consuming_chunk: Option<(
+        UpstreamChunkOffset,
+        // Newer items at the front, push_front, pop_back
+        VecDeque<DownstreamChunkOffset>,
+        Vec<StreamChunk>, // split chunks
+    )>,
+    // Newer items at the front, push_front, pop_back
+    consumed_offset_queue: VecDeque<(UpstreamChunkOffset, VecDeque<DownstreamChunkOffset>)>,
+    next_chunk_id: usize,
+    rate_limiter: RateLimiter,
+}
+
+pub struct RateLimitedLogReader<R: LogReader> {
+    core: RateLimitedLogReaderCore<R>,
+    control_rx: UnboundedReceiver<RateLimit>,
+}
+
+impl<R: LogReader> RateLimitedLogReader<R> {
+    pub fn new(inner: R, control_rx: UnboundedReceiver<RateLimit>) -> Self {
+        Self {
+            core: RateLimitedLogReaderCore {
+                inner,
+                consuming_chunk: None,
+                consumed_offset_queue: VecDeque::new(),
+                next_chunk_id: 0,
+                rate_limiter: RateLimiter::new(RateLimit::Disabled),
+            },
+            control_rx,
+        }
+    }
+}
+
+impl<R: LogReader> RateLimitedLogReaderCore<R> {
+    fn peek_next_pending_chunk(&self) -> Option<&StreamChunk> {
+        self.consuming_chunk
+            .as_ref()
+            .and_then(|(_, _, chunk)| chunk.last())
+    }
+
+    fn consume_next_pending_chunk(&mut self) -> Option<(u64, StreamChunk, ChunkId)> {
+        let Some((upstream_offset, consumed_offsets, pending_chunk)) = &mut self.consuming_chunk
+        else {
+            return None;
+        };
+        let epoch = upstream_offset.0.epoch();
+
+        let item = pending_chunk.pop().map(|chunk| {
+            let chunk_id = self.next_chunk_id;
+            self.next_chunk_id += 1;
+            consumed_offsets.push_front(DownstreamChunkOffset(TruncateOffset::Chunk {
+                epoch,
+                chunk_id,
+            }));
+            (epoch, chunk, chunk_id)
+        });
+        if pending_chunk.is_empty() {
+            let (upstream_offset, consumed_offsets, _) =
+                self.consuming_chunk.take().expect("checked some");
+            self.consumed_offset_queue
+                .push_front((upstream_offset, consumed_offsets));
+        }
+        item
+    }
+
+    fn consume_single_upstream_item(
+        &mut self,
+        epoch: u64,
+        mut item: LogStoreReadItem,
+    ) -> (u64, LogStoreReadItem) {
+        assert!(self.consuming_chunk.is_none());
+        let (upstream_offset, downstream_offset) = match &mut item {
+            LogStoreReadItem::StreamChunk { chunk_id, .. } => {
+                let upstream_chunk_id = *chunk_id;
+                let downstream_chunk_id = self.next_chunk_id;
+                self.next_chunk_id += 1;
+                *chunk_id = downstream_chunk_id;
+                (
+                    UpstreamChunkOffset(TruncateOffset::Chunk {
+                        epoch,
+                        chunk_id: upstream_chunk_id,
+                    }),
+                    DownstreamChunkOffset(TruncateOffset::Chunk {
+                        epoch,
+                        chunk_id: downstream_chunk_id,
+                    }),
+                )
+            }
+            LogStoreReadItem::Barrier { .. } => (
+                UpstreamChunkOffset(TruncateOffset::Barrier { epoch }),
+                DownstreamChunkOffset(TruncateOffset::Barrier { epoch }),
+            ),
+        };
+        self.consumed_offset_queue
+            .push_front((upstream_offset, VecDeque::from_iter([downstream_offset])));
+        (epoch, item)
+    }
+
+    async fn next_item(&mut self) -> LogStoreResult<(u64, LogStoreReadItem)> {
+        match self.rate_limiter.rate_limit() {
+            RateLimit::Pause => pending().await,
+            RateLimit::Disabled => {
+                if let Some((epoch, chunk, chunk_id)) = self.consume_next_pending_chunk() {
+                    Ok((epoch, LogStoreReadItem::StreamChunk { chunk, chunk_id }))
+                } else {
+                    let (epoch, item) = self.inner.next_item().await?;
+                    Ok(self.consume_single_upstream_item(epoch, item))
+                }
+            }
+            RateLimit::Fixed(limit) => {
+                if self.peek_next_pending_chunk().is_none() {
+                    let (epoch, item) = self.inner.next_item().await?;
+                    match item {
+                        LogStoreReadItem::StreamChunk { chunk, chunk_id } => {
+                            let chunks = if chunk.rate_limit_permits() < limit.get() {
+                                vec![chunk]
+                            } else {
+                                let mut chunks = chunk.split(limit.get() as _);
+                                // reverse to make the first chunk to be popped first
+                                chunks.reverse();
+                                chunks
+                            };
+                            assert!(!chunks.is_empty());
+
+                            assert!(
+                                self.consuming_chunk
+                                    .replace((
+                                        UpstreamChunkOffset(TruncateOffset::Chunk {
+                                            epoch,
+                                            chunk_id
+                                        }),
+                                        VecDeque::new(),
+                                        chunks,
+                                    ))
+                                    .is_none()
+                            );
+                        }
+                        item @ LogStoreReadItem::Barrier { .. } => {
+                            return Ok(self.consume_single_upstream_item(epoch, item));
+                        }
+                    };
+                }
+                let chunk = self.peek_next_pending_chunk().expect("must Some");
+                self.rate_limiter.wait_chunk(chunk).await;
+                let (epoch, chunk, chunk_id) =
+                    self.consume_next_pending_chunk().expect("must Some");
+                Ok((epoch, LogStoreReadItem::StreamChunk { chunk, chunk_id }))
+            }
+        }
+    }
+}
+
+impl<R: LogReader> LogReader for RateLimitedLogReader<R> {
+    async fn init(&mut self) -> LogStoreResult<()> {
+        self.core.inner.init().await
+    }
+
+    async fn next_item(&mut self) -> LogStoreResult<(u64, LogStoreReadItem)> {
+        loop {
+            select! {
+                biased;
+                recv = pin!(self.control_rx.recv()) => {
+                    let new_rate_limit = match recv {
+                        Some(limit) => limit,
+                        None => bail!("rate limit control channel closed"),
+                    };
+                    let old_rate_limit = self.core.rate_limiter.update(new_rate_limit);
+                    let paused = matches!(new_rate_limit, RateLimit::Pause);
+                    tracing::info!("rate limit changed from {:?} to {:?}, paused = {paused}", old_rate_limit, new_rate_limit);
+                },
+                item = self.core.next_item() => {
+                    return item;
+                }
+            }
+        }
+    }
+
+    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
+        let downstream_offset = DownstreamChunkOffset(offset);
+        let mut truncate_offset = None;
+        let mut stop = false;
+        'outer: while let Some((upstream_offset, downstream_offsets)) =
+            self.core.consumed_offset_queue.back_mut()
+        {
+            while let Some(prev_downstream_offset) = downstream_offsets.back() {
+                if *prev_downstream_offset <= downstream_offset {
+                    downstream_offsets.pop_back();
+                } else {
+                    stop = true;
+                    break 'outer;
+                }
+            }
+            truncate_offset = Some(*upstream_offset);
+            self.core.consumed_offset_queue.pop_back();
+        }
+        if !stop && let Some((_, downstream_offsets, _)) = &mut self.core.consuming_chunk {
+            while let Some(prev_downstream_offset) = downstream_offsets.back() {
+                if *prev_downstream_offset <= downstream_offset {
+                    downstream_offsets.pop_back();
+                } else {
+                    // stop = true;
+                    break;
+                }
+            }
+        }
+        tracing::trace!(
+            "rate limited log store reader truncate offset {:?}, downstream offset {:?}",
+            truncate_offset,
+            offset
+        );
+        if let Some(offset) = truncate_offset {
+            self.core.inner.truncate(offset.0)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rewind(&mut self) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.core.consuming_chunk = None;
+        self.core.consumed_offset_queue.clear();
+        self.core.next_chunk_id = 0;
+        self.core.inner.rewind()
+    }
+
+    fn start_from(
+        &mut self,
+        start_offset: Option<u64>,
+    ) -> impl Future<Output = LogStoreResult<()>> + Send + '_ {
+        self.core.inner.start_from(start_offset)
     }
 }
 
@@ -322,18 +688,30 @@ where
         TransformChunkLogReader { f, inner: self }
     }
 
-    pub fn monitored(self, metrics: SinkMetrics) -> impl LogReader {
+    pub fn monitored(self, metrics: LogReaderMetrics) -> impl LogReader {
+        // TODO: The `clone()` can be avoided if move backpressure inside `MonitoredLogReader`
         let wait_new_future_duration = metrics.log_store_reader_wait_new_future_duration_ns.clone();
         BackpressureMonitoredLogReader::new(
             MonitoredLogReader::new(self, metrics),
             wait_new_future_duration,
         )
     }
+
+    pub fn rate_limited(self, control_rx: UnboundedReceiver<RateLimit>) -> impl LogReader {
+        RateLimitedLogReader::new(self, control_rx)
+    }
 }
 
 pub struct MonitoredLogWriter<W: LogWriter> {
     inner: W,
-    metrics: SinkMetrics,
+    metrics: LogWriterMetrics,
+}
+
+pub struct LogWriterMetrics {
+    // Labels: [actor_id, sink_id, sink_name]
+    pub log_store_first_write_epoch: RelabeledAggregatedIntGauge,
+    pub log_store_latest_write_epoch: RelabeledAggregatedIntGauge,
+    pub log_store_write_rows: LabelGuardedIntCounter,
 }
 
 impl<W: LogWriter> LogWriter for MonitoredLogWriter<W> {
@@ -361,19 +739,13 @@ impl<W: LogWriter> LogWriter for MonitoredLogWriter<W> {
     async fn flush_current_epoch(
         &mut self,
         next_epoch: u64,
-        is_checkpoint: bool,
-    ) -> LogStoreResult<()> {
-        self.inner
-            .flush_current_epoch(next_epoch, is_checkpoint)
-            .await?;
+        options: FlushCurrentEpochOptions,
+    ) -> LogStoreResult<LogWriterPostFlushCurrentEpoch<'_>> {
+        let post_flush = self.inner.flush_current_epoch(next_epoch, options).await?;
         self.metrics
             .log_store_latest_write_epoch
             .set(next_epoch as _);
-        Ok(())
-    }
-
-    async fn update_vnode_bitmap(&mut self, new_vnodes: Arc<Bitmap>) -> LogStoreResult<()> {
-        self.inner.update_vnode_bitmap(new_vnodes).await
+        Ok(post_flush)
     }
 
     fn pause(&mut self) -> LogStoreResult<()> {
@@ -390,7 +762,7 @@ impl<T> T
 where
     T: LogWriter + Sized,
 {
-    pub fn monitored(self, metrics: SinkMetrics) -> MonitoredLogWriter<T> {
+    pub fn monitored(self, metrics: LogWriterMetrics) -> MonitoredLogWriter<T> {
         MonitoredLogWriter {
             inner: self,
             metrics,
@@ -485,7 +857,7 @@ impl<F> DeliveryFutureManager<F> {
 
 pub struct DeliveryFutureManagerAddFuture<'a, F>(&'a mut DeliveryFutureManager<F>);
 
-impl<'a, F: TryFuture<Ok = ()> + Unpin + 'static> DeliveryFutureManagerAddFuture<'a, F> {
+impl<F: TryFuture<Ok = ()> + Unpin + 'static> DeliveryFutureManagerAddFuture<'_, F> {
     /// Add a new future to the latest started written chunk.
     /// The returned bool value indicate whether we have awaited on any previous futures.
     pub async fn add_future_may_await(&mut self, future: F) -> Result<bool, F::Error> {
@@ -581,17 +953,58 @@ impl<F: TryFuture<Ok = ()> + Unpin + 'static> DeliveryFutureManager<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::{poll_fn, Future};
+    use std::collections::VecDeque;
+    use std::future::{Future, poll_fn};
     use std::pin::pin;
     use std::task::Poll;
 
     use futures::{FutureExt, TryFuture};
+    use risingwave_common::array::StreamChunk;
     use risingwave_common::util::epoch::test_epoch;
     use tokio::sync::oneshot;
     use tokio::sync::oneshot::Receiver;
 
-    use super::LogStoreResult;
+    use super::{LogReader, LogStoreReadItem, LogStoreResult, TruncateBarrierLogReader};
     use crate::sink::log_store::{DeliveryFutureManager, TruncateOffset};
+
+    struct MockLogReader {
+        items: VecDeque<(u64, LogStoreReadItem)>,
+        truncate_calls: Vec<TruncateOffset>,
+    }
+
+    impl MockLogReader {
+        fn new(items: impl IntoIterator<Item = (u64, LogStoreReadItem)>) -> Self {
+            Self {
+                items: items.into_iter().collect(),
+                truncate_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl LogReader for MockLogReader {
+        async fn init(&mut self) -> LogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn start_from(&mut self, _start_offset: Option<u64>) -> LogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn next_item(&mut self) -> LogStoreResult<(u64, LogStoreReadItem)> {
+            self.items
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no item"))
+        }
+
+        fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
+            self.truncate_calls.push(offset);
+            Ok(())
+        }
+
+        async fn rewind(&mut self) -> LogStoreResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_truncate_offset_cmp() {
@@ -644,6 +1057,8 @@ mod tests {
     }
 
     type TestFuture = impl TryFuture<Ok = (), Error = anyhow::Error> + Unpin + 'static;
+
+    #[define_opaque(TestFuture)]
     fn to_test_future(rx: Receiver<LogStoreResult<()>>) -> TestFuture {
         async move { rx.await.unwrap() }.boxed()
     }
@@ -652,9 +1067,11 @@ mod tests {
     async fn test_empty() {
         let mut manager = DeliveryFutureManager::<TestFuture>::new(2);
         let mut future = pin!(manager.next_truncate_offset());
-        assert!(poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
-            .await
-            .is_pending());
+        assert!(
+            poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
     }
 
     #[tokio::test]
@@ -664,10 +1081,12 @@ mod tests {
         let chunk_id1 = 1;
         let (tx1_1, rx1_1) = oneshot::channel();
         let mut write_chunk = manager.start_write_chunk(epoch1, chunk_id1);
-        assert!(!write_chunk
-            .add_future_may_await(to_test_future(rx1_1))
-            .await
-            .unwrap());
+        assert!(
+            !write_chunk
+                .add_future_may_await(to_test_future(rx1_1))
+                .await
+                .unwrap()
+        );
         assert_eq!(manager.future_count, 1);
         {
             let mut next_truncate_offset = pin!(manager.next_truncate_offset());
@@ -705,27 +1124,35 @@ mod tests {
         let (tx1_3, rx1_3) = oneshot::channel();
         let epoch2 = test_epoch(234);
         let (tx2_1, rx2_1) = oneshot::channel();
-        assert!(!manager
-            .start_write_chunk(epoch1, chunk_id1)
-            .add_future_may_await(to_test_future(rx1_1))
-            .await
-            .unwrap());
-        assert!(!manager
-            .start_write_chunk(epoch1, chunk_id2)
-            .add_future_may_await(to_test_future(rx1_2))
-            .await
-            .unwrap());
-        assert!(!manager
-            .start_write_chunk(epoch1, chunk_id3)
-            .add_future_may_await(to_test_future(rx1_3))
-            .await
-            .unwrap());
+        assert!(
+            !manager
+                .start_write_chunk(epoch1, chunk_id1)
+                .add_future_may_await(to_test_future(rx1_1))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .start_write_chunk(epoch1, chunk_id2)
+                .add_future_may_await(to_test_future(rx1_2))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .start_write_chunk(epoch1, chunk_id3)
+                .add_future_may_await(to_test_future(rx1_3))
+                .await
+                .unwrap()
+        );
         manager.add_barrier(epoch1);
-        assert!(!manager
-            .start_write_chunk(epoch2, chunk_id1)
-            .add_future_may_await(to_test_future(rx2_1))
-            .await
-            .unwrap());
+        assert!(
+            !manager
+                .start_write_chunk(epoch2, chunk_id1)
+                .add_future_may_await(to_test_future(rx2_1))
+                .await
+                .unwrap()
+        );
         assert_eq!(manager.future_count, 4);
         {
             let mut next_truncate_offset = pin!(manager.next_truncate_offset());
@@ -789,14 +1216,18 @@ mod tests {
 
         {
             let mut write_chunk = manager.start_write_chunk(epoch, chunk_id1);
-            assert!(!write_chunk
-                .add_future_may_await(to_test_future(rx1_1))
-                .await
-                .unwrap());
-            assert!(!write_chunk
-                .add_future_may_await(to_test_future(rx1_2))
-                .await
-                .unwrap());
+            assert!(
+                !write_chunk
+                    .add_future_may_await(to_test_future(rx1_1))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !write_chunk
+                    .add_future_may_await(to_test_future(rx1_2))
+                    .await
+                    .unwrap()
+            );
             assert_eq!(manager.future_count, 2);
         }
 
@@ -804,27 +1235,33 @@ mod tests {
             let mut write_chunk = manager.start_write_chunk(epoch, chunk_id2);
             {
                 let mut future1 = pin!(write_chunk.add_future_may_await(to_test_future(rx2_1)));
-                assert!(poll_fn(|cx| Poll::Ready(future1.as_mut().poll(cx)))
-                    .await
-                    .is_pending());
+                assert!(
+                    poll_fn(|cx| Poll::Ready(future1.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
                 tx1_1.send(Ok(())).unwrap();
                 assert!(future1.await.unwrap());
             }
             assert_eq!(2, write_chunk.future_count());
             {
                 let mut future2 = pin!(write_chunk.add_future_may_await(to_test_future(rx2_2)));
-                assert!(poll_fn(|cx| Poll::Ready(future2.as_mut().poll(cx)))
-                    .await
-                    .is_pending());
+                assert!(
+                    poll_fn(|cx| Poll::Ready(future2.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
                 tx1_2.send(Ok(())).unwrap();
                 assert!(future2.await.unwrap());
             }
             assert_eq!(2, write_chunk.future_count());
             {
                 let mut future3 = pin!(write_chunk.await_one_delivery());
-                assert!(poll_fn(|cx| Poll::Ready(future3.as_mut().poll(cx)))
-                    .await
-                    .is_pending());
+                assert!(
+                    poll_fn(|cx| Poll::Ready(future3.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
                 tx2_1.send(Ok(())).unwrap();
                 future3.await.unwrap();
             }
@@ -843,9 +1280,11 @@ mod tests {
 
         {
             let mut future = pin!(manager.next_truncate_offset());
-            assert!(poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
-                .await
-                .is_pending());
+            assert!(
+                poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
             tx2_2.send(Ok(())).unwrap();
             assert_eq!(
                 future.await.unwrap(),
@@ -857,5 +1296,116 @@ mod tests {
         }
 
         assert_eq!(0, manager.future_count);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_barrier_reader_truncates_previous_barriers_first() {
+        let inner = MockLogReader::new([
+            (
+                1,
+                LogStoreReadItem::Barrier {
+                    is_checkpoint: false,
+                    new_vnode_bitmap: None,
+                    is_stop: false,
+                    schema_change: None,
+                },
+            ),
+            (
+                2,
+                LogStoreReadItem::Barrier {
+                    is_checkpoint: false,
+                    new_vnode_bitmap: None,
+                    is_stop: false,
+                    schema_change: None,
+                },
+            ),
+        ]);
+        let mut reader = TruncateBarrierLogReader::new(inner);
+
+        reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        reader.next_item().await.unwrap();
+        reader.next_item().await.unwrap();
+        reader
+            .truncate(TruncateOffset::Barrier { epoch: 2 })
+            .unwrap();
+
+        assert_eq!(
+            reader.inner.truncate_calls,
+            vec![
+                TruncateOffset::Barrier { epoch: 1 },
+                TruncateOffset::Barrier { epoch: 2 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_barrier_reader_keeps_later_barrier_pending() {
+        let inner = MockLogReader::new([
+            (
+                1,
+                LogStoreReadItem::Barrier {
+                    is_checkpoint: false,
+                    new_vnode_bitmap: None,
+                    is_stop: false,
+                    schema_change: None,
+                },
+            ),
+            (
+                2,
+                LogStoreReadItem::StreamChunk {
+                    chunk: StreamChunk::default(),
+                    chunk_id: 0,
+                },
+            ),
+            (
+                2,
+                LogStoreReadItem::Barrier {
+                    is_checkpoint: false,
+                    new_vnode_bitmap: None,
+                    is_stop: false,
+                    schema_change: None,
+                },
+            ),
+        ]);
+        let mut reader = TruncateBarrierLogReader::new(inner);
+
+        reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        reader.next_item().await.unwrap();
+        reader.next_item().await.unwrap();
+        reader.next_item().await.unwrap();
+        reader
+            .truncate(TruncateOffset::Chunk {
+                epoch: 2,
+                chunk_id: 0,
+            })
+            .unwrap();
+
+        assert_eq!(
+            reader.inner.truncate_calls,
+            vec![
+                TruncateOffset::Barrier { epoch: 1 },
+                TruncateOffset::Chunk {
+                    epoch: 2,
+                    chunk_id: 0,
+                },
+            ]
+        );
+
+        reader
+            .truncate(TruncateOffset::Barrier { epoch: 2 })
+            .unwrap();
+        assert_eq!(
+            reader.inner.truncate_calls,
+            vec![
+                TruncateOffset::Barrier { epoch: 1 },
+                TruncateOffset::Chunk {
+                    epoch: 2,
+                    chunk_id: 0,
+                },
+                TruncateOffset::Barrier { epoch: 2 },
+            ]
+        );
     }
 }

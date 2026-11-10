@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ pub enum ValueEncodingError {
     InvalidTagEncoding(u8),
     #[error("Invalid jsonb encoding")]
     InvalidJsonbEncoding,
+    #[error("Invalid variant encoding")]
+    InvalidVariantEncoding,
     #[error("Invalid struct encoding: {0}")]
     InvalidStructEncoding(
         #[source]
@@ -42,6 +44,8 @@ pub enum ValueEncodingError {
         #[backtrace]
         crate::array::ArrayError,
     ),
-    #[error("Invalid flag: {0}")]
+    #[error("Invalid flag: {0:b}")]
     InvalidFlag(u8),
+    #[error("Invalid vector item: {0} {1}")]
+    InvalidVectorItem(f32, String),
 }

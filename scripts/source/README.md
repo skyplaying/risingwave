@@ -2,7 +2,7 @@ This folder contains scripts to prepare data for testing sources.
 
 ## Kafka
 
-`scripts/source/test_data` contains the data. Filename's convention is `<topic_name>.<n_partitions>`.
+`e2e_test/source_legacy/basic/scripts/test_data` contains the data. Filename's convention is `<topic_name>.<n_partitions>`.
 
 - If `<topic_name>` ends with `bin`, the whole file is a message with binary data.
 - If `<topic_name>` ends with `avro_json` or `json_schema`:

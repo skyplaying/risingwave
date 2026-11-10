@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2023 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,19 @@
 package com.risingwave.connector;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.risingwave.connector.api.sink.CommonSinkConfig;
+import java.sql.Connection;
+import java.sql.SQLException;
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class JDBCSinkConfig extends CommonSinkConfig {
     private String jdbcUrl;
+
+    @JsonProperty private String user;
+
+    @JsonProperty private String password;
 
     private String tableName;
 
@@ -31,6 +39,32 @@ public class JDBCSinkConfig extends CommonSinkConfig {
 
     @JsonProperty(value = "schema.name")
     private String schemaName;
+
+    @JsonProperty(value = "jdbc.query.timeout")
+    private int queryTimeoutSeconds = 60;
+
+    @JsonProperty(value = "jdbc.auto.commit")
+    private boolean autoCommit = false;
+
+    @JsonProperty(value = "database.name")
+    private String databaseName;
+
+    // Only applicable for redshift BatchAppendOnlyJDBCSink
+    @JsonProperty(value = "batch.insert.rows")
+    private int batchInsertRows = 0;
+
+    // TCP keep-alive configuration
+    @JsonProperty(value = "tcp.keepalive.enable")
+    private boolean keepaliveEnable = false;
+
+    @JsonProperty(value = "tcp.keepalive.idle")
+    private int keepaliveIdleSeconds = 10 * 60; // 10 minutes
+
+    @JsonProperty(value = "tcp.keepalive.interval")
+    private int keepaliveIntervalSeconds = 10;
+
+    @JsonProperty(value = "tcp.keepalive.count")
+    private int keepaliveCount = 3;
 
     @JsonCreator
     public JDBCSinkConfig(
@@ -51,6 +85,14 @@ public class JDBCSinkConfig extends CommonSinkConfig {
         return jdbcUrl;
     }
 
+    public String getUser() {
+        return user;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
     public String getTableName() {
         return tableName;
     }
@@ -61,5 +103,49 @@ public class JDBCSinkConfig extends CommonSinkConfig {
 
     public boolean isUpsertSink() {
         return this.isUpsertSink;
+    }
+
+    public int getQueryTimeout() {
+        return queryTimeoutSeconds;
+    }
+
+    public boolean isAutoCommit() {
+        return autoCommit;
+    }
+
+    public String getDatabaseName() {
+        return databaseName;
+    }
+
+    public int getBatchInsertRows() {
+        return batchInsertRows;
+    }
+
+    public boolean isKeepaliveEnabled() {
+        return keepaliveEnable;
+    }
+
+    public int getKeepaliveIdleSeconds() {
+        return keepaliveIdleSeconds;
+    }
+
+    public int getKeepaliveIntervalSeconds() {
+        return keepaliveIntervalSeconds;
+    }
+
+    public int getKeepaliveCount() {
+        return keepaliveCount;
+    }
+
+    /**
+     * Creates a JDBC connection based on this configuration. Subclasses can override this method to
+     * provide specialized connection logic. The connection returned by this method is *not*
+     * autoCommit by default.
+     *
+     * @return JDBC connection
+     * @throws SQLException if connection fails
+     */
+    public Connection getConnection() throws SQLException {
+        return JdbcUtils.getConnectionDefault(this);
     }
 }

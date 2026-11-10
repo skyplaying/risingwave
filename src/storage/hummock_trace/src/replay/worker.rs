@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::stream::BoxStream;
 use futures::StreamExt;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use futures::stream::BoxStream;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use super::{GlobalReplay, LocalReplay, ReplayRequest, WorkerId, WorkerResponse};
@@ -257,19 +257,15 @@ impl ReplayWorker {
                     panic!("expect iter result, but got {:?}", res);
                 }
             }
-            Operation::Sync(epoch_id) => {
+            Operation::Sync(sync_table_epochs) => {
                 assert_eq!(storage_type, StorageType::Global);
-                let sync_result = replay.sync(epoch_id).await.unwrap();
+                let sync_result = replay.sync(sync_table_epochs).await.unwrap();
                 let res = res_rx.recv().await.expect("recv result failed");
                 if let OperationResult::Sync(expected) = res {
                     assert_eq!(TraceResult::Ok(sync_result), expected, "sync failed");
                 } else {
                     panic!("expect sync result, but got {:?}", res);
                 }
-            }
-            Operation::Seal(epoch_id, is_checkpoint) => {
-                assert_eq!(storage_type, StorageType::Global);
-                replay.seal_epoch(epoch_id, is_checkpoint);
             }
             Operation::IterNext(id) => {
                 let iter = iters_map.get_mut(&id).expect("iter not in worker");
@@ -314,11 +310,11 @@ impl ReplayWorker {
                 let local_storage = local_storages.get_mut(&storage_type).unwrap();
                 local_storage.init(options).await.unwrap();
             }
-            Operation::TryWaitEpoch(epoch) => {
+            Operation::TryWaitEpoch(epoch, options) => {
                 assert_eq!(storage_type, StorageType::Global);
                 let res = res_rx.recv().await.expect("recv result failed");
                 if let OperationResult::TryWaitEpoch(expected) = res {
-                    let actual = replay.try_wait_epoch(epoch.into()).await;
+                    let actual = replay.try_wait_epoch(epoch.into(), options).await;
                     assert_eq!(TraceResult::from(actual), expected, "try_wait_epoch wrong");
                 } else {
                     panic!(
@@ -327,64 +323,10 @@ impl ReplayWorker {
                     );
                 }
             }
-            Operation::ClearSharedBuffer(prev_epoch) => {
-                assert_eq!(storage_type, StorageType::Global);
-                replay.clear_shared_buffer(prev_epoch).await;
-            }
             Operation::SealCurrentEpoch { epoch, opts } => {
                 assert_ne!(storage_type, StorageType::Global);
                 let local_storage = local_storages.get_mut(&storage_type).unwrap();
                 local_storage.seal_current_epoch(epoch, opts);
-            }
-            Operation::ValidateReadEpoch(epoch) => {
-                assert_eq!(storage_type, StorageType::Global);
-                let res = res_rx.recv().await.expect("recv result failed");
-                let actual = replay.validate_read_epoch(epoch.into());
-                if let OperationResult::ValidateReadEpoch(expected) = res {
-                    assert_eq!(
-                        TraceResult::from(actual),
-                        expected,
-                        "validate_read_epoch wrong"
-                    );
-                } else {
-                    panic!(
-                        "wrong validate_read_epoch result, expect epoch result, but got {:?}",
-                        res
-                    );
-                }
-            }
-            Operation::LocalStorageEpoch => {
-                assert_ne!(storage_type, StorageType::Global);
-                let local_storage = local_storages.get_mut(&storage_type).unwrap();
-                let res = res_rx.recv().await.expect("recv result failed");
-                if let OperationResult::LocalStorageEpoch(expected) = res {
-                    let actual = local_storage.epoch();
-                    assert_eq!(TraceResult::Ok(actual), expected, "epoch wrong");
-                } else {
-                    panic!(
-                        "wrong local storage epoch result, expect epoch result, but got {:?}",
-                        res
-                    );
-                }
-            }
-            Operation::LocalStorageIsDirty => {
-                assert_ne!(storage_type, StorageType::Global);
-                let local_storage = local_storages.get_mut(&storage_type).unwrap();
-                let res = res_rx.recv().await.expect("recv result failed");
-                if let OperationResult::LocalStorageIsDirty(expected) = res {
-                    let actual = local_storage.is_dirty();
-                    assert_eq!(
-                        TraceResult::Ok(actual),
-                        expected,
-                        "is_dirty wrong, epoch: {}",
-                        local_storage.epoch()
-                    );
-                } else {
-                    panic!(
-                        "wrong local storage is_dirty result, expect is_dirty result, but got {:?}",
-                        res
-                    );
-                }
             }
             Operation::Flush => {
                 assert_ne!(storage_type, StorageType::Global);
@@ -543,6 +485,7 @@ mod tests {
         let (res_tx, mut res_rx) = unbounded_channel();
         let get_table_id = 12;
         let iter_table_id = 14654;
+
         let read_options = TracedReadOptions::for_test(get_table_id);
         let iter_read_options = TracedReadOptions::for_test(iter_table_id);
         let op = Operation::get(Bytes::from(vec![123]), Some(123), read_options);

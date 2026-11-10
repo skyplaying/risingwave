@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::anyhow;
-use risingwave_common::catalog::{Schema, TableId};
+use anyhow::Context;
+use risingwave_common::catalog::{CdcKeyComparison, Schema};
+use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_common::util::sort_util::OrderType;
+use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
-    CdcTableType, ExternalTableConfig, SchemaTableName,
+    ExternalCdcTableType, ExternalTableConfig, SchemaTableName,
 };
+use risingwave_pb::data::data_type::TypeName;
 use risingwave_pb::plan_common::ExternalTableDesc;
 use risingwave_pb::stream_plan::StreamCdcScanNode;
 
 use super::*;
-use crate::common::table::state_table::StateTable;
-use crate::executor::{CdcBackfillExecutor, CdcScanOptions, ExternalStorageTable};
+use crate::common::table::state_table::StateTableBuilder;
+use crate::executor::{CdcBackfillExecutor, ExternalStorageTable, ParallelizedCdcBackfillExecutor};
+use crate::task::cdc_progress::CdcProgressReporter;
 
 pub struct StreamCdcScanExecutorBuilder;
+
+impl_stream_node_body!(StreamCdcScan(StreamCdcScanNode) => StreamCdcScanExecutorBuilder);
+
+type DecodedTablePk = (Vec<OrderType>, Option<Vec<CdcKeyComparison>>, Vec<usize>);
+
+fn decode_table_pk(
+    table_desc: &ExternalTableDesc,
+    table_type: &ExternalCdcTableType,
+) -> StreamResult<DecodedTablePk> {
+    if let Some(table_pk) = &table_desc.pk_ordering {
+        let order_types = table_pk
+            .columns
+            .iter()
+            .map(|_| OrderType::ascending())
+            .collect_vec();
+        let comparisons = table_pk
+            .columns
+            .iter()
+            .map(|column| column.get_comparison().map(CdcKeyComparison::from_protobuf))
+            .try_collect()?;
+        let indices = table_pk
+            .columns
+            .iter()
+            .map(|column| column.pk_col_idx as usize)
+            .collect_vec();
+        Ok((order_types, Some(comparisons), indices))
+    } else {
+        let order_types = table_desc
+            .pk
+            .iter()
+            .map(|column| OrderType::from_protobuf(column.get_order_type().unwrap()))
+            .collect_vec();
+        let indices = table_desc
+            .pk
+            .iter()
+            .map(|column| column.column_index as usize)
+            .collect_vec();
+        // Legacy graphs do not retain MySQL signedness: signed and unsigned BIGINT stored as
+        // Int64 are indistinguishable until the reader checks upstream. Only Int64 PK columns
+        // can need unsigned reinterpretation; other types (including Decimal) use native ordering.
+        let mut needs_reader_comparisons = false;
+        if matches!(
+            table_type,
+            ExternalCdcTableType::Mysql | ExternalCdcTableType::Mariadb
+        ) {
+            for &idx in &indices {
+                if table_desc.columns[idx].get_column_type()?.get_type_name()? == TypeName::Int64 {
+                    needs_reader_comparisons = true;
+                    break;
+                }
+            }
+        }
+        let comparisons = (!needs_reader_comparisons)
+            .then(|| vec![CdcKeyComparison::Native; table_desc.pk.len()]);
+        Ok((order_types, comparisons, indices))
+    }
+}
 
 impl ExecutorBuilder for StreamCdcScanExecutorBuilder {
     type Node = StreamCdcScanNode;
@@ -52,22 +112,10 @@ impl ExecutorBuilder for StreamCdcScanExecutorBuilder {
         assert_eq!(output_indices, (0..output_schema.len()).collect_vec());
         assert_eq!(output_schema.data_types(), params.info.schema.data_types());
 
-        let properties: HashMap<String, String> = table_desc
-            .connect_properties
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        let table_pk_order_types = table_desc
-            .pk
-            .iter()
-            .map(|desc| OrderType::from_protobuf(desc.get_order_type().unwrap()))
-            .collect_vec();
-        let table_pk_indices = table_desc
-            .pk
-            .iter()
-            .map(|k| k.column_index as usize)
-            .collect_vec();
+        let properties = table_desc.connect_properties.clone();
+        let table_type = ExternalCdcTableType::from_properties(&properties);
+        let (table_pk_order_types, table_pk_comparisons, table_pk_indices) =
+            decode_table_pk(table_desc, &table_type)?;
 
         let scan_options = node
             .options
@@ -77,64 +125,201 @@ impl ExecutorBuilder for StreamCdcScanExecutorBuilder {
                 disable_backfill: node.disable_backfill,
                 ..Default::default()
             });
-        let table_type = CdcTableType::from_properties(&properties);
-
         // Filter out additional columns to construct the external table schema
         let table_schema: Schema = table_desc
             .columns
             .iter()
             .filter(|col| {
-                !col.additional_column
+                col.additional_column
                     .as_ref()
-                    .is_some_and(|a_col| a_col.column_type.is_some())
+                    .is_none_or(|a_col| a_col.column_type.is_none())
             })
             .map(Into::into)
             .collect();
 
         let schema_table_name = SchemaTableName::from_properties(&properties);
-        let table_config = serde_json::from_value::<ExternalTableConfig>(
-            serde_json::to_value(properties).unwrap(),
+        let table_config = ExternalTableConfig::try_from_btreemap(
+            properties.clone(),
+            table_desc.secret_refs.clone(),
         )
-        .map_err(|e| anyhow!("failed to parse external table config").context(e))?;
+        .context("failed to parse external table config")?;
+
         let database_name = table_config.database.clone();
-        let table_reader = table_type
-            .create_table_reader(
-                table_config,
-                table_schema.clone(),
-                table_pk_indices.clone(),
-                scan_options.snapshot_batch_size,
-            )
-            .await?;
 
         let external_table = ExternalStorageTable::new(
-            TableId::new(table_desc.table_id),
+            table_desc.table_id,
             schema_table_name,
             database_name,
-            table_reader,
+            table_config,
+            table_type,
             table_schema,
             table_pk_order_types,
+            table_pk_comparisons,
             table_pk_indices,
         );
 
-        let vnodes = params.vnode_bitmap.map(Arc::new);
-        // cdc backfill should be singleton, so vnodes must be None.
-        assert_eq!(None, vnodes);
-        let state_table =
-            StateTable::from_table_catalog(node.get_state_table()?, state_store, vnodes).await;
-
         let output_columns = table_desc.columns.iter().map(Into::into).collect_vec();
-        let exec = CdcBackfillExecutor::new(
-            params.actor_context.clone(),
-            external_table,
-            upstream,
-            output_indices,
-            output_columns,
-            None,
-            params.executor_stats,
-            state_table,
-            node.rate_limit,
-            scan_options,
+        if scan_options.is_parallelized_backfill() {
+            // Set state table's vnodes to None to allow splits to be assigned to any actors, without following vnode constraints.
+            let vnodes = None;
+            let state_table = StateTableBuilder::new(node.get_state_table()?, state_store, vnodes)
+                .enable_preload_all_rows_by_config(&params.config)
+                .build()
+                .await;
+            let progress = CdcProgressReporter::new(params.local_barrier_manager.clone());
+            let exec = ParallelizedCdcBackfillExecutor::new(
+                params.actor_context.clone(),
+                external_table,
+                upstream,
+                output_indices,
+                output_columns,
+                params.executor_stats,
+                state_table,
+                node.rate_limit,
+                scan_options,
+                properties,
+                Some(progress),
+            );
+            Ok((params.info, exec).into())
+        } else {
+            assert!(
+                params.vnode_bitmap.is_singleton(),
+                "cdc backfill should be singleton"
+            );
+            let vnodes = Some(Arc::new(params.vnode_bitmap));
+            let state_table = StateTableBuilder::new(node.get_state_table()?, state_store, vnodes)
+                .enable_preload_all_rows_by_config(&params.config)
+                .build()
+                .await;
+            let exec = CdcBackfillExecutor::new(
+                params.actor_context.clone(),
+                external_table,
+                upstream,
+                output_indices,
+                output_columns,
+                None,
+                params.executor_stats,
+                state_table,
+                node.rate_limit,
+                scan_options,
+                properties,
+            );
+            Ok((params.info, exec).into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc};
+    use risingwave_common::types::DataType;
+    use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
+    use risingwave_connector::source::cdc::external::ExternalCdcTableType;
+    use risingwave_pb::plan_common::cdc_key_ordering::{Column, Comparison};
+    use risingwave_pb::plan_common::{CdcKeyOrdering, ExternalTableDesc};
+
+    use super::decode_table_pk;
+
+    fn legacy_desc(pk_type: DataType) -> ExternalTableDesc {
+        ExternalTableDesc {
+            columns: vec![
+                ColumnDesc::unnamed(0.into(), DataType::Varchar).to_protobuf(),
+                ColumnDesc::unnamed(1.into(), DataType::Int64).to_protobuf(),
+                ColumnDesc::unnamed(2.into(), pk_type).to_protobuf(),
+            ],
+            pk: vec![
+                ColumnOrder::new(2, OrderType::descending()).to_protobuf(),
+                ColumnOrder::new(0, OrderType::ascending()).to_protobuf(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_decode_legacy_mysql_int64_pk_comparisons_as_unknown() {
+        let (order_types, comparisons, indices) =
+            decode_table_pk(&legacy_desc(DataType::Int64), &ExternalCdcTableType::Mysql).unwrap();
+
+        assert_eq!(
+            order_types,
+            vec![OrderType::descending(), OrderType::ascending()]
         );
-        Ok((params.info, exec).into())
+        assert_eq!(comparisons, None);
+        assert_eq!(indices, vec![2, 0]);
+    }
+
+    #[test]
+    fn test_decode_legacy_mysql_non_int64_pk_comparisons_as_native() {
+        // An Int64 non-PK column must not require recovering comparison metadata.
+        for pk_type in [
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Decimal,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Varchar,
+        ] {
+            let (order_types, comparisons, indices) =
+                decode_table_pk(&legacy_desc(pk_type), &ExternalCdcTableType::Mysql).unwrap();
+            assert_eq!(
+                order_types,
+                vec![OrderType::descending(), OrderType::ascending()]
+            );
+            assert_eq!(
+                comparisons,
+                Some(vec![CdcKeyComparison::Native, CdcKeyComparison::Native])
+            );
+            assert_eq!(indices, vec![2, 0]);
+        }
+    }
+
+    #[test]
+    fn test_decode_legacy_non_mysql_pk_comparisons_as_native() {
+        for table_type in [
+            ExternalCdcTableType::Postgres,
+            ExternalCdcTableType::SqlServer,
+            ExternalCdcTableType::Mock,
+        ] {
+            let (_, comparisons, _) =
+                decode_table_pk(&legacy_desc(DataType::Int64), &table_type).unwrap();
+            assert_eq!(
+                comparisons,
+                Some(vec![CdcKeyComparison::Native, CdcKeyComparison::Native])
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_new_pk_comparisons_and_column_order() {
+        let desc = ExternalTableDesc {
+            pk_ordering: Some(CdcKeyOrdering {
+                columns: vec![
+                    Column {
+                        pk_col_idx: 3,
+                        comparison: Comparison::UnsignedInt64 as i32,
+                    },
+                    Column {
+                        pk_col_idx: 1,
+                        comparison: Comparison::Native as i32,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        let (order_types, comparisons, indices) =
+            decode_table_pk(&desc, &ExternalCdcTableType::Mysql).unwrap();
+        assert_eq!(
+            order_types,
+            vec![OrderType::ascending(), OrderType::ascending()]
+        );
+        assert_eq!(
+            comparisons,
+            Some(vec![
+                CdcKeyComparison::UnsignedInt64,
+                CdcKeyComparison::Native,
+            ])
+        );
+        assert_eq!(indices, vec![3, 1]);
     }
 }

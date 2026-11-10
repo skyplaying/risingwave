@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
 use pretty_xmlish::XmlNode;
-use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 use risingwave_pb::stream_plan::ProjectNode;
+use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::stream::prelude::*;
-use super::utils::{childless_record, watermark_pretty, Distill};
-use super::{generic, ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
-use crate::expr::{
-    try_derive_watermark, Expr, ExprImpl, ExprRewriter, ExprVisitor, WatermarkDerivation,
+use super::utils::{Distill, childless_record, watermark_pretty};
+use super::{
+    ExprRewritable, PlanBase, PlanTreeNodeUnary, StreamPlanRef as PlanRef, TryToStreamPb, generic,
 };
+use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::plan_node::generic::GenericPlanNode;
+use crate::optimizer::property::{
+    MonotonicityMap, WatermarkColumns, analyze_monotonicity, monotonicity_variants,
+};
+use crate::scheduler::SchedulerResult;
 use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::utils::ColIndexMappingRewriteExt;
 
@@ -63,7 +67,8 @@ impl Distill for StreamProject {
 
 impl StreamProject {
     pub fn new(core: generic::Project<PlanRef>) -> Self {
-        Self::new_inner(core, false)
+        let noop_update_hint = core.likely_produces_noop_updates();
+        Self::new_inner(core, noop_update_hint)
     }
 
     /// Set the `noop_update_hint` flag to the given value.
@@ -75,6 +80,7 @@ impl StreamProject {
     }
 
     fn new_inner(core: generic::Project<PlanRef>, noop_update_hint: bool) -> Self {
+        let ctx = core.ctx();
         let input = core.input.clone();
         let distribution = core
             .i2o_col_mapping()
@@ -82,23 +88,32 @@ impl StreamProject {
 
         let mut watermark_derivations = vec![];
         let mut nondecreasing_exprs = vec![];
-        let mut watermark_columns = FixedBitSet::with_capacity(core.exprs.len());
+        let mut out_watermark_columns = WatermarkColumns::new();
+        let mut out_monotonicity_map = MonotonicityMap::new();
         for (expr_idx, expr) in core.exprs.iter().enumerate() {
-            match try_derive_watermark(expr) {
-                WatermarkDerivation::Watermark(input_idx) => {
-                    if input.watermark_columns().contains(input_idx) {
-                        watermark_derivations.push((input_idx, expr_idx));
-                        watermark_columns.insert(expr_idx);
+            use monotonicity_variants::*;
+            match analyze_monotonicity(expr) {
+                Inherent(monotonicity) => {
+                    out_monotonicity_map.insert(expr_idx, monotonicity);
+                    if monotonicity.is_non_decreasing() && !monotonicity.is_constant() {
+                        // TODO(rc): may be we should also derive watermark for constant later
+                        // to produce watermarks
+                        nondecreasing_exprs.push(expr_idx);
+                        // each inherently non-decreasing expr creates a new watermark group
+                        out_watermark_columns.insert(expr_idx, ctx.next_watermark_group_id());
                     }
                 }
-                WatermarkDerivation::Nondecreasing => {
-                    nondecreasing_exprs.push(expr_idx);
-                    watermark_columns.insert(expr_idx);
+                FollowingInput(input_idx) => {
+                    let in_monotonicity = input.columns_monotonicity()[input_idx];
+                    out_monotonicity_map.insert(expr_idx, in_monotonicity);
+                    if let Some(wtmk_group) = input.watermark_columns().get_group(input_idx) {
+                        // to propagate watermarks
+                        watermark_derivations.push((input_idx, expr_idx));
+                        // join an existing watermark group
+                        out_watermark_columns.insert(expr_idx, wtmk_group);
+                    }
                 }
-                WatermarkDerivation::Constant => {
-                    // XXX(rc): we can produce one watermark on each recovery for this case.
-                }
-                WatermarkDerivation::None => {}
+                _FollowingInputInversely(_) => {}
             }
         }
         // Project executor won't change the append-only behavior of the stream, so it depends on
@@ -106,9 +121,10 @@ impl StreamProject {
         let base = PlanBase::new_stream_with_core(
             &core,
             distribution,
-            input.append_only(),
+            input.stream_kind(),
             input.emit_on_window_close(),
-            watermark_columns,
+            out_watermark_columns,
+            out_monotonicity_map,
         );
 
         StreamProject {
@@ -120,7 +136,7 @@ impl StreamProject {
         }
     }
 
-    pub fn as_logical(&self) -> &generic::Project<PlanRef> {
+    pub fn core(&self) -> &generic::Project<PlanRef> {
         &self.core
     }
 
@@ -133,7 +149,7 @@ impl StreamProject {
     }
 }
 
-impl PlanTreeNodeUnary for StreamProject {
+impl PlanTreeNodeUnary<Stream> for StreamProject {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -144,26 +160,40 @@ impl PlanTreeNodeUnary for StreamProject {
         Self::new_inner(core, self.noop_update_hint)
     }
 }
-impl_plan_tree_node_for_unary! {StreamProject}
+impl_plan_tree_node_for_unary! { Stream, StreamProject}
 
-impl StreamNode for StreamProject {
-    fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> PbNodeBody {
+impl TryToStreamPb for StreamProject {
+    fn try_to_stream_prost_body(
+        &self,
+        _state: &mut BuildFragmentGraphState,
+    ) -> SchedulerResult<PbNodeBody> {
         let (watermark_input_cols, watermark_output_cols) = self
             .watermark_derivations
             .iter()
             .map(|(i, o)| (*i as u32, *o as u32))
             .unzip();
-        PbNodeBody::Project(ProjectNode {
-            select_list: self.core.exprs.iter().map(|x| x.to_expr_proto()).collect(),
+        let select_list = self
+            .core
+            .exprs
+            .iter()
+            .map(|expr| {
+                expr.to_expr_proto_checked_pure(
+                    self.input().stream_kind().is_retract(),
+                    "SELECT list",
+                )
+            })
+            .collect::<crate::error::Result<Vec<_>>>()?;
+        Ok(PbNodeBody::Project(Box::new(ProjectNode {
+            select_list,
             watermark_input_cols,
             watermark_output_cols,
             nondecreasing_exprs: self.nondecreasing_exprs.iter().map(|i| *i as _).collect(),
             noop_update_hint: self.noop_update_hint,
-        })
+        })))
     }
 }
 
-impl ExprRewritable for StreamProject {
+impl ExprRewritable<Stream> for StreamProject {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -171,7 +201,8 @@ impl ExprRewritable for StreamProject {
     fn rewrite_exprs(&self, r: &mut dyn ExprRewriter) -> PlanRef {
         let mut core = self.core.clone();
         core.rewrite_exprs(r);
-        Self::new_inner(core, self.noop_update_hint).into()
+        let noop_update_hint = self.noop_update_hint || core.likely_produces_noop_updates();
+        Self::new_inner(core, noop_update_hint).into()
     }
 }
 

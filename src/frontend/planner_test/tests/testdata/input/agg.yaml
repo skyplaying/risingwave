@@ -296,20 +296,26 @@
   expected_outputs:
   - logical_plan
   - batch_plan
-- name: distinct on
+- name: distinct on order by distinct columns
   sql: |
     create table t (v1 int, v2 int, v3 int);
     select distinct on (v1, v3) v1, v2 from t order by v1, v3;
   expected_outputs:
   - logical_plan
   - batch_plan
-- name: distinct on
+- name: distinct on order by part of the distinct columns
   sql: |
     create table t (v1 int, v2 int);
     select distinct on (v1) v1, v2 from t order by v1;
   expected_outputs:
   - logical_plan
-- name: distinct on
+- name: distinct on order by distinct columns and additional sorting columns
+  sql: |
+    create table t (id int, ts timestamp, foo int, bar varchar);
+    select distinct on (id) * from t order by id, ts desc;
+  expected_outputs:
+    - logical_plan
+- name: distinct on with expression
   sql: |
     create table t (v1 int, v2 int, v3 int);
     select distinct on(v1) v2 + v3 from t order by v1;
@@ -404,6 +410,13 @@
     select avg(a) FILTER (WHERE a > b) AS avga from t group by b ;
   expected_outputs:
   - optimized_logical_plan_for_batch
+  - logical_plan
+  - stream_plan
+- name: avg filter clause with empty input group
+  sql: |
+    create table t(a int, b int);
+    select avg(a) FILTER (WHERE false) AS avga from t group by b;
+  expected_outputs:
   - logical_plan
   - stream_plan
 - name: count filter clause
@@ -569,6 +582,19 @@
   - optimized_logical_plan_for_stream
   with_config_map:
     RW_FORCE_SPLIT_DISTINCT_AGG: 'true'
+- name: grouping sets can require only expand flag
+  sql: |
+    create table t(a int);
+    select count(*) from t group by grouping sets ((), ());
+  expected_outputs:
+  - optimized_logical_plan_for_batch
+  - optimized_logical_plan_for_stream
+- name: split distinct agg with row id prunes hidden columns
+  sql: |
+    create table t(foo int, bar int);
+    explain (verbose) create materialized view mv_distinct_agg_with_row_id as select count(foo) as c1, count(distinct foo) as c2, count(distinct _row_id) as c3 from t;
+  expected_outputs:
+  - explain_output
 - name: remove unnecessary distinct for max and min
   sql: |
     create table t(x int, y int);
@@ -758,7 +784,7 @@
 - name: enable two phase aggregation with simple agg should have two phase agg
   sql: |
     SET QUERY_MODE TO DISTRIBUTED;
-    SET RW_ENABLE_TWO_PHASE_AGG=true;
+    SET ENABLE_TWO_PHASE_AGG=true;
     create table t(v1 int, v2 int);
     select min(v1), sum(v2) from t;
   expected_outputs:
@@ -767,7 +793,7 @@
 - name: disable two phase aggregation with simple agg
   sql: |
     SET QUERY_MODE TO DISTRIBUTED;
-    SET RW_ENABLE_TWO_PHASE_AGG=false;
+    SET ENABLE_TWO_PHASE_AGG=false;
     create table t(v1 int, v2 int);
     select min(v1), sum(v2) from t;
   expected_outputs:
@@ -998,5 +1024,171 @@
     FROM t
     GROUP BY a, b;
   expected_outputs:
+    - batch_plan
+    - stream_plan
+- name: test duplicate agg
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT sum(v1) as x, count(v1) as y, sum(v1) as z, count(v1) as w from t;
+  expected_outputs:
+    - logical_plan
+    - stream_plan
+- name: test simple approx_percentile alone
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with other simple aggs
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1), sum(v1) from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with other simple aggs (sum, count)
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT sum(v1) as s1, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1), sum(v1) as s2, count(v1) from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with duplicate approx_percentile
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as x, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as y from t;
+  expected_outputs:
+    - logical_plan
+    - stream_plan
+- name: test simple approx_percentile with different approx_percentile
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as x, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v2) as y from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with different approx_percentile interleaved with stateless simple aggs
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT sum(v1) as s1, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as x, count(*), sum(v2) + approx_percentile(0.9, 0.01) WITHIN GROUP (order by v2) as y from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with duplicated approx_percentile interleaved with stateless simple aggs
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT sum(v1) as s1, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as x, count(*), sum(v2) + approx_percentile(0.5, 0.01) WITHIN GROUP (order by v2) as y from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with descending order
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT sum(v1) as s1, approx_percentile(0.2, 0.01) WITHIN GROUP (order by v1 desc) from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test simple approx_percentile with different approx_percentile interleaved with stateless + stateful simple aggs
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT sum(v1) as s1, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) as x, count(*), max(v2) as m2, approx_percentile(0.5, 0.01) WITHIN GROUP (order by v2) as y from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test hash approx_percentile
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) from t group by v2;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test approx_percentile hash_agg forced should use single phase agg
+  sql: |
+    SET RW_FORCE_TWO_PHASE_AGG=true;
+    create table t (v1 int, grp_col int);
+    select approx_percentile(0.5, 0.01) WITHIN GROUP (order by v1) from t group by grp_col;
+  expected_outputs:
+    - stream_error
+- name: test approx percentile with default relative_error
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5) WITHIN GROUP (order by v1) from t;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: test approx percentile with invalid relative_error
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5, 0.0) WITHIN GROUP (order by v1) from t;
+  expected_outputs:
+    - binder_error
+- name: test approx percentile with invalid relative_error 0.0
+  sql: |
+    CREATE TABLE t (v1 int);
+    SELECT approx_percentile(0.5, 0.0) WITHIN GROUP (order by v1) from t;
+  expected_outputs:
+    - binder_error
+- name: test approx percentile with invalid relative_error 1.0 with group by.
+  sql: |
+    CREATE TABLE t (v1 int, v2 int);
+    SELECT approx_percentile(0.0, 1.0) WITHIN GROUP (order by v1) from t group by v2;
+  expected_outputs:
+    - binder_error
+- name: test empty agg
+  sql: |
+    WITH with_0 AS (
+        WITH with_1 AS (
+            SELECT
+                TIMESTAMP '2025-05-05 16:18:55' AS col_0,
+                avg((INT '813')) AS col_1, ((BIGINT '371') / (INT '-2147483648')) AS col_2,
+                (SMALLINT '460') AS col_3
+            FROM generate_series(TIMESTAMP '2020-01-01 00:07:42', TIMESTAMP '2020-01-01 00:46:33', INTERVAL '2706 seconds') AS generate_series_2
+            WHERE true
+        )
+        SELECT
+            true AS col_0,
+            (REAL '-2147483648') AS col_1,
+            (SMALLINT '-10773') AS col_2
+        FROM with_1
+    )
+    SELECT
+        CAST(NULL AS STRUCT<a SMALLINT, b DOUBLE, c TIME>) AS col_0,
+        (INT '995') AS col_1,
+        (INTERVAL '-604800') AS col_2,
+        (FLOAT '294') AS col_3
+    FROM with_0
+    WHERE false;
+  expected_outputs:
+    - logical_plan
+    - batch_plan
+    - stream_plan
+- name: group by on a single-row input must not become a simple agg (https://github.com/risingwavelabs/risingwave/issues/27451)
+  sql: |
+    create materialized view m6 as select min(x) as col_0 from (values (1)) as v(x);
+    select col_0 from m6 where false group by col_0;
+  expected_outputs:
+    - logical_plan
+    - optimized_logical_plan_for_batch
+    - optimized_logical_plan_for_stream
+    - batch_plan
+    - stream_plan
+- name: group by multiple columns on a single-row input keeps one group key
+  sql: |
+    create materialized view m7 as select min(x) as a, max(x) as b from (values (1)) as v(x);
+    select a, b, count(*) from m7 where a > 0 group by a, b;
+  expected_outputs:
+    - optimized_logical_plan_for_batch
+    - optimized_logical_plan_for_stream
     - batch_plan
     - stream_plan

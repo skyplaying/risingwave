@@ -1,20 +1,23 @@
-// Copyright 2024 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.source;
 
 import com.risingwave.connector.api.TableSchema;
+import com.risingwave.connector.api.source.SourceTypeE;
 import com.risingwave.connector.source.common.*;
 import com.risingwave.proto.ConnectorServiceProto;
 import io.grpc.StatusRuntimeException;
@@ -89,6 +92,98 @@ public class SourceValidateHandler {
         }
     }
 
+    /**
+     * Validate queue.memory.ratio if specified. The ratio must be a valid number between
+     * MIN_QUEUE_MAX_MEMORY_RATIO and MAX_QUEUE_MAX_MEMORY_RATIO.
+     */
+    private static void validateQueueMemoryRatio(Map<String, String> props) {
+        String ratioStr = props.get("debezium.queue.memory.ratio");
+        if (ratioStr == null) {
+            return; // Not specified, use default
+        }
+
+        double ratio;
+        try {
+            ratio = Double.parseDouble(ratioStr);
+        } catch (NumberFormatException e) {
+            throw ValidatorUtils.invalidArgument(
+                    String.format(
+                            "'debezium.queue.memory.ratio' must be a valid number, got: '%s'",
+                            ratioStr));
+        }
+
+        // Validate ratio is in reasonable range (1% - 80%)
+        if (ratio < DbzConnectorConfig.MIN_QUEUE_MAX_MEMORY_RATIO
+                || ratio > DbzConnectorConfig.MAX_QUEUE_MAX_MEMORY_RATIO) {
+            throw ValidatorUtils.invalidArgument(
+                    String.format(
+                            "'debezium.queue.memory.ratio' must be between %s and %s, got: %s",
+                            DbzConnectorConfig.MIN_QUEUE_MAX_MEMORY_RATIO,
+                            DbzConnectorConfig.MAX_QUEUE_MAX_MEMORY_RATIO,
+                            ratio));
+        }
+    }
+
+    /**
+     * Requires an explicitly supplied heartbeat interval to be a positive signed 32-bit integer.
+     * Validates user-supplied options, not the final Debezium configuration. If omitted,
+     * DbzConnectorConfig supplies the connector default. Keep this policy in sync with Rust's
+     * validate_heartbeat_interval (CREATE and ALTER).
+     */
+    private static void validateHeartbeatInterval(Map<String, String> props) {
+        String intervalStr = props.get("debezium.heartbeat.interval.ms");
+        if (intervalStr == null) {
+            return; // Not specified, use default
+        }
+
+        int interval;
+        try {
+            // Match Rust's ASCII integer syntax; Integer.parseInt also accepts Unicode digits.
+            if (!intervalStr.matches("[+-]?[0-9]+")) {
+                throw new NumberFormatException();
+            }
+            // Debezium uses a signed 32-bit integer; RW also rejects zero to keep heartbeats
+            // enabled.
+            interval = Integer.parseInt(intervalStr);
+            if (interval <= 0) {
+                throw new NumberFormatException();
+            }
+        } catch (NumberFormatException e) {
+            throw ValidatorUtils.invalidArgument(
+                    String.format(
+                            "'debezium.heartbeat.interval.ms' must be a positive integer, got: '%s'",
+                            intervalStr));
+        }
+    }
+
+    private static void validateHeartbeatTableAutoInitialize(
+            Map<String, String> props, ConnectorServiceProto.SourceType sourceType) {
+        var value = props.get(DbzConnectorConfig.HEARTBEAT_TABLE_AUTO_INITIALIZE_KEY);
+        if (value == null) {
+            return;
+        }
+        if (!value.equals("true") && !value.equals("false")) {
+            throw ValidatorUtils.invalidArgument(
+                    String.format(
+                            "'%s' must be 'true' or 'false'",
+                            DbzConnectorConfig.HEARTBEAT_TABLE_AUTO_INITIALIZE_KEY));
+        }
+        if (value.equals("false")) {
+            return;
+        }
+
+        switch (sourceType) {
+            case ORACLE:
+                break;
+            default:
+                throw ValidatorUtils.invalidArgument(
+                        String.format(
+                                "'%s=true' is not supported for connector '%s'",
+                                DbzConnectorConfig.HEARTBEAT_TABLE_AUTO_INITIALIZE_KEY,
+                                sourceType.name()));
+        }
+    }
+
     public static void validateSource(ConnectorServiceProto.ValidateSourceRequest request)
             throws Exception {
         var props = request.getPropertiesMap();
@@ -101,6 +196,8 @@ public class SourceValidateHandler {
                 isCdcSourceJob,
                 isBackfillTable);
 
+        validateHeartbeatInterval(props);
+        validateHeartbeatTableAutoInitialize(props, request.getSourceType());
         TableSchema tableSchema = TableSchema.fromProto(request.getTableSchema());
         switch (request.getSourceType()) {
             case POSTGRES:
@@ -109,53 +206,60 @@ public class SourceValidateHandler {
                 ensurePropNotBlank(props, DbzConnectorConfig.PG_SLOT_NAME);
                 ensurePropNotBlank(props, DbzConnectorConfig.PG_PUB_NAME);
                 ensurePropNotBlank(props, DbzConnectorConfig.PG_PUB_CREATE);
+                validateQueueMemoryRatio(props);
                 try (var validator = new PostgresValidator(props, tableSchema, isCdcSourceJob)) {
                     validator.validateAll();
                 }
                 break;
 
-            case CITUS:
-                ensureRequiredProps(props, isCdcSourceJob);
-                ensurePropNotBlank(props, DbzConnectorConfig.TABLE_NAME);
-                ensurePropNotBlank(props, DbzConnectorConfig.PG_SCHEMA_NAME);
-                try (var coordinatorValidator = new CitusValidator(props, tableSchema)) {
-                    coordinatorValidator.validateDistributedTable();
-                    coordinatorValidator.validateTable();
-                }
-
-                ensurePropNotBlank(props, DbzConnectorConfig.DB_SERVERS);
-                var workerServers =
-                        StringUtils.split(props.get(DbzConnectorConfig.DB_SERVERS), ',');
-                // props extracted from grpc request, clone it to modify
-                Map<String, String> mutableProps = new HashMap<>(props);
-                for (String workerAddr : workerServers) {
-                    String[] hostPort = StringUtils.split(workerAddr, ':');
-                    if (hostPort.length != 2) {
-                        throw ValidatorUtils.invalidArgument("invalid database.servers");
-                    }
-                    // set HOST for each worker server
-                    mutableProps.put(DbzConnectorConfig.HOST, hostPort[0]);
-                    mutableProps.put(DbzConnectorConfig.PORT, hostPort[1]);
-                    try (var workerValidator = new CitusValidator(mutableProps, tableSchema)) {
-                        workerValidator.validateDbConfig();
-                        workerValidator.validateUserPrivilege();
-                    }
-                }
-
-                break;
             case MYSQL:
+            case MARIADB:
                 ensureRequiredProps(props, isCdcSourceJob);
                 ensurePropNotBlank(props, DbzConnectorConfig.MYSQL_SERVER_ID);
+                validateQueueMemoryRatio(props);
                 try (var validator =
-                        new MySqlValidator(props, tableSchema, isCdcSourceJob, isBackfillTable)) {
+                        new MySqlValidator(
+                                SourceTypeE.valueOf(request.getSourceType()),
+                                props,
+                                tableSchema,
+                                isCdcSourceJob,
+                                isBackfillTable)) {
                     validator.validateAll();
                 }
                 break;
             case MONGODB:
                 ensurePropNotBlank(props, DbzConnectorConfig.MongoDb.MONGO_URL);
                 ensurePropNotBlank(props, DbzConnectorConfig.MongoDb.MONGO_COLLECTION_NAME);
-                var validator = new MongoDbValidator(props);
-                validator.validateDbConfig();
+                validateQueueMemoryRatio(props);
+                try (var validator = new MongoDbValidator(props, request.getSourceId())) {
+                    validator.validateAll();
+                }
+                break;
+            case SQL_SERVER:
+                ensureRequiredProps(props, isCdcSourceJob);
+                ensurePropNotBlank(props, DbzConnectorConfig.SQL_SERVER_SCHEMA_NAME);
+                validateQueueMemoryRatio(props);
+                try (var sqlServerValidator =
+                        new SqlServerValidator(props, tableSchema, isCdcSourceJob)) {
+                    sqlServerValidator.validateAll();
+                }
+                break;
+            case ORACLE:
+                ensureRequiredProps(props, isCdcSourceJob);
+                ensurePropNotBlank(props, DbzConnectorConfig.ORACLE_PDB_NAME);
+                ensurePropNotBlank(props, DbzConnectorConfig.ORACLE_SCHEMA_NAME);
+                ensurePropNotBlank(props, DbzConnectorConfig.ORACLE_HEARTBEAT_TABLE_NAME);
+                if (props.containsKey(DbzConnectorConfig.HEARTBEAT_ACTION_QUERY_KEY)) {
+                    throw ValidatorUtils.invalidArgument(
+                            String.format(
+                                    "'%s' is generated internally; configure '%s' instead",
+                                    DbzConnectorConfig.HEARTBEAT_ACTION_QUERY_KEY,
+                                    DbzConnectorConfig.ORACLE_HEARTBEAT_TABLE_NAME));
+                }
+                validateQueueMemoryRatio(props);
+                try (var oracleValidator = new OracleValidator(props, isCdcSourceJob)) {
+                    oracleValidator.validateAll();
+                }
                 break;
             default:
                 LOG.warn("Unknown source type");

@@ -1,0 +1,387 @@
+# CDC validation tests, primarily using shared sources.
+#
+# These tests verify that invalid CDC source and table definitions are rejected
+# during creation. Oracle temporarily uses direct CDC tables until shared-source
+# support is available.
+
+control substitution on
+
+
+############################################################
+# CDC: Debezium decimal handling mode validation.
+############################################################
+
+# Precise mode emits binary logical decimals that RisingWave cannot decode safely from
+# schema-less JSON.
+statement error 'debezium.decimal.handling.mode' must be 'string', got: 'precise'
+create source mysql_invalid_decimal_precise with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5802',
+ debezium.decimal.handling.mode = 'precise'
+);
+
+# Double mode can lose decimal precision.
+statement error 'debezium.decimal.handling.mode' must be 'string', got: 'double'
+create source mysql_invalid_decimal_double with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5803',
+ debezium.decimal.handling.mode = 'double'
+);
+
+
+############################################################
+# CDC: Debezium heartbeat interval validation.
+############################################################
+
+statement error 'debezium.heartbeat.interval.ms' must be a positive integer, got: '0'
+create source mysql_invalid_heartbeat_zero with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5802',
+ debezium.heartbeat.interval.ms = '0'
+);
+
+statement error 'debezium.heartbeat.interval.ms' must be a positive integer, got: '-1'
+create source mysql_invalid_heartbeat_negative with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5803',
+ debezium.heartbeat.interval.ms = '-1'
+);
+
+statement error 'debezium.heartbeat.interval.ms' must be a positive integer, got: 'invalid'
+create source mysql_invalid_heartbeat_non_integer with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5804',
+ debezium.heartbeat.interval.ms = 'invalid'
+);
+
+
+############################################################
+# Oracle: connector configuration errors fire at `CREATE TABLE`.
+############################################################
+
+# TODO: Replace both direct Oracle CDC tables below with `CREATE SOURCE` once Oracle
+# shared-source support is ready in a later PR. Use implicit `FORMAT PLAIN ENCODE JSON`
+# like the MySQL cases, removing the explicit columns and table.name.
+# Both errors must be reported by Java validation before connecting to Oracle.
+
+statement error 'debezium.heartbeat.action.query' is generated internally; configure 'heartbeat.table.name' instead
+create table oracle_user_provided_heartbeat_action (
+ id INT PRIMARY KEY
+) with (
+ connector = 'oracle-cdc',
+ hostname = 'oracle',
+ port = '1521',
+ username = 'C##RW_VALIDATOR',
+ password = 'secret',
+ database.name = 'FREE',
+ database.pdb.name = 'FREEPDB1',
+ schema.name = 'APP',
+ table.name = 'CUSTOMERS',
+ heartbeat.table.name = 'APP.RW_HEARTBEAT',
+ debezium.heartbeat.action.query = 'UPDATE APP.RW_HEARTBEAT SET HEARTBEAT = 1 WHERE ID = 1'
+) FORMAT DEBEZIUM ENCODE JSON;
+
+statement error 'database.pdb.name' must be an unquoted Oracle identifier
+create table oracle_invalid_pdb_identifier (
+ id INT PRIMARY KEY
+) with (
+ connector = 'oracle-cdc',
+ hostname = 'oracle',
+ port = '1521',
+ username = 'C##RW_VALIDATOR',
+ password = 'secret',
+ database.name = 'FREE',
+ database.pdb.name = 'FREEPDB1; DROP TABLE APP.CUSTOMERS',
+ schema.name = 'APP',
+ table.name = 'CUSTOMERS',
+ heartbeat.table.name = 'APP.RW_HEARTBEAT'
+) FORMAT DEBEZIUM ENCODE JSON;
+
+
+############################################################
+# MySQL: connection-level errors fire at `CREATE SOURCE`.
+############################################################
+
+# invalid username
+statement error
+create source mysql_invalid_user with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'rot',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5801'
+);
+
+# invalid password
+statement error
+create source mysql_invalid_pwd with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '1456',
+ database.name = 'my@db',
+ server.id = '5801'
+);
+
+# invalid database name
+statement error
+create source mysql_invalid_db with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'mdb',
+ server.id = '5801'
+);
+
+
+############################################################
+# MySQL: schema-level errors fire at `CREATE TABLE FROM SOURCE`.
+############################################################
+
+statement ok
+create source mysql_validate_src with (
+ connector = 'mysql-cdc',
+ hostname = 'mysql',
+ port = '3306',
+ username = 'root',
+ password = '123456',
+ database.name = 'my@db',
+ server.id = '5801'
+);
+
+# upstream table does not exist
+statement error
+create table products (
+ id INT,
+ name STRING,
+ description STRING,
+ PRIMARY KEY (id)
+) from mysql_validate_src table 'my@db.prdcts';
+
+# primary key column does not match upstream
+statement error
+create table orders (
+ order_id int,
+ order_date timestamp,
+ customer_name string,
+ price decimal,
+ product_id int,
+ order_status smallint,
+ PRIMARY KEY (product_id)
+) from mysql_validate_src table 'my@db.orders';
+
+# column data type mismatch (decimal vs double)
+statement error
+create table orders (
+ order_id int,
+ order_date timestamp,
+ customer_name string,
+ price double,
+ product_id int,
+ order_status smallint,
+ PRIMARY KEY (order_id)
+) from mysql_validate_src table 'my@db.orders';
+
+# column name mismatch
+statement error
+create table orders (
+ order_id int,
+ order_date timestamp,
+ cust_name string,
+ price decimal,
+ product_id int,
+ order_status smallint,
+ PRIMARY KEY (order_id)
+) from mysql_validate_src table 'my@db.orders';
+
+statement ok
+drop source mysql_validate_src;
+
+
+############################################################
+# Postgres: connection-level errors fire at `CREATE SOURCE`.
+############################################################
+
+# invalid username
+statement error
+create source pg_invalid_user with (
+ connector = 'postgres-cdc',
+ hostname = 'db',
+ port = '5432',
+ username = 'posres',
+ password = 'postgres',
+ database.name = 'cdc_test'
+);
+
+# invalid password
+statement error
+create source pg_invalid_pwd with (
+ connector = 'postgres-cdc',
+ hostname = 'db',
+ port = '5432',
+ username = 'postgres',
+ password = 'otgres',
+ database.name = 'cdc_test'
+);
+
+
+############################################################
+# Postgres: schema-level errors fire at `CREATE TABLE FROM SOURCE`.
+############################################################
+
+statement ok
+create source pg_validate_src with (
+ connector = 'postgres-cdc',
+ hostname = '${PGHOST:localhost}',
+ port = '${PGPORT:5432}',
+ username = '${PGUSER:$USER}',
+ password = '${PGPASSWORD:}',
+ database.name = '${PGDATABASE:postgres}',
+ slot.name = 'validate_slot'
+);
+
+# NOT NULL constraint not supported on CDC tables
+statement error CDC table with NOT NULL constraint is not supported
+create table shipments (
+  shipment_id INTEGER,
+  order_id INTEGER,
+  origin STRING,
+  destination STRING NOT NULL,
+  is_arrived boolean NOT NULL,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipments';
+
+# upstream table does not exist
+statement error
+create table shipments (
+  shipment_id INTEGER,
+  order_id INTEGER,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipment';
+
+# primary key column does not match upstream
+statement error
+create table shipments (
+  shipment_id INTEGER,
+  order_id INTEGER,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+ PRIMARY KEY (order_id)
+) from pg_validate_src table 'public.shipments';
+
+# column name mismatch
+statement error
+create table shipments (
+  shipment_id INTEGER,
+  orderid INTEGER,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipments';
+
+# column data type mismatch (real vs integer)
+statement error
+create table shipments (
+  shipment_id INTEGER,
+  order_id real,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipments';
+
+# non-generated column after a generated column is rejected
+statement error Not supported: Non-generated column found after a generated column.
+create table shipments (
+  next_shipment_id INTEGER as shipment_id + 1,
+  shipment_id INTEGER,
+  order_id INTEGER,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipments';
+
+# generated column placed at the end is valid
+statement ok
+create table shipments (
+  shipment_id INTEGER,
+  order_id INTEGER,
+  origin STRING,
+  destination STRING,
+  is_arrived boolean,
+  generated_c INTEGER AS shipment_id + order_id,
+ PRIMARY KEY (shipment_id)
+) from pg_validate_src table 'public.shipments';
+
+statement ok
+drop table shipments;
+
+statement ok
+drop source pg_validate_src;
+
+
+############################################################
+# Postgres: partition table publication validation.
+# Publication `rw_publication_pubviaroot_false` is created upstream
+# without `publish_via_partition_root = true`, so CDC ingestion of the
+# partitioned root table must be rejected.
+############################################################
+
+statement ok
+create source pg_partition_pubviaroot_false with (
+ connector = 'postgres-cdc',
+ hostname = '${PGHOST:localhost}',
+ port = '${PGPORT:5432}',
+ username = '${PGUSER:$USER}',
+ password = '${PGPASSWORD:}',
+ database.name = '${PGDATABASE:postgres}',
+ publication.name = 'rw_publication_pubviaroot_false',
+ slot.name = 'validate_partition_slot'
+);
+
+statement error Table 'partitioned_timestamp_table' has partitions, which requires publication 'rw_publication_pubviaroot_false' to be created with `publish_via_partition_root = true`.
+create table partitioned_timestamp_table(
+  c_int int,
+  c_boolean boolean,
+  c_timestamp timestamp,
+  PRIMARY KEY (c_int, c_timestamp)
+) from pg_partition_pubviaroot_false table 'public.partitioned_timestamp_table';
+
+statement ok
+drop source pg_partition_pubviaroot_false;

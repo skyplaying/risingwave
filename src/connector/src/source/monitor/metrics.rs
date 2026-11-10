@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,19 +14,77 @@
 
 use std::sync::{Arc, LazyLock};
 
-use prometheus::core::{AtomicI64, AtomicU64, GenericCounterVec, GenericGaugeVec};
 use prometheus::{
-    exponential_buckets, histogram_opts, register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry, HistogramVec,
-    Registry,
+    IntCounterVec, Registry, exponential_buckets, histogram_opts,
+    register_int_counter_vec_with_registry,
+};
+use risingwave_common::config::MetricLevel;
+use risingwave_common::metrics::{
+    GaugeAggregation, IntGaugeVecRelabelExt, LabelGuardedHistogramVec, LabelGuardedIntCounterVec,
+    LabelGuardedIntGaugeVec, MetricVecRelabelExt, RelabeledAggregatedIntGaugeVec,
+    RelabeledGuardedIntCounterVec,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
+use risingwave_common::{
+    register_guarded_histogram_vec_with_registry, register_guarded_int_counter_vec_with_registry,
+    register_guarded_int_gauge_vec_with_registry,
+};
 
+use crate::connector_metrics_level;
 use crate::source::kafka::stats::RdKafkaStats;
+
+/// Low-cardinality connector ack failure categories.
+///
+/// Keep this list bounded. Do not add raw connector error messages, topics,
+/// partitions, or split identifiers as metric label values.
+#[derive(Debug, Clone, Copy)]
+pub enum ConnectorAckFailureType {
+    Error,
+    Timeout,
+    EmptyMessageId,
+    ChannelMissing,
+    ChannelSendError,
+    DecodeError,
+    BrokerError,
+}
+
+impl ConnectorAckFailureType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::EmptyMessageId => "empty_message_id",
+            Self::ChannelMissing => "channel_missing",
+            Self::ChannelSendError => "channel_send_error",
+            Self::DecodeError => "decode_error",
+            Self::BrokerError => "broker_error",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EnumeratorMetrics {
-    pub high_watermark: GenericGaugeVec<AtomicI64>,
+    pub high_watermark: LabelGuardedIntGaugeVec,
+    /// Kafka consumer group delete attempts that failed during source enumerator cleanup.
+    ///
+    /// The `consumer_group` label is fragment-derived and emitted only on cleanup failures.
+    pub kafka_consumer_group_delete_failure_count: IntCounterVec,
+    /// PostgreSQL CDC confirmed flush LSN monitoring
+    pub pg_cdc_confirmed_flush_lsn: LabelGuardedIntGaugeVec,
+    /// PostgreSQL CDC upstream max LSN monitoring
+    pub pg_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
+    /// MySQL CDC binlog file sequence number (min)
+    pub mysql_cdc_binlog_file_seq_min: LabelGuardedIntGaugeVec,
+    /// MySQL CDC binlog file sequence number (max)
+    pub mysql_cdc_binlog_file_seq_max: LabelGuardedIntGaugeVec,
+    /// `MariaDB` CDC binlog file sequence number (min)
+    pub mariadb_cdc_binlog_file_seq_min: LabelGuardedIntGaugeVec,
+    /// `MariaDB` CDC binlog file sequence number (max)
+    pub mariadb_cdc_binlog_file_seq_max: LabelGuardedIntGaugeVec,
+    /// SQL Server CDC upstream minimum LSN
+    pub sqlserver_cdc_upstream_min_lsn: LabelGuardedIntGaugeVec,
+    /// SQL Server CDC upstream maximum LSN
+    pub sqlserver_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
 }
 
 pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
@@ -34,14 +92,98 @@ pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
 
 impl EnumeratorMetrics {
     fn new(registry: &Registry) -> Self {
-        let high_watermark = register_int_gauge_vec_with_registry!(
+        let high_watermark = register_guarded_int_gauge_vec_with_registry!(
             "source_kafka_high_watermark",
             "High watermark for a exec per partition",
             &["source_id", "partition"],
             registry,
         )
         .unwrap();
-        EnumeratorMetrics { high_watermark }
+
+        let kafka_consumer_group_delete_failure_count = register_int_counter_vec_with_registry!(
+            "source_kafka_consumer_group_delete_failure_count",
+            "Total number of Kafka consumer group delete attempts that failed during source enumerator cleanup",
+            &["source_id", "consumer_group"],
+            registry,
+        )
+        .unwrap();
+
+        let pg_cdc_confirmed_flush_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "pg_cdc_confirmed_flush_lsn",
+            "PostgreSQL CDC confirmed flush LSN",
+            &["source_id", "slot_name"],
+            registry,
+        )
+        .unwrap();
+
+        let pg_cdc_upstream_max_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "pg_cdc_upstream_max_lsn",
+            "PostgreSQL CDC upstream max LSN (pg_current_wal_lsn)",
+            &["source_id", "slot_name"],
+            registry,
+        )
+        .unwrap();
+
+        let mysql_cdc_binlog_file_seq_min = register_guarded_int_gauge_vec_with_registry!(
+            "mysql_cdc_binlog_file_seq_min",
+            "MySQL CDC upstream binlog file sequence number (minimum/oldest)",
+            &["source_id", "hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let mysql_cdc_binlog_file_seq_max = register_guarded_int_gauge_vec_with_registry!(
+            "mysql_cdc_binlog_file_seq_max",
+            "MySQL CDC upstream binlog file sequence number (maximum/newest)",
+            &["source_id", "hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let mariadb_cdc_binlog_file_seq_min = register_guarded_int_gauge_vec_with_registry!(
+            "mariadb_cdc_binlog_file_seq_min",
+            "MariaDB CDC upstream binlog file sequence number (minimum/oldest)",
+            &["source_id", "hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let mariadb_cdc_binlog_file_seq_max = register_guarded_int_gauge_vec_with_registry!(
+            "mariadb_cdc_binlog_file_seq_max",
+            "MariaDB CDC upstream binlog file sequence number (maximum/newest)",
+            &["source_id", "hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let sqlserver_cdc_upstream_min_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "sqlserver_cdc_upstream_min_lsn",
+            "SQL Server CDC upstream minimum LSN",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let sqlserver_cdc_upstream_max_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "sqlserver_cdc_upstream_max_lsn",
+            "SQL Server CDC upstream maximum LSN",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        EnumeratorMetrics {
+            high_watermark,
+            kafka_consumer_group_delete_failure_count,
+            pg_cdc_confirmed_flush_lsn,
+            pg_cdc_upstream_max_lsn,
+            mysql_cdc_binlog_file_seq_min,
+            mysql_cdc_binlog_file_seq_max,
+            mariadb_cdc_binlog_file_seq_min,
+            mariadb_cdc_binlog_file_seq_max,
+            sqlserver_cdc_upstream_min_lsn,
+            sqlserver_cdc_upstream_max_lsn,
+        }
     }
 
     pub fn unused() -> Self {
@@ -57,26 +199,60 @@ impl Default for EnumeratorMetrics {
 
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
-    pub partition_input_count: GenericCounterVec<AtomicU64>,
+    pub partition_input_count: RelabeledGuardedIntCounterVec,
 
     // **Note**: for normal messages, the metric is the message's payload size.
     // For messages from load generator, the metric is the size of stream chunk.
-    pub partition_input_bytes: GenericCounterVec<AtomicU64>,
+    pub partition_input_bytes: RelabeledGuardedIntCounterVec,
     /// Report latest message id
-    pub latest_message_id: GenericGaugeVec<AtomicI64>,
+    pub latest_message_id: RelabeledAggregatedIntGaugeVec,
+    pub partition_eof_count: LabelGuardedIntCounterVec,
+    pub partition_eof_offset: LabelGuardedIntGaugeVec,
     pub rdkafka_native_metric: Arc<RdKafkaStats>,
 
-    pub connector_source_rows_received: GenericCounterVec<AtomicU64>,
+    pub direct_cdc_event_lag_latency: LabelGuardedHistogramVec,
 
-    pub direct_cdc_event_lag_latency: HistogramVec,
+    pub parquet_source_skip_row_count: RelabeledGuardedIntCounterVec,
+    pub file_source_input_row_count: RelabeledGuardedIntCounterVec,
+    pub file_source_dirty_split_count: RelabeledAggregatedIntGaugeVec,
+    pub file_source_failed_split_count: RelabeledGuardedIntCounterVec,
+
+    // kinesis source
+    pub kinesis_throughput_exceeded_count: LabelGuardedIntCounterVec,
+    pub kinesis_timeout_count: LabelGuardedIntCounterVec,
+    pub kinesis_rebuild_shard_iter_count: LabelGuardedIntCounterVec,
+    pub kinesis_early_terminate_shard_count: LabelGuardedIntCounterVec,
+    pub kinesis_lag_latency_ms: LabelGuardedHistogramVec,
+
+    /// Total connector ack failures after checkpoint commit by bounded failure category.
+    connector_ack_failure_count: IntCounterVec,
+    /// Total successful connector acks after checkpoint commit.
+    connector_ack_success_count: IntCounterVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
-    LazyLock::new(|| SourceMetrics::new(&GLOBAL_METRICS_REGISTRY));
+    LazyLock::new(|| SourceMetrics::new(&GLOBAL_METRICS_REGISTRY, connector_metrics_level()));
 
 impl SourceMetrics {
-    fn new(registry: &Registry) -> Self {
-        let partition_input_count = register_int_counter_vec_with_registry!(
+    pub fn inc_connector_ack_failure_count(
+        &self,
+        source_name: &str,
+        connector_type: &'static str,
+        failure_type: ConnectorAckFailureType,
+    ) {
+        self.connector_ack_failure_count
+            .with_label_values(&[source_name, connector_type, failure_type.as_str()])
+            .inc();
+    }
+
+    pub fn inc_connector_ack_success_count(&self, source_name: &str, connector_type: &'static str) {
+        self.connector_ack_success_count
+            .with_label_values(&[source_name, connector_type])
+            .inc();
+    }
+
+    fn new(registry: &Registry, metric_level: MetricLevel) -> Self {
+        let partition_input_count = register_guarded_int_counter_vec_with_registry!(
             "source_partition_input_count",
             "Total number of rows that have been input from specific partition",
             &[
@@ -88,8 +264,9 @@ impl SourceMetrics {
             ],
             registry
         )
-        .unwrap();
-        let partition_input_bytes = register_int_counter_vec_with_registry!(
+        .unwrap()
+        .relabel_debug_1(metric_level);
+        let partition_input_bytes = register_guarded_int_counter_vec_with_registry!(
             "source_partition_input_bytes",
             "Total bytes that have been input from specific partition",
             &[
@@ -101,19 +278,29 @@ impl SourceMetrics {
             ],
             registry
         )
-        .unwrap();
-        let latest_message_id = register_int_gauge_vec_with_registry!(
+        .unwrap()
+        .relabel_debug_1(metric_level);
+        // Preserve the frontend's max-by-source/partition query semantics when live and
+        // backfill readers share a worker and their actor labels are relabeled.
+        let latest_message_id = register_guarded_int_gauge_vec_with_registry!(
             "source_latest_message_id",
             "Latest message id for a exec per partition",
-            &["source_id", "actor_id", "partition"],
+            &["actor_id", "source_id", "partition"],
             registry,
         )
+        .unwrap()
+        .relabel_debug_1_with_aggregation(metric_level, GaugeAggregation::Max);
+        let partition_eof_count = register_guarded_int_counter_vec_with_registry!(
+            "source_partition_eof_count",
+            "Total number of EOF events received from specific partition",
+            &["source_id", "partition", "source_name", "fragment_id"],
+            registry
+        )
         .unwrap();
-
-        let connector_source_rows_received = register_int_counter_vec_with_registry!(
-            "source_rows_received",
-            "Number of rows received by source",
-            &["source_type", "source_id"],
+        let partition_eof_offset = register_guarded_int_gauge_vec_with_registry!(
+            "source_partition_eof_offset",
+            "Latest resolved EOF offset for specific partition",
+            &["source_id", "partition", "source_name", "fragment_id"],
             registry
         )
         .unwrap();
@@ -123,17 +310,122 @@ impl SourceMetrics {
             "source_cdc_lag_latency",
             exponential_buckets(1.0, 2.0, 21).unwrap(), // max 1048s
         );
+
+        let parquet_source_skip_row_count = register_guarded_int_counter_vec_with_registry!(
+            "parquet_source_skip_row_count",
+            "Total number of rows that have been set to null in parquet source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap()
+        .relabel_debug_1(metric_level);
+
         let direct_cdc_event_lag_latency =
-            register_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
+            register_guarded_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
 
         let rdkafka_native_metric = Arc::new(RdKafkaStats::new(registry.clone()));
+
+        let file_source_input_row_count = register_guarded_int_counter_vec_with_registry!(
+            "file_source_input_row_count",
+            "Total number of rows that have been read in file source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap()
+        .relabel_debug_1(metric_level);
+        let file_source_dirty_split_count = register_guarded_int_gauge_vec_with_registry!(
+            "file_source_dirty_split_count",
+            "Current number of dirty file splits in file source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap()
+        .relabel_debug_1_with_aggregation(metric_level, GaugeAggregation::Sum);
+        let file_source_failed_split_count = register_guarded_int_counter_vec_with_registry!(
+            "file_source_failed_split_count",
+            "Total number of file splits marked dirty in file source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap()
+        .relabel_debug_1(metric_level);
+
+        let kinesis_throughput_exceeded_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_throughput_exceeded_count",
+            "Total number of times throughput exceeded in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_timeout_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_timeout_count",
+            "Total number of times timeout in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_rebuild_shard_iter_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_rebuild_shard_iter_count",
+            "Total number of times rebuild shard iter in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_early_terminate_shard_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_early_terminate_shard_count",
+            "Total number of times early terminate shard in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_lag_latency_ms = register_guarded_histogram_vec_with_registry!(
+            "kinesis_lag_latency_ms",
+            "Lag latency in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let connector_ack_failure_count = register_int_counter_vec_with_registry!(
+            "source_connector_ack_failure_count",
+            "Total number of connector ack failures after checkpoint commit by bounded failure category",
+            &["source_name", "connector_type", "error_type"],
+            registry
+        )
+        .unwrap();
+        let connector_ack_success_count = register_int_counter_vec_with_registry!(
+            "source_connector_ack_success_count",
+            "Total number of successful connector acks after checkpoint commit",
+            &["source_name", "connector_type"],
+            registry
+        )
+        .unwrap();
+
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
             latest_message_id,
+            partition_eof_count,
+            partition_eof_offset,
             rdkafka_native_metric,
-            connector_source_rows_received,
             direct_cdc_event_lag_latency,
+            parquet_source_skip_row_count,
+            file_source_input_row_count,
+            file_source_dirty_split_count,
+            file_source_failed_split_count,
+
+            kinesis_throughput_exceeded_count,
+            kinesis_timeout_count,
+            kinesis_rebuild_shard_iter_count,
+            kinesis_early_terminate_shard_count,
+            kinesis_lag_latency_ms,
+
+            connector_ack_failure_count,
+            connector_ack_success_count,
         }
     }
 }
@@ -141,5 +433,92 @@ impl SourceMetrics {
 impl Default for SourceMetrics {
     fn default() -> Self {
         GLOBAL_SOURCE_METRICS.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_aggregation(
+        gauge_vec: &RelabeledAggregatedIntGaugeVec,
+        first_labels: &[&str],
+        second_labels: &[&str],
+        expected: i64,
+    ) {
+        let first = gauge_vec.with_guarded_label_values(first_labels);
+        let second = gauge_vec.with_guarded_label_values(second_labels);
+        first.set(5);
+        second.set(7);
+        assert_eq!(first.get(), expected);
+        assert_eq!(second.get(), expected);
+    }
+
+    #[test]
+    fn actor_relabeled_gauges_use_the_assigned_reducers() {
+        for level in [MetricLevel::Critical, MetricLevel::Info] {
+            let registry = Registry::new();
+            let metrics = SourceMetrics::new(&registry, level);
+
+            assert_aggregation(
+                &metrics.latest_message_id,
+                &["1", "source", "partition"],
+                &["2", "source", "partition"],
+                7,
+            );
+            assert_aggregation(
+                &metrics.file_source_dirty_split_count,
+                &["1", "source", "name", "fragment"],
+                &["2", "source", "name", "fragment"],
+                12,
+            );
+        }
+    }
+
+    #[test]
+    fn latest_message_id_max_is_independent_of_reader_placement() {
+        for level in [MetricLevel::Critical, MetricLevel::Info, MetricLevel::Debug] {
+            for same_worker in [true, false] {
+                let live_registry = Registry::new();
+                let backfill_registry = Registry::new();
+                let live_metrics = SourceMetrics::new(&live_registry, level);
+                let backfill_metrics = if same_worker {
+                    live_metrics.clone()
+                } else {
+                    SourceMetrics::new(&backfill_registry, level)
+                };
+                let live = live_metrics.latest_message_id.with_guarded_label_values(&[
+                    "1",
+                    "source",
+                    "partition",
+                ]);
+                let backfill = backfill_metrics
+                    .latest_message_id
+                    .with_guarded_label_values(&["2", "source", "partition"]);
+                live.set(1_000);
+                backfill.set(100);
+
+                // Match the frontend's max(source_latest_message_id) across workers.
+                let mut offsets: Vec<_> = [&live_registry, &backfill_registry]
+                    .into_iter()
+                    .flat_map(Registry::gather)
+                    .filter(|family| family.name() == "source_latest_message_id")
+                    .flat_map(|family| {
+                        family
+                            .get_metric()
+                            .iter()
+                            .map(|metric| metric.get_gauge().value() as i64)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert_eq!(offsets.iter().copied().max(), Some(1_000));
+                offsets.sort_unstable();
+                if same_worker && level != MetricLevel::Debug {
+                    assert_eq!(offsets, [1_000]);
+                } else {
+                    assert_eq!(offsets, [100, 1_000]);
+                }
+            }
+        }
     }
 }

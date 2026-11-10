@@ -1,0 +1,55 @@
+# Rerun Original validation
+query I
+SELECT count(*) FROM t;
+----
+10000
+
+query I
+SELECT sum(v1), sum(v2) FROM t;
+----
+50005000 100015000
+
+query I
+SELECT count(*) FROM m;
+----
+10000
+
+query I
+SELECT sum(v1), sum(v2) FROM m;
+----
+50005000 100015000
+
+# Legacy SST metadata written by the old cluster should be decoded by the new
+# SstableInfo filter fields.
+query II
+SELECT
+    CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END,
+    COUNT(*) FILTER (
+        WHERE filter_type != 3
+           OR filter_layout NOT IN (2, 3)
+    )::int
+FROM rw_catalog.rw_hummock_sstables
+WHERE bloom_filter_kind IN (1, 2);
+----
+1 0
+
+# Test updates and deletes
+
+statement ok
+SET RW_IMPLICIT_FLUSH=true;
+
+statement ok
+UPDATE t SET v2 = v2 + 1 WHERE v1 >= 1 AND v1 <= 5000;
+
+statement ok
+DELETE FROM t WHERE v1 > 5000;
+
+query I
+SELECT COUNT(*) FROM t;
+----
+5000
+
+query I
+SELECT SUM(v2) FROM t;
+----
+25015000

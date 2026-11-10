@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 
 use std::fmt::{Debug, Formatter};
 
+use await_tree::InstrumentAwait;
 use futures::StreamExt;
 use risingwave_common::array::DataChunk;
 use risingwave_expr::expr_context::capture_expr_context;
-use risingwave_pb::batch_plan::exchange_source::LocalExecutePlan::{self, Plan};
 use risingwave_pb::batch_plan::TaskOutputId;
+use risingwave_pb::batch_plan::exchange_source::LocalExecutePlan::{self, Plan};
 use risingwave_pb::task_service::{ExecuteRequest, GetDataResponse};
-use risingwave_rpc_client::error::RpcError;
 use risingwave_rpc_client::ComputeClient;
+use risingwave_rpc_client::error::RpcError;
 use tonic::Streaming;
 
 use crate::error::Result;
@@ -33,6 +34,8 @@ pub struct GrpcExchangeSource {
     stream: Streaming<GetDataResponse>,
 
     task_output_id: TaskOutputId,
+
+    take_data_span: await_tree::Span,
 }
 
 impl GrpcExchangeSource {
@@ -42,6 +45,13 @@ impl GrpcExchangeSource {
         local_execute_plan: Option<LocalExecutePlan>,
     ) -> Result<Self> {
         let task_id = task_output_id.get_task_id()?.clone();
+        let take_data_span = await_tree::span!(
+            "grpc_exchange_take_data (query {} stage {} task {} output {})",
+            task_id.query_id,
+            task_id.stage_id,
+            task_id.task_id,
+            task_output_id.output_id
+        );
         let stream = match local_execute_plan {
             // When in the local execution mode, `GrpcExchangeSource` would send out
             // `ExecuteRequest` and get the data chunks back in a single RPC.
@@ -50,7 +60,6 @@ impl GrpcExchangeSource {
                 let execute_request = ExecuteRequest {
                     task_id: Some(task_id),
                     plan: plan.plan,
-                    epoch: plan.epoch,
                     tracing_context: plan.tracing_context,
                     expr_context: Some(capture_expr_context()?),
                 };
@@ -61,6 +70,7 @@ impl GrpcExchangeSource {
         let source = Self {
             stream,
             task_output_id,
+            take_data_span,
         };
         Ok(source)
     }
@@ -76,18 +86,22 @@ impl Debug for GrpcExchangeSource {
 
 impl ExchangeSource for GrpcExchangeSource {
     async fn take_data(&mut self) -> Result<Option<DataChunk>> {
-        let res = match self.stream.next().await {
+        let res = match self
+            .stream
+            .next()
+            .instrument_await(self.take_data_span.clone())
+            .await
+        {
             None => {
                 return Ok(None);
             }
             Some(r) => r,
         };
         let task_data = res.map_err(RpcError::from_batch_status)?;
-        let data = DataChunk::from_protobuf(task_data.get_record_batch()?)?.compact();
+        let data = DataChunk::from_protobuf(task_data.get_record_batch()?)?.compact_vis();
         trace!(
             "Receiver taskOutput = {:?}, data = {:?}",
-            self.task_output_id,
-            data
+            self.task_output_id, data
         );
 
         Ok(Some(data))

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,14 @@
 
 mod backfill;
 mod background_ddl;
+mod batch_refresh;
+mod cross_db_retention;
+mod drop_streaming_job;
 mod event_log;
+mod locality_backfill;
 mod nexmark_recovery;
-mod pause_on_bootstrap;
+mod recovery_info;
+mod serving_mapping;
+mod serving_mapping_start_order;
+mod source_split;
+mod time_travel;

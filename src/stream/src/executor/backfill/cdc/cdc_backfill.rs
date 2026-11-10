@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,40 +12,260 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 
 use either::Either;
 use futures::stream;
 use futures::stream::select_with_strategy;
 use itertools::Itertools;
-use risingwave_common::array::DataChunk;
+use risingwave_common::array::{DataChunk, Op};
 use risingwave_common::bail;
-use risingwave_common::catalog::ColumnDesc;
+use risingwave_common::bitmap::BitmapBuilder;
+use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc};
 use risingwave_common::row::RowExt;
-use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_common::util::sort_util::OrderType;
 use risingwave_connector::parser::{
-    ByteStreamSourceParser, DebeziumParser, DebeziumProps, EncodingProperties, JsonProperties,
-    ProtocolProperties, SourceStreamChunkBuilder, SpecificParserConfig,
+    BigintUnsignedHandlingMode, ByteStreamSourceParser, DebeziumParser, DebeziumProps,
+    EncodingProperties, JsonProperties, ProtocolProperties, SourceStreamChunkBuilder,
+    SpecificParserConfig, TimeHandling, TimestampHandling, TimestamptzHandling,
 };
-use risingwave_connector::source::cdc::external::CdcOffset;
-use risingwave_connector::source::{SourceColumnDesc, SourceContext};
+use risingwave_connector::source::cdc::CdcScanOptions;
+use risingwave_connector::source::cdc::external::{
+    CdcOffset, CdcOffsetParseFunc, ExternalCdcTableType, ExternalTableReaderImpl,
+};
+use risingwave_connector::source::{SourceColumnDesc, SourceContext, SourceCtrlOpts};
 use rw_futures_util::pausable;
+use thiserror_ext::AsReport;
 
 use crate::executor::backfill::cdc::state::CdcBackfillState;
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
+use crate::executor::backfill::cdc::upstream_table::reader::{
+    build_reader_and_poll_upstream, create_table_reader_with_retry,
+};
 use crate::executor::backfill::cdc::upstream_table::snapshot::{
     SnapshotReadArgs, UpstreamTableRead, UpstreamTableReader,
 };
 use crate::executor::backfill::utils::{
-    get_cdc_chunk_last_offset, get_new_pos, mapping_chunk, mapping_message, mark_cdc_chunk,
+    cmp_pk_unsigned_aware, get_cdc_chunk_last_offset, get_new_pos, mapping_chunk, mapping_message,
+    mark_cdc_chunk,
 };
-use crate::executor::backfill::CdcScanOptions;
 use crate::executor::monitor::CdcBackfillMetrics;
 use crate::executor::prelude::*;
-use crate::task::CreateMviewProgress;
+use crate::executor::{Mutation, TableId};
+use crate::task::CreateMviewProgressReporter;
 
 /// `split_id`, `is_finished`, `row_count`, `cdc_offset` all occupy 1 column each.
 const METADATA_STATE_LEN: usize = 4;
+
+struct PkCompareInfo<'a> {
+    indices: &'a [usize],
+    order: &'a [OrderType],
+    needs_unsigned_i64_compare: &'a [bool],
+}
+
+fn can_poll_upstream_while_creating_reader(
+    current_pk_pos: Option<&OwnedRow>,
+    pk_comparisons_are_known: bool,
+) -> bool {
+    current_pk_pos.is_none() || pk_comparisons_are_known
+}
+
+/// Result of handling an upstream message while no snapshot is running.
+enum NoSnapshotUpstreamOutcome {
+    /// Forward the message downstream, if any, and keep going.
+    /// `None` means nothing to emit: a watermark, or a chunk with no visible rows to emit.
+    Continue(Option<Message>),
+    /// The actor is stopped: forward the barrier and exit the executor.
+    Stop(Barrier),
+}
+
+/// Snapshot cursor together with the PK comparisons needed to filter upstream changes
+/// against it.
+#[derive(Clone, Copy)]
+struct SnapshotCursor<'a> {
+    pk_pos: &'a OwnedRow,
+    pk_needs_unsigned_i64_compare: &'a [bool],
+}
+
+struct NoSnapshotUpstreamHandler<'a, S: StateStore> {
+    actor_ctx: &'a ActorContextRef,
+    metrics: &'a CdcBackfillMetrics,
+    table_id: TableId,
+    upstream_table_name: &'a str,
+    offset_parse_func: &'a mut CdcOffsetParseFunc,
+    output_indices: &'a [usize],
+    pk_indices: &'a [usize],
+    pk_order: &'a [OrderType],
+    /// `None` means the next snapshot starts from the beginning.
+    cursor: Option<SnapshotCursor<'a>>,
+    total_snapshot_row_count: u64,
+    state_impl: &'a mut CdcBackfillState<S>,
+    last_binlog_offset: &'a mut Option<CdcOffset>,
+    is_snapshot_paused: &'a mut bool,
+    rate_limit_rps: &'a mut Option<u32>,
+}
+
+impl<S: StateStore> NoSnapshotUpstreamHandler<'_, S> {
+    async fn handle_upstream(
+        &mut self,
+        msg: Message,
+    ) -> StreamExecutorResult<NoSnapshotUpstreamOutcome> {
+        match msg {
+            Message::Barrier(barrier) => {
+                if let Some(mutation) = barrier.mutation.as_deref() {
+                    match mutation {
+                        Mutation::Pause => {
+                            *self.is_snapshot_paused = true;
+                            tracing::info!(
+                                table_id = %self.table_id,
+                                upstream_table_name = self.upstream_table_name,
+                                "snapshot is paused by barrier"
+                            );
+                        }
+                        Mutation::Resume => {
+                            *self.is_snapshot_paused = false;
+                            tracing::info!(
+                                table_id = %self.table_id,
+                                upstream_table_name = self.upstream_table_name,
+                                "snapshot is resumed by barrier"
+                            );
+                        }
+                        Mutation::Throttle(_) => {
+                            if let Some(entry) =
+                                mutation.backfill_throttle_config(self.actor_ctx.fragment_id)
+                            {
+                                *self.rate_limit_rps = entry.rate_limit;
+                            }
+                        }
+                        mutation if mutation.is_stop(self.actor_ctx.id) => {
+                            tracing::info!(
+                                table_id = %self.table_id,
+                                upstream_table_name = self.upstream_table_name,
+                                "CdcBackfill has been dropped due to config change"
+                            );
+                            self.state_impl.commit_state(barrier.epoch).await?;
+
+                            return Ok(NoSnapshotUpstreamOutcome::Stop(barrier));
+                        }
+                        _ => (),
+                    }
+                }
+
+                // Commit after all preceding upstream chunks have been emitted.
+                self.state_impl
+                    .mutate_and_commit_state(
+                        self.cursor.map(|cursor| cursor.pk_pos.clone()),
+                        self.last_binlog_offset.clone(),
+                        self.total_snapshot_row_count,
+                        false,
+                        barrier.epoch,
+                    )
+                    .await?;
+
+                Ok(NoSnapshotUpstreamOutcome::Continue(Some(Message::Barrier(
+                    barrier,
+                ))))
+            }
+            Message::Chunk(chunk) => {
+                let Some(cursor) = self.cursor else {
+                    // The next snapshot starts from the beginning and covers these changes.
+                    return Ok(NoSnapshotUpstreamOutcome::Continue(None));
+                };
+
+                if !chunk.has_visible_rows() {
+                    return Ok(NoSnapshotUpstreamOutcome::Continue(None));
+                }
+
+                let (chunk, consumed_offset) = CdcBackfillExecutor::<S>::filter_recovery_chunk(
+                    self.offset_parse_func,
+                    chunk,
+                    cursor.pk_pos,
+                    PkCompareInfo {
+                        indices: self.pk_indices,
+                        order: self.pk_order,
+                        needs_unsigned_i64_compare: cursor.pk_needs_unsigned_i64_compare,
+                    },
+                    self.last_binlog_offset,
+                    self.output_indices,
+                )?;
+
+                if let Some(consumed_offset) = consumed_offset {
+                    *self.last_binlog_offset = Some(consumed_offset);
+                }
+
+                let chunk = chunk.map(|chunk| {
+                    CdcBackfillExecutor::<S>::report_metrics(
+                        self.metrics,
+                        0,
+                        chunk.cardinality() as u64,
+                    );
+
+                    Message::Chunk(chunk)
+                });
+
+                Ok(NoSnapshotUpstreamOutcome::Continue(chunk))
+            }
+            Message::Watermark(_) => Ok(NoSnapshotUpstreamOutcome::Continue(None)),
+        }
+    }
+
+    async fn wait_for_reader(
+        &mut self,
+        upstream: &mut (impl Stream<Item = StreamExecutorResult<Message>> + Unpin),
+        future: &mut Pin<Box<impl Future<Output = ExternalTableReaderImpl>>>,
+    ) -> StreamExecutorResult<Either<NoSnapshotUpstreamOutcome, ExternalTableReaderImpl>> {
+        match build_reader_and_poll_upstream(upstream, future).await? {
+            Either::Left(msg) => Ok(Either::Left(self.handle_upstream(msg).await?)),
+            Either::Right(table_reader) => Ok(Either::Right(table_reader)),
+        }
+    }
+}
+
+// The TimestampHandling/TimestamptzHandling/TimeHandling parser's behavior depends on the debezium.time.precision.mode setting:
+// - If left unset, Debezium defaults to time.precision.mode=microseconds (per debezium.properties), and the parser uses Micro.
+// - If set to "connect", Debezium uses time.precision.mode=connect, and the parser uses Milli by design.
+// - If set to any other value, Debezium applies that specific value, and the default parser is used to maintain backward compatibility.
+pub(crate) fn get_cdc_json_parse_handling_from_properties(
+    properties: &BTreeMap<String, String>,
+) -> (
+    Option<TimestampHandling>,
+    Option<TimestamptzHandling>,
+    Option<TimeHandling>,
+    Option<BigintUnsignedHandlingMode>,
+) {
+    let (timestamp_handling, timestamptz_handling, time_handling) = match properties
+        .get("debezium.time.precision.mode")
+    {
+        None => (
+            Some(TimestampHandling::Micro),
+            Some(TimestamptzHandling::Micro),
+            Some(TimeHandling::Micro),
+        ),
+        Some(m) if m == "connect" => (
+            Some(TimestampHandling::Milli),
+            Some(TimestamptzHandling::Milli),
+            Some(TimeHandling::Milli),
+        ),
+        Some(other) => {
+            // backward compatibility.
+            tracing::warn!(
+                "Unsupported debezium.time.precision.mode = {other}, fall back to default parser."
+            );
+            (None, None, None)
+        }
+    };
+    let bigint_unsigned_handling = properties
+        .get("debezium.bigint.unsigned.handling.mode")
+        .is_some_and(|v| v == "precise")
+        .then_some(BigintUnsignedHandlingMode::Precise);
+    (
+        timestamp_handling,
+        timestamptz_handling,
+        time_handling,
+        bigint_unsigned_handling,
+    )
+}
 
 pub struct CdcBackfillExecutor<S: StateStore> {
     actor_ctx: ActorContextRef,
@@ -67,7 +287,7 @@ pub struct CdcBackfillExecutor<S: StateStore> {
 
     // TODO: introduce a CdcBackfillProgress to report finish to Meta
     // This object is just a stub right now
-    progress: Option<CreateMviewProgress>,
+    progress: Option<CreateMviewProgressReporter>,
 
     metrics: CdcBackfillMetrics,
 
@@ -75,24 +295,27 @@ pub struct CdcBackfillExecutor<S: StateStore> {
     rate_limit_rps: Option<u32>,
 
     options: CdcScanOptions,
+
+    properties: BTreeMap<String, String>,
 }
 
 impl<S: StateStore> CdcBackfillExecutor<S> {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         actor_ctx: ActorContextRef,
         external_table: ExternalStorageTable,
         upstream: Executor,
         output_indices: Vec<usize>,
         output_columns: Vec<ColumnDesc>,
-        progress: Option<CreateMviewProgress>,
+        progress: Option<CreateMviewProgressReporter>,
         metrics: Arc<StreamingMetrics>,
         state_table: StateTable<S>,
         rate_limit_rps: Option<u32>,
         options: CdcScanOptions,
+        properties: BTreeMap<String, String>,
     ) -> Self {
         let pk_indices = external_table.pk_indices();
-        let upstream_table_id = external_table.table_id().table_id;
+        let upstream_table_id = external_table.table_id();
         let state_impl = CdcBackfillState::new(
             upstream_table_id,
             state_table,
@@ -100,7 +323,6 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         );
 
         let metrics = metrics.new_cdc_backfill_metrics(external_table.table_id(), actor_ctx.id);
-
         Self {
             actor_ctx,
             external_table,
@@ -112,6 +334,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             metrics,
             rate_limit_rps,
             options,
+            properties,
         }
     }
 
@@ -129,17 +352,155 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             .inc_by(upstream_processed_row_count);
     }
 
+    /// Partitions buffered CDC rows into emitted and retained chunk views.
+    ///
+    /// Rows in the active binlog range with `PK <= current_pk_pos` are visible in
+    /// the emitted chunks. Rows with `PK > current_pk_pos` are visible in the
+    /// retained buffer.
+    fn consume_upstream_chunk_buffer(
+        offset_parse_func: &CdcOffsetParseFunc,
+        upstream_chunk_buffer: &mut Vec<StreamChunk>,
+        current_pk_pos: Option<&OwnedRow>,
+        pk_compare: PkCompareInfo<'_>,
+        last_binlog_offset: &Option<CdcOffset>,
+        output_indices: &[usize],
+    ) -> StreamExecutorResult<(Vec<StreamChunk>, u64, Option<CdcOffset>)> {
+        let Some(current_pos) = current_pk_pos else {
+            return Ok((vec![], 0, None));
+        };
+
+        let buffered_chunks = std::mem::take(upstream_chunk_buffer);
+        let mut emitted_chunks = Vec::with_capacity(buffered_chunks.len());
+        let mut upstream_processed_row_count = 0;
+        let mut consumed_binlog_offset = None;
+        let mut retained_chunks = Vec::with_capacity(buffered_chunks.len());
+        let mut can_advance_consumed_offset = true;
+
+        for chunk in buffered_chunks {
+            let mut emitted_vis = BitmapBuilder::zeroed(chunk.capacity());
+            let mut retained_vis = BitmapBuilder::zeroed(chunk.capacity());
+            for idx in 0..chunk.capacity() {
+                let (op, row, visible) = chunk.row_at(idx);
+                if !visible {
+                    // Buffered chunks may carry sparse visibility from previous filtering rounds.
+                    continue;
+                }
+                let event_offset = (*offset_parse_func)(
+                    row.iter()
+                        .last()
+                        .flatten()
+                        .expect("cdc offset must exist")
+                        .into_utf8(),
+                )?;
+                let in_binlog_range = last_binlog_offset
+                    .as_ref()
+                    .is_none_or(|binlog_low| *binlog_low <= event_offset);
+
+                let row_pk = row.project(pk_compare.indices);
+                let reached_current_pos = cmp_pk_unsigned_aware(
+                    row_pk.iter(),
+                    current_pos.iter(),
+                    pk_compare.order,
+                    pk_compare.needs_unsigned_i64_compare,
+                )
+                .is_le();
+                if !in_binlog_range {
+                    continue;
+                }
+                let should_emit = reached_current_pos;
+
+                match op {
+                    Op::Insert | Op::Delete => {
+                        if should_emit {
+                            emitted_vis.set(idx, true);
+                            if can_advance_consumed_offset {
+                                consumed_binlog_offset = Some(event_offset);
+                            }
+                            upstream_processed_row_count += 1;
+                        } else {
+                            retained_vis.set(idx, true);
+                            can_advance_consumed_offset = false;
+                        }
+                    }
+                    Op::UpdateDelete | Op::UpdateInsert => {
+                        unreachable!("CDC buffered chunks should not contain update pairs")
+                    }
+                }
+            }
+
+            let emitted_vis = emitted_vis.finish();
+            if emitted_vis.count_ones() > 0 {
+                emitted_chunks.push(mapping_chunk(
+                    chunk.clone_with_vis(emitted_vis),
+                    output_indices,
+                ));
+            }
+
+            let retained_vis = retained_vis.finish();
+            if retained_vis.count_ones() > 0 {
+                retained_chunks.push(chunk.clone_with_vis(retained_vis));
+            }
+        }
+
+        *upstream_chunk_buffer = retained_chunks;
+
+        Ok((
+            emitted_chunks,
+            upstream_processed_row_count,
+            consumed_binlog_offset,
+        ))
+    }
+
+    /// Returned chunk has rows safe to send downstream marked as visible, unsafe rows marked invisible.
+    ///
+    /// Rows are safe to send downstream if in binlog range and `PK <= current_pk_pos`.
+    fn filter_recovery_chunk(
+        offset_parse_func: &CdcOffsetParseFunc,
+        chunk: StreamChunk,
+        current_pos: &OwnedRow,
+        pk_compare: PkCompareInfo<'_>,
+        last_binlog_offset: &Option<CdcOffset>,
+        output_indices: &[usize],
+    ) -> StreamExecutorResult<(Option<StreamChunk>, Option<CdcOffset>)> {
+        let chunk_offset = get_cdc_chunk_last_offset(offset_parse_func, &chunk)?;
+        let chunk = mapping_chunk(
+            mark_cdc_chunk(
+                offset_parse_func,
+                chunk,
+                current_pos,
+                pk_compare.indices,
+                pk_compare.order,
+                pk_compare.needs_unsigned_i64_compare,
+                last_binlog_offset.clone(),
+            )?,
+            output_indices,
+        );
+        let chunk = (chunk.cardinality() > 0).then_some(chunk);
+        let consumed_offset = chunk_offset.filter(|chunk_offset| {
+            last_binlog_offset
+                .as_ref()
+                .is_none_or(|last| *last < *chunk_offset)
+        });
+        Ok((chunk, consumed_offset))
+    }
+
     #[try_stream(ok = Message, error = StreamExecutorError)]
     async fn execute_inner(mut self) {
         // The indices to primary key columns
         let pk_indices = self.external_table.pk_indices().to_vec();
         let pk_order = self.external_table.pk_order_types().to_vec();
+        let pk_needs_unsigned_i64_compare =
+            self.external_table.pk_comparisons().map(|comparisons| {
+                comparisons
+                    .iter()
+                    .map(|comparison| *comparison == CdcKeyComparison::UnsignedInt64)
+                    .collect_vec()
+            });
 
-        let upstream_table_id = self.external_table.table_id().table_id;
+        let table_id = self.external_table.table_id();
         let upstream_table_name = self.external_table.qualified_table_name();
         let schema_table_name = self.external_table.schema_table_name().clone();
         let external_database_name = self.external_table.database_name().to_owned();
-        let upstream_table_reader = UpstreamTableReader::new(self.external_table);
 
         let additional_columns = self
             .output_columns
@@ -157,53 +518,42 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         // Poll the upstream to get the first barrier.
         let first_barrier = expect_first_barrier(&mut upstream).await?;
 
-        let mut paused = first_barrier.is_pause_on_startup();
+        let mut is_snapshot_paused = first_barrier.is_pause_on_startup();
+        let first_barrier_epoch = first_barrier.epoch;
+        // The first barrier message should be propagated.
+        yield Message::Barrier(first_barrier);
 
-        // Check whether this parallelism has been assigned splits,
-        // if not, we should bypass the backfill directly.
         let mut state_impl = self.state_impl;
 
-        let mut upstream = transform_upstream(upstream, &self.output_columns)
-            .boxed()
-            .peekable();
-
-        state_impl.init_epoch(first_barrier.epoch);
+        state_impl.init_epoch(first_barrier_epoch).await?;
 
         // restore backfill state
         let state = state_impl.restore_state().await?;
         current_pk_pos = state.current_pk_pos.clone();
 
-        let to_backfill = !self.options.disable_backfill && !state.is_finished;
-
-        // The first barrier message should be propagated.
-        yield Message::Barrier(first_barrier);
+        let need_backfill = !self.options.disable_backfill && !state.is_finished;
 
         // Keep track of rows from the snapshot.
         let mut total_snapshot_row_count = state.row_count as u64;
 
-        let mut last_binlog_offset: Option<CdcOffset> = state
-            .last_cdc_offset
-            .map_or(upstream_table_reader.current_cdc_offset().await?, Some);
-
-        let offset_parse_func = upstream_table_reader
-            .inner()
-            .table_reader()
-            .get_cdc_offset_parser();
-        let mut consumed_binlog_offset: Option<CdcOffset> = None;
-
-        tracing::info!(
-            upstream_table_id,
-            upstream_table_name,
-            initial_binlog_offset = ?last_binlog_offset,
-            ?current_pk_pos,
-            is_finished = state.is_finished,
-            snapshot_row_count = total_snapshot_row_count,
-            rate_limit = self.rate_limit_rps,
-            disable_backfill = self.options.disable_backfill,
-            snapshot_interval = self.options.snapshot_interval,
-            snapshot_batch_size = self.options.snapshot_batch_size,
-            "start cdc backfill",
-        );
+        let (timestamp_handling, timestamptz_handling, time_handling, bigint_unsigned_handling) =
+            get_cdc_json_parse_handling_from_properties(&self.properties);
+        // Only postgres-cdc connector may trigger TOAST.
+        let handle_toast_columns: bool =
+            self.external_table.table_type() == &ExternalCdcTableType::Postgres;
+        // Make sure to use mapping_message after transform_upstream.
+        let mut upstream = transform_upstream(
+            upstream,
+            self.output_columns.clone(),
+            timestamp_handling,
+            timestamptz_handling,
+            time_handling,
+            bigint_unsigned_handling,
+            handle_toast_columns,
+        )
+        .boxed()
+        .peekable();
+        let mut last_binlog_offset = state.last_cdc_offset.clone();
 
         // CDC Backfill Algorithm:
         //
@@ -215,7 +565,8 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         // When a new barrier comes from upstream:
         //  - read the current binlog offset as `binlog_high`
         //  - for each row of the upstream change log, forward it to downstream if it in the range
-        //    of [binlog_low, binlog_high] and its pk <= `current_pos`, otherwise ignore it
+        //    of [binlog_low, binlog_high] and its pk <= `current_pos`, otherwise keep buffering it
+        //    until `current_pos` catches up
         //  - reconstruct the whole backfill stream with upstream changelog and a new table snapshot
         //
         // When a chunk comes from snapshot, we forward it to the downstream and raise
@@ -224,40 +575,255 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         // finished.
         //
         // Once the backfill loop ends, we forward the upstream directly to the downstream.
-        if to_backfill {
+        if need_backfill {
+            // After init the state table and forward the initial barrier to downstream,
+            // we now try to create the table reader with retry.
+            //
+            // A fresh backfill can ignore CDC events here because its snapshot starts from the
+            // beginning. Recovery preserves events for the already-scanned prefix while reader
+            // creation is retried. Legacy MySQL graphs with Int64 PK columns must first recover
+            // comparison metadata from the reader so events use unsigned-aware ordering if needed.
+            let mut offset_parse_func = self.external_table.table_type().get_cdc_offset_parser()?;
+            let mut future = Box::pin(create_table_reader_with_retry(
+                self.external_table.clone(),
+                self.actor_ctx.id,
+                self.actor_ctx.fragment_id,
+            ));
+            let table_reader = if can_poll_upstream_while_creating_reader(
+                current_pk_pos.as_ref(),
+                pk_needs_unsigned_i64_compare.is_some(),
+            ) {
+                let mut handler = NoSnapshotUpstreamHandler {
+                    actor_ctx: &self.actor_ctx,
+                    metrics: &self.metrics,
+                    table_id,
+                    upstream_table_name: &upstream_table_name,
+                    offset_parse_func: &mut offset_parse_func,
+                    output_indices: &self.output_indices,
+                    pk_indices: &pk_indices,
+                    pk_order: &pk_order,
+                    cursor: current_pk_pos.as_ref().map(|pk_pos| SnapshotCursor {
+                        pk_pos,
+                        pk_needs_unsigned_i64_compare: pk_needs_unsigned_i64_compare
+                            .as_deref()
+                            .expect("checked by can_poll_upstream_while_creating_reader"),
+                    }),
+                    total_snapshot_row_count,
+                    state_impl: &mut state_impl,
+                    last_binlog_offset: &mut last_binlog_offset,
+                    is_snapshot_paused: &mut is_snapshot_paused,
+                    rate_limit_rps: &mut self.rate_limit_rps,
+                };
+                loop {
+                    match handler.wait_for_reader(&mut upstream, &mut future).await? {
+                        Either::Left(NoSnapshotUpstreamOutcome::Continue(msg)) => {
+                            if let Some(msg) = msg {
+                                yield msg;
+                            }
+                        }
+                        Either::Left(NoSnapshotUpstreamOutcome::Stop(barrier)) => {
+                            yield Message::Barrier(barrier);
+
+                            return Ok(());
+                        }
+                        Either::Right(table_reader) => break table_reader,
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    %table_id,
+                    upstream_table_name,
+                    "waiting for the CDC table reader to recover legacy MySQL primary-key comparison metadata; checkpoint progress is paused"
+                );
+                future.as_mut().await
+            };
+            let pk_names = self.external_table.pk_names();
+            let pk_needs_unsigned_i64_compare = match pk_needs_unsigned_i64_compare {
+                Some(comparisons) => comparisons,
+                None => {
+                    let comparisons = table_reader.pk_column_comparisons(&pk_names)?;
+                    assert_eq!(comparisons.len(), pk_indices.len());
+                    comparisons
+                        .into_iter()
+                        .map(|comparison| comparison == CdcKeyComparison::UnsignedInt64)
+                        .collect_vec()
+                }
+            };
+            tracing::info!(
+                %table_id,
+                upstream_table_name,
+                "table reader created successfully"
+            );
+
+            let mut upstream_table_reader =
+                UpstreamTableReader::new(self.external_table.clone(), table_reader);
+
+            if last_binlog_offset.is_none() {
+                // Limit concurrent CDC connections globally to 10 using a semaphore.
+                static CDC_CONN_SEMAPHORE: tokio::sync::Semaphore =
+                    tokio::sync::Semaphore::const_new(10);
+
+                let _permit = CDC_CONN_SEMAPHORE.acquire().await.unwrap();
+                last_binlog_offset = upstream_table_reader.current_cdc_offset().await?;
+            }
+
+            tracing::info!(
+                %table_id,
+                upstream_table_name,
+                initial_binlog_offset = ?last_binlog_offset,
+                ?current_pk_pos,
+                is_finished = state.is_finished,
+                is_snapshot_paused,
+                snapshot_row_count = total_snapshot_row_count,
+                rate_limit = self.rate_limit_rps,
+                disable_backfill = self.options.disable_backfill,
+                snapshot_barrier_interval = self.options.snapshot_barrier_interval,
+                snapshot_batch_size = self.options.snapshot_batch_size,
+                "start cdc backfill",
+            );
+
             // drive the upstream changelog first to ensure we can receive timely changelog event,
             // otherwise the upstream changelog may be blocked by the snapshot read stream
             let _ = Pin::new(&mut upstream).peek().await;
 
             // wait for a barrier to make sure the backfill starts after upstream source
+            let mut handler = NoSnapshotUpstreamHandler {
+                actor_ctx: &self.actor_ctx,
+                metrics: &self.metrics,
+                table_id,
+                upstream_table_name: &upstream_table_name,
+                offset_parse_func: &mut offset_parse_func,
+                output_indices: &self.output_indices,
+                pk_indices: &pk_indices,
+                pk_order: &pk_order,
+                cursor: current_pk_pos.as_ref().map(|pk_pos| SnapshotCursor {
+                    pk_pos,
+                    pk_needs_unsigned_i64_compare: &pk_needs_unsigned_i64_compare,
+                }),
+                total_snapshot_row_count,
+                state_impl: &mut state_impl,
+                last_binlog_offset: &mut last_binlog_offset,
+                is_snapshot_paused: &mut is_snapshot_paused,
+                rate_limit_rps: &mut self.rate_limit_rps,
+            };
             #[for_await]
             for msg in upstream.by_ref() {
                 match msg? {
-                    Message::Barrier(barrier) => {
-                        // commit state just to bump the epoch of state table
-                        state_impl.commit_state(barrier.epoch).await?;
-                        yield Message::Barrier(barrier);
-                        break;
+                    Message::Chunk(chunk) if handler.cursor.is_none() => {
+                        // Without a snapshot cursor, the snapshot covers these changes, but the
+                        // binlog offset still advances past them.
+                        if chunk.has_visible_rows()
+                            && let Some(chunk_offset) =
+                                get_cdc_chunk_last_offset(handler.offset_parse_func, &chunk)?
+                            && handler
+                                .last_binlog_offset
+                                .as_ref()
+                                .is_none_or(|last| *last < chunk_offset)
+                        {
+                            *handler.last_binlog_offset = Some(chunk_offset);
+                        }
                     }
-                    Message::Chunk(ref chunk) => {
-                        last_binlog_offset = get_cdc_chunk_last_offset(&offset_parse_func, chunk)?;
-                    }
-                    Message::Watermark(_) => {
-                        // Ignore watermark
-                    }
+                    msg => match handler.handle_upstream(msg).await? {
+                        NoSnapshotUpstreamOutcome::Continue(Some(msg)) => {
+                            let is_barrier = matches!(msg, Message::Barrier(_));
+
+                            yield msg;
+
+                            if is_barrier {
+                                break;
+                            }
+                        }
+                        NoSnapshotUpstreamOutcome::Continue(None) => {}
+                        NoSnapshotUpstreamOutcome::Stop(barrier) => {
+                            yield Message::Barrier(barrier);
+
+                            return Ok(());
+                        }
+                    },
                 }
             }
 
-            tracing::info!(upstream_table_id,
+            tracing::info!(%table_id,
                 upstream_table_name,
                 initial_binlog_offset = ?last_binlog_offset,
                 ?current_pk_pos,
+                is_snapshot_paused,
                 "start cdc backfill loop");
 
             // the buffer will be drained when a barrier comes
             let mut upstream_chunk_buffer: Vec<StreamChunk> = vec![];
+            let mut needs_reader_rebuild = false;
 
             'backfill_loop: loop {
+                if needs_reader_rebuild {
+                    needs_reader_rebuild = false;
+                    tracing::info!(
+                        %table_id,
+                        upstream_table_name,
+                        "rebuilding CDC table reader after snapshot read failure"
+                    );
+
+                    if let Err(error) = upstream_table_reader.disconnect().await {
+                        tracing::warn!(
+                            error = %error.as_report(),
+                            %table_id,
+                            upstream_table_name,
+                            "failed to disconnect CDC snapshot reader; continuing with rebuild"
+                        );
+                    }
+
+                    let mut future = Box::pin(create_table_reader_with_retry(
+                        self.external_table.clone(),
+                        self.actor_ctx.id,
+                        self.actor_ctx.fragment_id,
+                    ));
+
+                    let mut handler = NoSnapshotUpstreamHandler {
+                        actor_ctx: &self.actor_ctx,
+                        metrics: &self.metrics,
+                        table_id,
+                        upstream_table_name: &upstream_table_name,
+                        offset_parse_func: &mut offset_parse_func,
+                        output_indices: &self.output_indices,
+                        pk_indices: &pk_indices,
+                        pk_order: &pk_order,
+                        cursor: current_pk_pos.as_ref().map(|pk_pos| SnapshotCursor {
+                            pk_pos,
+                            pk_needs_unsigned_i64_compare: &pk_needs_unsigned_i64_compare,
+                        }),
+                        total_snapshot_row_count,
+                        state_impl: &mut state_impl,
+                        last_binlog_offset: &mut last_binlog_offset,
+                        is_snapshot_paused: &mut is_snapshot_paused,
+                        rate_limit_rps: &mut self.rate_limit_rps,
+                    };
+                    let table_reader = loop {
+                        match handler.wait_for_reader(&mut upstream, &mut future).await? {
+                            Either::Left(NoSnapshotUpstreamOutcome::Continue(msg)) => {
+                                if let Some(msg) = msg {
+                                    yield msg;
+                                }
+                            }
+                            Either::Left(NoSnapshotUpstreamOutcome::Stop(barrier)) => {
+                                yield Message::Barrier(barrier);
+
+                                return Ok(());
+                            }
+                            Either::Right(table_reader) => break table_reader,
+                        }
+                    };
+
+                    upstream_table_reader =
+                        UpstreamTableReader::new(self.external_table.clone(), table_reader);
+                    tracing::info!(
+                        %table_id,
+                        upstream_table_name,
+                        "CDC table reader rebuilt successfully"
+                    );
+                }
+
+                let mut should_bypass_snapshot_stream_patch =
+                    self.rate_limit_rps.is_some_and(|val| val == 0);
                 let left_upstream = upstream.by_ref().map(Either::Left);
 
                 let mut snapshot_read_row_cnt: usize = 0;
@@ -269,14 +835,14 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                     schema_table_name.clone(),
                     external_database_name.clone(),
                 );
-
-                let right_snapshot = pin!(upstream_table_reader
-                    .snapshot_read_full_table(read_args, self.options.snapshot_batch_size)
-                    .map(Either::Right));
-
-                let (right_snapshot, valve) = pausable(right_snapshot);
-                if paused {
-                    valve.pause();
+                let right_snapshot = pin!(
+                    upstream_table_reader
+                        .snapshot_read_full_table(read_args, self.options.snapshot_batch_size)
+                        .map(Either::Right)
+                );
+                let (right_snapshot, snapshot_valve) = pausable(right_snapshot);
+                if is_snapshot_paused {
+                    snapshot_valve.pause();
                 }
 
                 // Prefer to select upstream, so we can stop snapshot stream when barrier comes.
@@ -299,47 +865,57 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                 Message::Barrier(barrier) => {
                                     // increase the barrier count and check whether need to start a new snapshot
                                     barrier_count += 1;
-                                    let can_start_new_snapshot =
-                                        barrier_count == self.options.snapshot_interval;
+                                    let mut needs_rebuild_snapshot =
+                                        barrier_count == self.options.snapshot_barrier_interval;
 
                                     if let Some(mutation) = barrier.mutation.as_deref() {
-                                        use crate::executor::Mutation;
                                         match mutation {
                                             Mutation::Pause => {
-                                                paused = true;
-                                                valve.pause();
+                                                is_snapshot_paused = true;
+                                                snapshot_valve.pause();
                                             }
                                             Mutation::Resume => {
-                                                paused = false;
-                                                valve.resume();
+                                                is_snapshot_paused = false;
+                                                snapshot_valve.resume();
                                             }
-                                            Mutation::Throttle(some) => {
-                                                if let Some(new_rate_limit) =
-                                                    some.get(&self.actor_ctx.id)
-                                                    && *new_rate_limit != self.rate_limit_rps
+                                            Mutation::Throttle(_) => {
+                                                if let Some(entry) = mutation
+                                                    .backfill_throttle_config(
+                                                        self.actor_ctx.fragment_id,
+                                                    )
+                                                    && entry.rate_limit != self.rate_limit_rps
                                                 {
-                                                    self.rate_limit_rps = *new_rate_limit;
-                                                    // rebuild the new reader stream with new rate limit
-                                                    continue 'backfill_loop;
+                                                    // If self.rate_limit_rps is 0, the snapshot stream does not establish a snapshot_read.
+                                                    // Consequently, the later snapshot stream patch is bypassed.
+                                                    should_bypass_snapshot_stream_patch = self
+                                                        .rate_limit_rps
+                                                        .is_some_and(|val| val == 0);
+                                                    self.rate_limit_rps = entry.rate_limit;
+                                                    needs_rebuild_snapshot = true;
                                                 }
+                                            }
+                                            mutation if mutation.is_stop(self.actor_ctx.id) => {
+                                                // the actor has been dropped, exit the backfill loop
+                                                tracing::info!(
+                                                    %table_id,
+                                                    upstream_table_name,
+                                                    "CdcBackfill has been dropped due to config change"
+                                                );
+                                                state_impl.commit_state(barrier.epoch).await?;
+                                                yield Message::Barrier(barrier);
+                                                break 'backfill_loop;
                                             }
                                             _ => (),
                                         }
                                     }
 
-                                    Self::report_metrics(
-                                        &self.metrics,
-                                        cur_barrier_snapshot_processed_rows,
-                                        cur_barrier_upstream_processed_rows,
-                                    );
-
                                     // when processing a barrier, check whether can start a new snapshot
                                     // if the number of barriers reaches the snapshot interval
-                                    if can_start_new_snapshot {
+                                    if needs_rebuild_snapshot || needs_reader_rebuild {
                                         // staging the barrier
                                         pending_barrier = Some(barrier);
                                         tracing::debug!(
-                                            upstream_table_id,
+                                            %table_id,
                                             ?current_pk_pos,
                                             ?snapshot_read_row_cnt,
                                             "Prepare to start a new snapshot"
@@ -347,17 +923,50 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                         // Break the loop for consuming snapshot and prepare to start a new snapshot
                                         break;
                                     } else {
+                                        // Drain the in-memory buffer to ensure no data is lost during the recovery process.
+                                        let (
+                                            emitted_upstream_chunks,
+                                            consumed_upstream_row_count,
+                                            consumed_binlog_offset,
+                                        ) = Self::consume_upstream_chunk_buffer(
+                                            &offset_parse_func,
+                                            &mut upstream_chunk_buffer,
+                                            current_pk_pos.as_ref(),
+                                            PkCompareInfo {
+                                                indices: &pk_indices,
+                                                order: &pk_order,
+                                                needs_unsigned_i64_compare:
+                                                    &pk_needs_unsigned_i64_compare,
+                                            },
+                                            &last_binlog_offset,
+                                            &self.output_indices,
+                                        )?;
+                                        cur_barrier_upstream_processed_rows +=
+                                            consumed_upstream_row_count;
+                                        if let Some(consumed_binlog_offset) = consumed_binlog_offset
+                                        {
+                                            last_binlog_offset = Some(consumed_binlog_offset);
+                                        }
+                                        for chunk in emitted_upstream_chunks {
+                                            yield Message::Chunk(chunk);
+                                        }
+
+                                        Self::report_metrics(
+                                            &self.metrics,
+                                            cur_barrier_snapshot_processed_rows,
+                                            cur_barrier_upstream_processed_rows,
+                                        );
+
                                         // update and persist current backfill progress
                                         state_impl
-                                            .mutate_state(
+                                            .mutate_and_commit_state(
                                                 current_pk_pos.clone(),
                                                 last_binlog_offset.clone(),
                                                 total_snapshot_row_count,
                                                 false,
+                                                barrier.epoch,
                                             )
                                             .await?;
-
-                                        state_impl.commit_state(barrier.epoch).await?;
 
                                         // emit barrier and continue consume the backfill stream
                                         yield Message::Barrier(barrier);
@@ -381,20 +990,20 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                     // Since we don't need changelog before the
                                     // `last_binlog_offset`, skip the chunk that *only* contains
                                     // events before `last_binlog_offset`.
-                                    if let Some(last_binlog_offset) = last_binlog_offset.as_ref() {
-                                        if let Some(chunk_offset) = chunk_binlog_offset
-                                            && chunk_offset < *last_binlog_offset
-                                        {
-                                            tracing::trace!(
-                                                "skip changelog chunk: chunk_offset {:?}, capacity {}",
-                                                chunk_offset,
-                                                chunk.capacity()
-                                            );
-                                            continue;
-                                        }
+                                    if let (Some(last_binlog_offset), Some(chunk_offset)) =
+                                        (last_binlog_offset.as_ref(), chunk_binlog_offset)
+                                        && chunk_offset < *last_binlog_offset
+                                    {
+                                        tracing::trace!(
+                                            "skip changelog chunk: chunk_offset {:?}, capacity {}",
+                                            chunk_offset,
+                                            chunk.capacity()
+                                        );
+                                        continue;
                                     }
+
                                     // Buffer the upstream chunk.
-                                    upstream_chunk_buffer.push(chunk.compact());
+                                    upstream_chunk_buffer.push(chunk.compact_vis());
                                 }
                                 Message::Watermark(_) => {
                                     // Ignore watermark during backfill.
@@ -403,10 +1012,10 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                         }
                         // Snapshot read
                         Either::Right(msg) => {
-                            match msg? {
-                                None => {
+                            match msg {
+                                Ok(None) => {
                                     tracing::info!(
-                                        upstream_table_id,
+                                        %table_id,
                                         ?last_binlog_offset,
                                         ?current_pk_pos,
                                         "snapshot read stream ends"
@@ -425,7 +1034,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                     // backfill has finished, exit the backfill loop and persist the state when we recv a barrier
                                     break 'backfill_loop;
                                 }
-                                Some(chunk) => {
+                                Ok(Some(chunk)) => {
                                     // Raise the current position.
                                     // As snapshot read streams are ordered by pk, so we can
                                     // just use the last row to update `current_pos`.
@@ -444,6 +1053,15 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                         &self.output_indices,
                                     ));
                                 }
+                                Err(error) => {
+                                    needs_reader_rebuild = true;
+                                    tracing::warn!(
+                                        error = %error.as_report(),
+                                        %table_id,
+                                        upstream_table_name,
+                                        "failed to read CDC snapshot; rebuilding reader after a barrier"
+                                    );
+                                }
                             }
                         }
                     }
@@ -452,19 +1070,29 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 assert!(pending_barrier.is_some(), "pending_barrier must exist");
                 let pending_barrier = pending_barrier.unwrap();
 
+                // The snapshot stream patch:
                 // Here we have to ensure the snapshot stream is consumed at least once,
                 // since the barrier event can kick in anytime.
                 // Otherwise, the result set of the new snapshot stream may become empty.
                 // It maybe a cancellation bug of the mysql driver.
                 let (_, mut snapshot_stream) = backfill_stream.into_inner();
-                if let Some(msg) = snapshot_stream.next().await {
+                // Resume the snapshot stream so that the snapshot stream patch won't block.
+                if !should_bypass_snapshot_stream_patch && is_snapshot_paused {
+                    snapshot_valve.resume();
+                }
+                if !should_bypass_snapshot_stream_patch
+                    && let Some(msg) = snapshot_stream
+                        .next()
+                        .instrument_await("consume_snapshot_stream_once")
+                        .await
+                {
                     let Either::Right(msg) = msg else {
                         bail!("BUG: snapshot_read contains upstream messages");
                     };
-                    match msg? {
-                        None => {
+                    match msg {
+                        Ok(None) => {
                             tracing::info!(
-                                upstream_table_id,
+                                %table_id,
                                 ?last_binlog_offset,
                                 ?current_pk_pos,
                                 "snapshot read stream ends in the force emit branch"
@@ -477,21 +1105,23 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
 
                             // mark backfill has finished
                             state_impl
-                                .mutate_state(
+                                .mutate_and_commit_state(
                                     current_pk_pos.clone(),
                                     last_binlog_offset.clone(),
                                     total_snapshot_row_count,
                                     true,
+                                    pending_barrier.epoch,
                                 )
                                 .await?;
 
-                            // commit state because we have received a barrier message
-                            state_impl.commit_state(pending_barrier.epoch).await?;
                             yield Message::Barrier(pending_barrier);
                             // end of backfill loop, since backfill has finished
                             break 'backfill_loop;
                         }
-                        Some(chunk) => {
+                        Ok(Some(_)) if is_snapshot_paused => {
+                            // Since the snapshot stream is paused, drop the chunk.
+                        }
+                        Ok(Some(chunk)) => {
                             // Raise the current pk position.
                             current_pk_pos = Some(get_new_pos(&chunk, &pk_indices));
 
@@ -501,18 +1131,29 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                             snapshot_read_row_cnt += row_count as usize;
 
                             tracing::debug!(
-                                upstream_table_id,
+                                %table_id,
                                 ?current_pk_pos,
                                 ?snapshot_read_row_cnt,
                                 "force emit a snapshot chunk"
                             );
                             yield Message::Chunk(mapping_chunk(chunk, &self.output_indices));
                         }
+                        Err(error) => {
+                            needs_reader_rebuild = true;
+                            tracing::warn!(
+                                error = %error.as_report(),
+                                %table_id,
+                                upstream_table_name,
+                                "failed to read CDC snapshot; rebuilding reader after a barrier"
+                            );
+                        }
                     }
                 }
 
                 // If the number of barriers reaches the snapshot interval,
                 // consume the buffered upstream chunks.
+                let mut consumed_binlog_offset = None;
+
                 if let Some(current_pos) = &current_pk_pos {
                     for chunk in upstream_chunk_buffer.drain(..) {
                         cur_barrier_upstream_processed_rows += chunk.cardinality() as u64;
@@ -529,6 +1170,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                 current_pos,
                                 &pk_indices,
                                 &pk_order,
+                                &pk_needs_unsigned_i64_compare,
                                 last_binlog_offset.clone(),
                             )?,
                             &self.output_indices,
@@ -553,21 +1195,22 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
 
                 // update and persist current backfill progress
                 state_impl
-                    .mutate_state(
+                    .mutate_and_commit_state(
                         current_pk_pos.clone(),
                         last_binlog_offset.clone(),
                         total_snapshot_row_count,
                         false,
+                        pending_barrier.epoch,
                     )
                     .await?;
 
-                state_impl.commit_state(pending_barrier.epoch).await?;
                 yield Message::Barrier(pending_barrier);
             }
+            upstream_table_reader.disconnect().await?;
         } else if self.options.disable_backfill {
             // If backfill is disabled, we just mark the backfill as finished
             tracing::info!(
-                upstream_table_id,
+                %table_id,
                 upstream_table_name,
                 "CdcBackfill has been disabled"
             );
@@ -581,11 +1224,8 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 .await?;
         }
 
-        // drop reader to release db connection
-        drop(upstream_table_reader);
-
         tracing::info!(
-            upstream_table_id,
+            %table_id,
             upstream_table_name,
             "CdcBackfill has already finished and will forward messages directly to the downstream"
         );
@@ -597,20 +1237,19 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 // If not finished then we need to update state, otherwise no need.
                 if let Message::Barrier(barrier) = &msg {
                     // finalized the backfill state
-                    // TODO: unify `mutate_state` and `commit_state` into one method
                     state_impl
-                        .mutate_state(
+                        .mutate_and_commit_state(
                             current_pk_pos.clone(),
                             last_binlog_offset.clone(),
                             total_snapshot_row_count,
                             true,
+                            barrier.epoch,
                         )
                         .await?;
-                    state_impl.commit_state(barrier.epoch).await?;
 
                     // mark progress as finished
                     if let Some(progress) = self.progress.as_mut() {
-                        progress.finish(barrier.epoch.curr, total_snapshot_row_count);
+                        progress.finish(barrier.epoch, total_snapshot_row_count);
                     }
                     yield msg;
                     // break after the state have been saved
@@ -639,12 +1278,23 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
 }
 
 #[try_stream(ok = Message, error = StreamExecutorError)]
-pub async fn transform_upstream(upstream: BoxedMessageStream, output_columns: &[ColumnDesc]) {
+pub async fn transform_upstream(
+    upstream: BoxedMessageStream,
+    output_columns: Vec<ColumnDesc>,
+    timestamp_handling: Option<TimestampHandling>,
+    timestamptz_handling: Option<TimestamptzHandling>,
+    time_handling: Option<TimeHandling>,
+    bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
+    handle_toast_columns: bool,
+) {
     let props = SpecificParserConfig {
-        key_encoding_config: None,
         encoding_config: EncodingProperties::Json(JsonProperties {
             use_schema_registry: false,
-            timestamptz_handling: None,
+            timestamp_handling,
+            timestamptz_handling,
+            time_handling,
+            bigint_unsigned_handling,
+            handle_toast_columns,
         }),
         // the cdc message is generated internally so the key must exist.
         protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
@@ -655,7 +1305,6 @@ pub async fn transform_upstream(upstream: BoxedMessageStream, output_columns: &[
         .iter()
         .map(SourceColumnDesc::from)
         .collect_vec();
-
     let mut parser = DebeziumParser::new(
         props,
         columns_with_meta.clone(),
@@ -680,24 +1329,31 @@ async fn parse_debezium_chunk(
     parser: &mut DebeziumParser,
     chunk: &StreamChunk,
 ) -> StreamExecutorResult<StreamChunk> {
-    // here we transform the input chunk in (payload varchar, _rw_offset varchar, _rw_table_name varchar) schema
+    // here we transform the input chunk in `(payload varchar, _rw_offset varchar, _rw_table_name varchar)` schema
     // to chunk with downstream table schema `info.schema` of MergeNode contains the schema of the
     // table job with `_rw_offset` in the end
     // see `gen_create_table_plan_for_cdc_source` for details
-    let mut builder =
-        SourceStreamChunkBuilder::with_capacity(parser.columns().to_vec(), chunk.capacity());
 
-    // The schema of input chunk (payload varchar, _rw_offset varchar, _rw_table_name varchar, _row_id)
+    // use `SourceStreamChunkBuilder` for convenience
+    let mut builder = SourceStreamChunkBuilder::new(
+        parser.columns().to_vec(),
+        SourceCtrlOpts {
+            chunk_size: chunk.capacity(),
+            split_txn: false,
+        },
+    );
+
+    // The schema of input chunk `(payload varchar, _rw_offset varchar, _rw_table_name varchar, _row_id)`
     // We should use the debezium parser to parse the first column,
     // then chain the parsed row with `_rw_offset` row to get a new row.
-    let payloads = chunk.data_chunk().project(vec![0].as_slice());
-    let offset_columns = chunk.data_chunk().project(vec![1].as_slice());
+    let payloads = chunk.data_chunk().project(&[0]);
+    let offsets = chunk.data_chunk().project(&[1]).compact_vis();
 
     // TODO: preserve the transaction semantics
     for payload in payloads.rows() {
         let ScalarRefImpl::Jsonb(jsonb_ref) = payload.datum_at(0).expect("payload must exist")
         else {
-            unreachable!("payload must be jsonb");
+            panic!("payload must be jsonb");
         };
 
         parser
@@ -709,31 +1365,23 @@ async fn parse_debezium_chunk(
             .await
             .unwrap();
     }
+    builder.finish_current_chunk();
 
-    let parsed_chunk = builder.finish();
-    let (data_chunk, ops) = parsed_chunk.into_parts();
+    let parsed_chunk = {
+        let mut iter = builder.consume_ready_chunks();
+        assert_eq!(1, iter.len());
+        iter.next().unwrap()
+    };
+    assert_eq!(parsed_chunk.capacity(), chunk.capacity()); // each payload is expected to generate one row
+    let (ops, mut columns, vis) = parsed_chunk.into_inner();
+    // note that `vis` is not necessarily the same as the original chunk's visibilities
 
-    // concat the rows in the parsed chunk with the _rw_offset column, we should also retain the Op column
-    let mut new_rows = Vec::with_capacity(chunk.capacity());
-    let offset_columns = offset_columns.compact();
-    for (data_row, offset_row) in data_chunk
-        .rows_with_holes()
-        .zip_eq_fast(offset_columns.rows_with_holes())
-    {
-        let combined = data_row.chain(offset_row);
-        new_rows.push(combined);
-    }
-
-    let data_types = parser
-        .columns()
-        .iter()
-        .map(|col| col.data_type.clone())
-        .chain(std::iter::once(DataType::Varchar)) // _rw_offset column
-        .collect_vec();
+    // concat the rows in the parsed chunk with the `_rw_offset` column
+    columns.extend(offsets.into_parts().0);
 
     Ok(StreamChunk::from_parts(
         ops,
-        DataChunk::from_rows(new_rows.as_slice(), data_types.as_slice()),
+        DataChunk::from_parts(columns.into(), vis),
     ))
 }
 
@@ -745,16 +1393,42 @@ impl<S: StateStore> Execute for CdcBackfillExecutor<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::time::Duration;
 
-    use futures::{pin_mut, StreamExt};
-    use risingwave_common::array::{DataChunk, Op, StreamChunk};
-    use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
-    use risingwave_common::types::{DataType, Datum, JsonbVal};
+    use either::Either;
+    use futures::{StreamExt, pin_mut, stream};
+    use risingwave_common::array::{Array, DataChunk, Op, StreamChunk};
+    use risingwave_common::catalog::{
+        CdcKeyComparison, ColumnDesc, ColumnId, Field, Schema, TableId,
+    };
+    use risingwave_common::row::{OwnedRow, Row};
+    use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarImpl};
+    use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::iter_util::ZipEqFast;
+    use risingwave_common::util::sort_util::OrderType;
+    use risingwave_connector::source::cdc::CdcScanOptions;
+    use risingwave_connector::source::cdc::external::mock_external_table::MockExternalTableReader;
+    use risingwave_connector::source::cdc::external::mysql::MysqlOffset;
+    use risingwave_connector::source::cdc::external::{
+        CdcOffset, ExternalCdcTableType, ExternalTableConfig, ExternalTableReaderImpl,
+        SchemaTableName,
+    };
+    use risingwave_storage::memory::MemoryStateStore;
 
+    use super::{
+        PkCompareInfo, build_reader_and_poll_upstream, can_poll_upstream_while_creating_reader,
+    };
+    use crate::common::table::test_utils::gen_pbtable;
     use crate::executor::backfill::cdc::cdc_backfill::transform_upstream;
-    use crate::executor::test_utils::MockSource;
+    use crate::executor::backfill::cdc::state::CdcBackfillState;
+    use crate::executor::monitor::StreamingMetrics;
+    use crate::executor::prelude::StateTable;
+    use crate::executor::test_utils::{MessageSender, MockSource};
+    use crate::executor::{
+        ActorContext, Barrier, CdcBackfillExecutor, ExternalStorageTable, Message,
+    };
 
     #[tokio::test]
     async fn test_transform_upstream_chunk() {
@@ -763,19 +1437,17 @@ mod tests {
             Field::unnamed(DataType::Varchar), // _rw_offset
             Field::unnamed(DataType::Varchar), // _rw_table_name
         ]);
-        let pk_indices = vec![1];
+        let stream_key = vec![1];
         let (mut tx, source) = MockSource::channel();
-        let source = source.into_executor(schema.clone(), pk_indices.clone());
+        let source = source.into_executor(schema.clone(), stream_key.clone());
         // let payload = r#"{"before": null,"after":{"O_ORDERKEY": 5, "O_CUSTKEY": 44485, "O_ORDERSTATUS": "F", "O_TOTALPRICE": "144659.20", "O_ORDERDATE": "1994-07-30" },"source":{"version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002", "ts_ms": 1695277757000, "snapshot": "last", "db": "mydb", "sequence": null, "table": "orders_new", "server_id": 0, "gtid": null, "file": "binlog.000008", "pos": 3693, "row": 0, "thread": null, "query": null},"op":"r","ts_ms":1695277757017,"transaction":null}"#.to_string();
         let payload = r#"{ "payload": { "before": null, "after": { "O_ORDERKEY": 5, "O_CUSTKEY": 44485, "O_ORDERSTATUS": "F", "O_TOTALPRICE": "144659.20", "O_ORDERDATE": "1994-07-30" }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002", "ts_ms": 1695277757000, "snapshot": "last", "db": "mydb", "sequence": null, "table": "orders_new", "server_id": 0, "gtid": null, "file": "binlog.000008", "pos": 3693, "row": 0, "thread": null, "query": null }, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#;
 
         let datums: Vec<Datum> = vec![
             Some(JsonbVal::from_str(payload).unwrap().into()),
-            Some("file: 1.binlog, pos: 100".to_string().into()),
-            Some("mydb.orders".to_string().into()),
+            Some("file: 1.binlog, pos: 100".to_owned().into()),
+            Some("mydb.orders".to_owned().into()),
         ];
-
-        println!("datums: {:?}", datums[1]);
 
         let mut builders = schema.create_array_builders(8);
         for (builder, datum) in builders.iter_mut().zip_eq_fast(datums.iter()) {
@@ -802,11 +1474,1286 @@ mod tests {
             ColumnDesc::named("commit_ts", ColumnId::new(6), DataType::Timestamptz),
         ];
 
-        let parsed_stream = transform_upstream(upstream, &columns);
+        let parsed_stream = transform_upstream(upstream, columns, None, None, None, None, false);
         pin_mut!(parsed_stream);
-        // the output chunk must contain the offset column
-        if let Some(message) = parsed_stream.next().await {
-            println!("chunk: {:#?}", message.unwrap());
+        let message = parsed_stream
+            .next()
+            .await
+            .expect("transform stream should yield the input chunk")
+            .expect("transforming the CDC chunk should succeed");
+        let Message::Chunk(chunk) = message else {
+            panic!("expected a transformed chunk");
+        };
+        assert_eq!(
+            chunk
+                .rows()
+                .map(|(op, row)| (op, row.to_owned_row()))
+                .collect::<Vec<_>>(),
+            vec![(
+                Op::Insert,
+                OwnedRow::new(vec![
+                    Some(ScalarImpl::Int64(5)),
+                    Some(ScalarImpl::Int64(44485)),
+                    Some(ScalarImpl::Utf8("F".into())),
+                    Some(ScalarImpl::Decimal("144659.20".parse().unwrap())),
+                    Some(ScalarImpl::Date("1994-07-30".parse().unwrap())),
+                    None,
+                    Some(ScalarImpl::Utf8("file: 1.binlog, pos: 100".into())),
+                ]),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finished_backfill_forwards_without_reader() {
+        let actor_context = ActorContext::for_test(1);
+        let table_id = TableId::new(1234);
+        let external_storage_table = ExternalStorageTable::new(
+            table_id,
+            SchemaTableName {
+                schema_name: "public".to_owned(),
+                table_name: "missing_table".to_owned(),
+            },
+            "mydb".to_owned(),
+            ExternalTableConfig::default(),
+            ExternalCdcTableType::Unspecified,
+            Schema::new(vec![Field::with_name(DataType::Int64, "O_ORDERKEY")]),
+            vec![OrderType::ascending()],
+            Some(vec![CdcKeyComparison::Native]),
+            vec![0],
+        );
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Jsonb),   // debezium json payload
+            Field::unnamed(DataType::Varchar), // _rw_offset
+            Field::unnamed(DataType::Varchar), // _rw_table_name
+        ]);
+        let stream_key = vec![1];
+        let (mut tx, source) = MockSource::channel();
+        let source = source
+            .stop_on_finish(false)
+            .into_executor(schema.clone(), stream_key.clone());
+        let output_indices = vec![1, 0, 4]; //reorder
+        let output_columns = vec![
+            ColumnDesc::named("O_ORDERKEY", ColumnId::new(1), DataType::Int64),
+            ColumnDesc::named("O_CUSTKEY", ColumnId::new(2), DataType::Int64),
+            ColumnDesc::named("O_ORDERSTATUS", ColumnId::new(3), DataType::Varchar),
+            ColumnDesc::named("O_TOTALPRICE", ColumnId::new(4), DataType::Decimal),
+            ColumnDesc::named("O_DUMMY", ColumnId::new(5), DataType::Int64),
+            ColumnDesc::named("commit_ts", ColumnId::new(6), DataType::Timestamptz),
+        ];
+        let store = MemoryStateStore::new();
+        let mut persisted_state =
+            CdcBackfillState::new(table_id, create_cdc_state_table(store.clone()).await, 5);
+        persisted_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(6)).epoch)
+            .await
+            .unwrap();
+        persisted_state
+            .mutate_and_commit_state(
+                Some(OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                Some(CdcOffset::Mysql(MysqlOffset::new(
+                    "1.binlog".to_owned(),
+                    100,
+                ))),
+                1,
+                true,
+                Barrier::new_test_barrier(test_epoch(7)).epoch,
+            )
+            .await
+            .unwrap();
+        let state_table = create_cdc_state_table(store).await;
+        let cdc = CdcBackfillExecutor::new(
+            actor_context,
+            external_storage_table,
+            source,
+            output_indices,
+            output_columns,
+            None,
+            StreamingMetrics::unused().into(),
+            state_table,
+            None,
+            CdcScanOptions::default(),
+            BTreeMap::default(),
+        );
+        let s = cdc.execute_inner();
+        pin_mut!(s);
+
+        // send first barrier
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(8)));
+        // send chunk
+        {
+            let payload = r#"{ "payload": { "before": null, "after": { "O_ORDERKEY": 5, "O_CUSTKEY": 44485, "O_ORDERSTATUS": "F", "O_TOTALPRICE": "144659.20", "O_DUMMY": 100 }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002", "ts_ms": 1695277757000, "snapshot": "last", "db": "mydb", "sequence": null, "table": "orders_new", "server_id": 0, "gtid": null, "file": "binlog.000008", "pos": 3693, "row": 0, "thread": null, "query": null }, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#;
+            let datums: Vec<Datum> = vec![
+                Some(JsonbVal::from_str(payload).unwrap().into()),
+                Some("file: 1.binlog, pos: 100".to_owned().into()),
+                Some("mydb.orders".to_owned().into()),
+            ];
+            let mut builders = schema.create_array_builders(8);
+            for (builder, datum) in builders.iter_mut().zip_eq_fast(datums.iter()) {
+                builder.append(datum.clone());
+            }
+            let columns = builders
+                .into_iter()
+                .map(|builder| builder.finish().into())
+                .collect();
+            // one row chunk
+            let chunk = StreamChunk::from_parts(vec![Op::Insert], DataChunk::new(columns, 1));
+
+            tx.push_chunk(chunk);
         }
+        let _first_barrier = s.next().await.unwrap();
+        let upstream_change_log = s.next().await.unwrap().unwrap();
+        let Message::Chunk(chunk) = upstream_change_log else {
+            panic!("expect chunk");
+        };
+        assert_eq!(chunk.columns().len(), 3);
+        assert_eq!(chunk.rows().count(), 1);
+        assert_eq!(
+            chunk.columns()[0].as_int64().iter().collect::<Vec<_>>(),
+            vec![Some(44485)]
+        );
+        assert_eq!(
+            chunk.columns()[1].as_int64().iter().collect::<Vec<_>>(),
+            vec![Some(5)]
+        );
+        assert_eq!(
+            chunk.columns()[2].as_int64().iter().collect::<Vec<_>>(),
+            vec![Some(100)]
+        );
+
+        drop(tx);
+        assert!(s.next().await.is_none());
+    }
+
+    #[test]
+    fn test_reader_startup_polling_selection() {
+        let recovered_position = OwnedRow::new(vec![Some(ScalarImpl::Int64(1))]);
+
+        assert!(!can_poll_upstream_while_creating_reader(
+            Some(&recovered_position),
+            false,
+        ));
+        assert!(can_poll_upstream_while_creating_reader(None, false));
+        assert!(can_poll_upstream_while_creating_reader(
+            Some(&recovered_position),
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_read_error_rebuilds_reader() {
+        let external_table = create_mock_external_table().with_mock_snapshot_errors([1, 0]);
+        let reader_create_probe = external_table.clone();
+        let (tx, executor) = create_mock_cdc_backfill(
+            external_table,
+            create_cdc_state_table(MemoryStateStore::new()).await,
+            CdcScanOptions {
+                snapshot_barrier_interval: 1,
+                ..Default::default()
+            },
+        );
+        let executor = executor.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(1)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // The second barrier starts the snapshot. The first reader fails when it is polled.
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), executor.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(reader_create_probe.mock_reader_create_count(), 1);
+
+        // The next barrier checkpoints the resume position before the failed reader is replaced.
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // The replacement reader succeeds, proving that retries do not reuse the failed reader.
+        let Message::Chunk(chunk) = executor.next().await.unwrap().unwrap() else {
+            panic!("replacement reader should produce a snapshot chunk");
+        };
+        assert_eq!(chunk.cardinality(), 6);
+        assert_eq!(reader_create_probe.mock_reader_create_count(), 2);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(4)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_read_error_before_first_chunk_survives_recovery() {
+        let scan_options = || CdcScanOptions {
+            snapshot_barrier_interval: 1,
+            ..Default::default()
+        };
+
+        let memory_state_store = MemoryStateStore::new();
+
+        // The first snapshot read fails before any row is emitted, and the next barrier
+        // checkpoints while there is no snapshot cursor.
+        {
+            let (tx, executor) = create_mock_cdc_backfill(
+                create_mock_external_table().with_mock_snapshot_errors([1]),
+                create_cdc_state_table(memory_state_store.clone()).await,
+                scan_options(),
+            );
+            let executor = executor.execute_inner();
+
+            pin_mut!(executor);
+
+            for epoch in 1..=3 {
+                tx.send_barrier(Barrier::new_test_barrier(test_epoch(epoch)));
+                assert!(matches!(
+                    executor.next().await.unwrap().unwrap(),
+                    Message::Barrier(_)
+                ));
+            }
+        }
+
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store.clone()).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(4)).epoch)
+            .await
+            .unwrap();
+
+        // No snapshot progress was made, so no backfill state should be persisted.
+        let state = restored_state.restore_state().await.unwrap();
+        assert!(!state.is_finished);
+        assert_eq!(state.current_pk_pos, None);
+        assert_eq!(state.last_cdc_offset, None);
+        assert_eq!(state.row_count, 0);
+
+        // After recovery, the snapshot must restart from the beginning instead of resuming
+        // from a NULL cursor.
+        let (tx, executor) = create_mock_cdc_backfill(
+            create_mock_external_table(),
+            create_cdc_state_table(memory_state_store).await,
+            scan_options(),
+        );
+        let executor = executor.execute_inner();
+
+        pin_mut!(executor);
+
+        for epoch in 4..=5 {
+            tx.send_barrier(Barrier::new_test_barrier(test_epoch(epoch)));
+            assert!(matches!(
+                executor.next().await.unwrap().unwrap(),
+                Message::Barrier(_)
+            ));
+        }
+        let Message::Chunk(chunk) = tokio::time::timeout(Duration::from_secs(5), executor.next())
+            .await
+            .expect("recovered backfill should read the snapshot")
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("recovered reader should produce a snapshot chunk");
+        };
+
+        assert_eq!(chunk.cardinality(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_cdc_backfill_finishes_without_table_reader() {
+        let actor_context = ActorContext::for_test(1);
+        let external_storage_table = ExternalStorageTable::new(
+            TableId::new(1234),
+            SchemaTableName {
+                schema_name: "public".to_owned(),
+                table_name: "orders".to_owned(),
+            },
+            "db".to_owned(),
+            ExternalTableConfig::default(),
+            ExternalCdcTableType::Unspecified,
+            Schema::new(vec![Field::with_name(DataType::Int64, "id")]),
+            vec![OrderType::ascending()],
+            Some(vec![CdcKeyComparison::Native]),
+            vec![0],
+        );
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Jsonb),
+            Field::unnamed(DataType::Varchar),
+            Field::unnamed(DataType::Varchar),
+        ]);
+        let stream_key = vec![1];
+        let (tx, source) = MockSource::channel();
+        let source = source.into_executor(schema, stream_key);
+        let output_columns = vec![ColumnDesc::named("id", ColumnId::new(1), DataType::Int64)];
+        let memory_state_store = MemoryStateStore::new();
+        let state_table = create_cdc_state_table(memory_state_store.clone()).await;
+        let cdc = CdcBackfillExecutor::new(
+            actor_context,
+            external_storage_table,
+            source,
+            vec![0],
+            output_columns,
+            None,
+            StreamingMetrics::unused().into(),
+            state_table,
+            None,
+            CdcScanOptions {
+                disable_backfill: true,
+                ..CdcScanOptions::default()
+            },
+            BTreeMap::default(),
+        );
+        let executor = cdc.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(1)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(2)).epoch)
+            .await
+            .unwrap();
+        let state = restored_state.restore_state().await.unwrap();
+        assert!(state.is_finished);
+        assert_eq!(state.last_cdc_offset, None);
+    }
+
+    #[tokio::test]
+    async fn test_unfinished_cdc_backfill_rejects_null_offset_on_restore() {
+        let memory_state_store = MemoryStateStore::new();
+        let mut state_writer = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store.clone()).await,
+            5,
+        );
+        state_writer
+            .init_epoch(Barrier::new_test_barrier(test_epoch(1)).epoch)
+            .await
+            .unwrap();
+        state_writer
+            .mutate_and_commit_state(
+                Some(OwnedRow::new(vec![Some(ScalarImpl::Int64(10))])),
+                None,
+                10,
+                false,
+                Barrier::new_test_barrier(test_epoch(2)).epoch,
+            )
+            .await
+            .unwrap();
+
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(2)).epoch)
+            .await
+            .unwrap();
+
+        assert!(restored_state.restore_state().await.is_err());
+    }
+
+    fn create_raw_cdc_chunk(rows: &[(&str, &str)]) -> StreamChunk {
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Jsonb),
+            Field::unnamed(DataType::Varchar),
+        ]);
+        let mut builders = schema.create_array_builders(rows.len());
+        for (payload, offset) in rows {
+            let payload_datum: Datum = Some(JsonbVal::from_str(payload).unwrap().into());
+            let offset_datum: Datum = Some((*offset).into());
+            builders[0].append(payload_datum);
+            builders[1].append(offset_datum);
+        }
+        let columns = builders
+            .into_iter()
+            .map(|builder| builder.finish().into())
+            .collect();
+        StreamChunk::from_parts(
+            vec![Op::Insert; rows.len()],
+            DataChunk::new(columns, rows.len()),
+        )
+    }
+
+    fn create_mock_external_table() -> ExternalStorageTable {
+        ExternalStorageTable::new(
+            TableId::new(1234),
+            SchemaTableName {
+                schema_name: "public".to_owned(),
+                table_name: "mock_table".to_owned(),
+            },
+            "mydb".to_owned(),
+            ExternalTableConfig::default(),
+            ExternalCdcTableType::Mock,
+            Schema::new(vec![
+                Field::with_name(DataType::Int64, "id"),
+                Field::with_name(DataType::Float64, "price"),
+            ]),
+            vec![OrderType::ascending()],
+            Some(vec![CdcKeyComparison::Native]),
+            vec![0],
+        )
+    }
+
+    /// Creates a CDC backfill executor over the `id`/`price` mock table, along with the sender
+    /// for its upstream.
+    fn create_mock_cdc_backfill(
+        external_table: ExternalStorageTable,
+        state_table: StateTable<MemoryStateStore>,
+        scan_options: CdcScanOptions,
+    ) -> (MessageSender, CdcBackfillExecutor<MemoryStateStore>) {
+        let (tx, source) = MockSource::channel();
+        let source = source.into_executor(
+            Schema::new(vec![
+                Field::unnamed(DataType::Jsonb),
+                Field::unnamed(DataType::Varchar),
+            ]),
+            vec![0],
+        );
+        let executor = CdcBackfillExecutor::new(
+            ActorContext::for_test(0x1a),
+            external_table,
+            source,
+            vec![0, 1],
+            vec![
+                ColumnDesc::named("id", ColumnId::new(1), DataType::Int64),
+                ColumnDesc::named("price", ColumnId::new(2), DataType::Float64),
+            ],
+            None,
+            StreamingMetrics::unused().into(),
+            state_table,
+            None,
+            scan_options,
+            BTreeMap::default(),
+        );
+        (tx, executor)
+    }
+
+    async fn create_cdc_state_table(store: MemoryStateStore) -> StateTable<MemoryStateStore> {
+        let state_schema = Schema::new(vec![
+            Field::with_name(DataType::Varchar, "split_id"),
+            Field::with_name(DataType::Int64, "id"),
+            Field::with_name(DataType::Boolean, "backfill_finished"),
+            Field::with_name(DataType::Int64, "row_count"),
+            Field::with_name(DataType::Jsonb, "cdc_offset"),
+        ]);
+        let column_descs = vec![
+            ColumnDesc::unnamed(ColumnId::from(0), state_schema[0].data_type.clone()),
+            ColumnDesc::unnamed(ColumnId::from(1), state_schema[1].data_type.clone()),
+            ColumnDesc::unnamed(ColumnId::from(2), state_schema[2].data_type.clone()),
+            ColumnDesc::unnamed(ColumnId::from(3), state_schema[3].data_type.clone()),
+            ColumnDesc::unnamed(ColumnId::from(4), state_schema[4].data_type.clone()),
+        ];
+
+        StateTable::from_table_catalog(
+            &gen_pbtable(
+                TableId::from(0x42),
+                column_descs,
+                vec![OrderType::ascending()],
+                vec![0],
+                0,
+            ),
+            store,
+            None,
+        )
+        .await
+    }
+
+    async fn create_recovering_cdc_backfill() -> (
+        MessageSender,
+        CdcBackfillExecutor<MemoryStateStore>,
+        MemoryStateStore,
+    ) {
+        let memory_state_store = MemoryStateStore::new();
+        let mut state_writer = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store.clone()).await,
+            5,
+        );
+        state_writer
+            .init_epoch(Barrier::new_test_barrier(test_epoch(1)).epoch)
+            .await
+            .unwrap();
+        state_writer
+            .mutate_and_commit_state(
+                Some(OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                5,
+                false,
+                Barrier::new_test_barrier(test_epoch(2)).epoch,
+            )
+            .await
+            .unwrap();
+
+        let (tx, executor) = create_mock_cdc_backfill(
+            create_mock_external_table(),
+            create_cdc_state_table(memory_state_store.clone()).await,
+            CdcScanOptions::default(),
+        );
+        (tx, executor, memory_state_store)
+    }
+
+    async fn assert_recovery_offset(
+        memory_state_store: MemoryStateStore,
+        expected_position: u64,
+        epoch: u64,
+    ) {
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(epoch).epoch)
+            .await
+            .unwrap();
+        let state = restored_state.restore_state().await.unwrap();
+        assert_eq!(
+            state.last_cdc_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new(
+                "1.binlog".to_owned(),
+                expected_position,
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_filters_upstream_while_reader_is_pending() {
+        let chunk = StreamChunk::from_rows(
+            &[
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(4)),
+                        Some(ScalarImpl::Float64(44.04.into())),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(6)),
+                        Some(ScalarImpl::Float64(66.06.into())),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+            ],
+            &[DataType::Int64, DataType::Float64, DataType::Varchar],
+        );
+        let mut upstream = stream::iter([
+            Ok(Message::Chunk(chunk)),
+            Ok(Message::Barrier(Barrier::new_test_barrier(test_epoch(4)))),
+        ]);
+        let mut reader_future = Box::pin(std::future::pending::<ExternalTableReaderImpl>());
+
+        let Either::Left(Message::Chunk(chunk)) =
+            build_reader_and_poll_upstream(&mut upstream, &mut reader_future)
+                .await
+                .unwrap()
+        else {
+            panic!("expected an upstream chunk while the reader is pending");
+        };
+
+        let parser = ExternalCdcTableType::Mock.get_cdc_offset_parser().unwrap();
+        let (chunk, consumed_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::filter_recovery_chunk(
+                &parser,
+                chunk,
+                &OwnedRow::new(vec![Some(ScalarImpl::Int64(5))]),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                &[0, 1],
+            )
+            .unwrap();
+        let chunk = chunk.expect("the scanned row should be emitted");
+        assert_eq!(chunk.cardinality(), 1);
+        assert_eq!(
+            chunk.row_at(0).1.to_owned_row()[0],
+            Some(ScalarImpl::Int64(4))
+        );
+        assert_eq!(
+            consumed_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 4)))
+        );
+        assert!(matches!(
+            build_reader_and_poll_upstream(&mut upstream, &mut reader_future)
+                .await
+                .unwrap(),
+            Either::Left(Message::Barrier(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_recovery_filters_updates_before_backfill_barrier() {
+        let (mut tx, executor, memory_state_store) = create_recovering_cdc_backfill().await;
+        let executor = executor.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        tx.push_chunk(create_raw_cdc_chunk(&[
+            (
+                r#"{ "payload": { "before": { "id": 1, "price": 11.01 }, "after": { "id": 1, "price": 12.01 }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002" }, "op": "u", "ts_ms": 1695277757017, "transaction": null } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#,
+            ),
+            (
+                r#"{ "payload": { "before": { "id": 6, "price": 66.06 }, "after": { "id": 6, "price": 67.06 }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002" }, "op": "u", "ts_ms": 1695277757017, "transaction": null } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#,
+            ),
+        ]));
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(4)));
+
+        let Message::Chunk(chunk) = executor.next().await.unwrap().unwrap() else {
+            panic!("expected the recovered update before the barrier");
+        };
+        let rows = chunk
+            .rows()
+            .map(|(op, row)| (op, row.to_owned_row()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Op::Insert);
+        assert_eq!(rows[0].1[0], Some(ScalarImpl::Int64(1)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+        assert_recovery_offset(memory_state_store, 4, test_epoch(4)).await;
+    }
+
+    #[tokio::test]
+    async fn test_recovery_preserves_scanned_inserts_and_deletes() {
+        let (mut tx, executor, _) = create_recovering_cdc_backfill().await;
+        let executor = executor.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+        // This replayed event predates the saved offset and must not lower the offset filter.
+        tx.push_chunk(create_raw_cdc_chunk(&[(
+            r#"{ "payload": { "before": null, "after": { "id": 3, "price": 30.01 }, "op": "c" } }"#,
+            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":1},"isHeartbeat":false}"#,
+        )]));
+        tx.push_chunk(create_raw_cdc_chunk(&[
+            (
+                r#"{ "payload": { "before": null, "after": { "id": 3, "price": 31.01 }, "op": "c" } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":1},"isHeartbeat":false}"#,
+            ),
+            (
+                r#"{ "payload": { "before": null, "after": { "id": 4, "price": 44.04 }, "op": "c" } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":2},"isHeartbeat":false}"#,
+            ),
+            (
+                r#"{ "payload": { "before": { "id": 5, "price": 55.05 }, "after": null, "op": "d" } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#,
+            ),
+        ]));
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(4)));
+
+        let Message::Chunk(chunk) = executor.next().await.unwrap().unwrap() else {
+            panic!("expected the scanned-prefix changes before the barrier");
+        };
+        let rows = chunk
+            .rows()
+            .map(|(op, row)| (op, row.to_owned_row()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, Op::Insert);
+        assert_eq!(rows[0].1[0], Some(ScalarImpl::Int64(4)));
+        assert_eq!(rows[1].0, Op::Delete);
+        assert_eq!(rows[1].1[0], Some(ScalarImpl::Int64(5)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_recovery_does_not_leave_deleted_unscanned_row() {
+        let (mut tx, mut executor, memory_state_store) = create_recovering_cdc_backfill().await;
+        executor.options.snapshot_barrier_interval = 1;
+        let executor = executor.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Recover at PK 5, then receive an insert for an unscanned key during startup.
+        tx.push_chunk(create_raw_cdc_chunk(&[(
+            r#"{ "payload": { "before": null, "after": { "id": 100, "price": 100.01 }, "op": "c" } }"#,
+            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#,
+        )]));
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(4)));
+
+        // Normal backfill receives its delete before the snapshot reaches PK 100.
+        // The snapshot refresh at barrier 5 scans up to PK 8 and filters out the delete.
+        tx.push_chunk(create_raw_cdc_chunk(&[(
+            r#"{ "payload": { "before": { "id": 100, "price": 100.01 }, "after": null, "op": "d" } }"#,
+            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#,
+        )]));
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(5)));
+        // The next snapshot is empty, so backfill completes at barrier 6.
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(6)));
+
+        let mut materialized = BTreeMap::new();
+        loop {
+            match executor.next().await.unwrap().unwrap() {
+                Message::Chunk(chunk) => {
+                    for (op, row) in chunk.rows() {
+                        let pk = row.datum_at(0).unwrap().into_int64();
+                        match op {
+                            Op::Insert => {
+                                materialized.insert(pk, row.to_owned_row());
+                            }
+                            Op::Delete => {
+                                materialized.remove(&pk);
+                            }
+                            _ => unreachable!("CDC updates are converted to inserts"),
+                        }
+                    }
+                }
+                Message::Barrier(barrier) if barrier.epoch.curr == test_epoch(6) => break,
+                Message::Barrier(_) => {}
+                Message::Watermark(_) => panic!("unexpected watermark during backfill"),
+            }
+        }
+
+        assert!(!materialized.contains_key(&100));
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(6)).epoch)
+            .await
+            .unwrap();
+        assert!(restored_state.restore_state().await.unwrap().is_finished);
+    }
+
+    #[test]
+    fn test_consume_upstream_chunk_buffer_retains_future_rows() {
+        let mut upstream_chunk_buffer = vec![StreamChunk::from_rows(
+            &[
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(1)),
+                        Some(ScalarImpl::Int64(100)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(6)),
+                        Some(ScalarImpl::Int64(600)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+            ],
+            &[DataType::Int64, DataType::Int64, DataType::Varchar],
+        )];
+
+        let (emitted_chunks, drained_row_count, drained_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut upstream_chunk_buffer,
+                Some(&OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                &[0, 1],
+            )
+            .unwrap();
+
+        assert_eq!(drained_row_count, 1);
+        assert_eq!(
+            drained_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 3)))
+        );
+        assert_eq!(emitted_chunks.len(), 1);
+        assert_eq!(emitted_chunks[0].rows().count(), 1);
+        assert_eq!(
+            emitted_chunks[0].rows().next().unwrap().1.to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(1)),
+                Some(ScalarImpl::Int64(100))
+            ])
+        );
+
+        assert_eq!(upstream_chunk_buffer.len(), 1);
+        assert_eq!(upstream_chunk_buffer[0].rows().count(), 1);
+        assert_eq!(
+            upstream_chunk_buffer[0]
+                .rows()
+                .next()
+                .unwrap()
+                .1
+                .to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(6)),
+                Some(ScalarImpl::Int64(600)),
+                Some(ScalarImpl::Utf8(
+                    r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                        .into(),
+                )),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_consume_buffer_uses_unsigned_bigint_pk_order() {
+        let mut upstream_chunk_buffer = vec![StreamChunk::from_rows(
+            &[
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(4)),
+                        Some(ScalarImpl::Int64(400)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        // `u64::MAX` represented in RisingWave's `i64` storage.
+                        Some(ScalarImpl::Int64(-1)),
+                        Some(ScalarImpl::Int64(900)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+            ],
+            &[DataType::Int64, DataType::Int64, DataType::Varchar],
+        )];
+
+        let (emitted_chunks, drained_row_count, drained_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut upstream_chunk_buffer,
+                Some(&OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[true],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                &[0, 1],
+            )
+            .unwrap();
+
+        assert_eq!(drained_row_count, 1);
+        assert_eq!(
+            drained_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 3)))
+        );
+        assert_eq!(emitted_chunks.len(), 1);
+        assert_eq!(
+            emitted_chunks[0].rows().next().unwrap().1.to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(4)),
+                Some(ScalarImpl::Int64(400))
+            ])
+        );
+
+        assert_eq!(upstream_chunk_buffer.len(), 1);
+        assert_eq!(
+            upstream_chunk_buffer[0]
+                .rows()
+                .next()
+                .unwrap()
+                .1
+                .to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(-1)),
+                Some(ScalarImpl::Int64(900)),
+                Some(ScalarImpl::Utf8(
+                    r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                        .into(),
+                )),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_consume_buffer_non_monotonic_pk_in_chunk() {
+        let mut upstream_chunk_buffer = vec![StreamChunk::from_rows(
+            &[
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(1)),
+                        Some(ScalarImpl::Int64(100)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(6)),
+                        Some(ScalarImpl::Int64(600)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(2)),
+                        Some(ScalarImpl::Int64(200)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":5},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+            ],
+            &[DataType::Int64, DataType::Int64, DataType::Varchar],
+        )];
+
+        let (emitted_chunks, drained_row_count, drained_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut upstream_chunk_buffer,
+                Some(&OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                &[0, 1],
+            )
+            .unwrap();
+
+        assert_eq!(drained_row_count, 2);
+        assert_eq!(
+            drained_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 3)))
+        );
+        assert_eq!(emitted_chunks.len(), 1);
+        assert_eq!(emitted_chunks[0].rows().count(), 2);
+        assert_eq!(
+            emitted_chunks[0]
+                .rows()
+                .map(|(_, row)| row.to_owned_row())
+                .collect::<Vec<_>>(),
+            vec![
+                OwnedRow::new(vec![
+                    Some(ScalarImpl::Int64(1)),
+                    Some(ScalarImpl::Int64(100))
+                ]),
+                OwnedRow::new(vec![
+                    Some(ScalarImpl::Int64(2)),
+                    Some(ScalarImpl::Int64(200))
+                ]),
+            ]
+        );
+
+        assert_eq!(upstream_chunk_buffer.len(), 1);
+        assert_eq!(upstream_chunk_buffer[0].rows().count(), 1);
+        assert_eq!(
+            upstream_chunk_buffer[0]
+                .rows()
+                .next()
+                .unwrap()
+                .1
+                .to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(6)),
+                Some(ScalarImpl::Int64(600)),
+                Some(ScalarImpl::Utf8(
+                    r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                        .into(),
+                )),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_consume_buffer_processes_chunks_after_future_row() {
+        let mut upstream_chunk_buffer = vec![
+            StreamChunk::from_rows(
+                &[
+                    (
+                        Op::Insert,
+                        OwnedRow::new(vec![
+                            Some(ScalarImpl::Int64(1)),
+                            Some(ScalarImpl::Int64(100)),
+                            Some(ScalarImpl::Utf8(
+                                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#
+                                    .into(),
+                            )),
+                        ]),
+                    ),
+                    (
+                        Op::Insert,
+                        OwnedRow::new(vec![
+                            Some(ScalarImpl::Int64(6)),
+                            Some(ScalarImpl::Int64(600)),
+                            Some(ScalarImpl::Utf8(
+                                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                    .into(),
+                            )),
+                        ]),
+                    ),
+                ],
+                &[DataType::Int64, DataType::Int64, DataType::Varchar],
+            ),
+            StreamChunk::from_rows(
+                &[(
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(2)),
+                        Some(ScalarImpl::Int64(200)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":5},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                )],
+                &[DataType::Int64, DataType::Int64, DataType::Varchar],
+            ),
+        ];
+
+        let (emitted_chunks, drained_row_count, drained_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut upstream_chunk_buffer,
+                Some(&OwnedRow::new(vec![Some(ScalarImpl::Int64(5))])),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 2))),
+                &[0, 1],
+            )
+            .unwrap();
+
+        assert_eq!(drained_row_count, 2);
+        assert_eq!(
+            drained_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 3)))
+        );
+        assert_eq!(emitted_chunks.len(), 2);
+        assert_eq!(emitted_chunks[0].rows().count(), 1);
+        assert_eq!(emitted_chunks[1].rows().count(), 1);
+        assert_eq!(
+            emitted_chunks[1].rows().next().unwrap().1.to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(2)),
+                Some(ScalarImpl::Int64(200))
+            ])
+        );
+
+        assert_eq!(upstream_chunk_buffer.len(), 1);
+        assert_eq!(
+            upstream_chunk_buffer[0]
+                .rows()
+                .next()
+                .unwrap()
+                .1
+                .to_owned_row(),
+            OwnedRow::new(vec![
+                Some(ScalarImpl::Int64(6)),
+                Some(ScalarImpl::Int64(600)),
+                Some(ScalarImpl::Utf8(
+                    r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                        .into(),
+                )),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_consume_buffer_advances_offset_after_preceding_rows_are_emitted() {
+        let mut upstream_chunk_buffer = vec![StreamChunk::from_rows(
+            &[
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(6)),
+                        Some(ScalarImpl::Int64(600)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(ScalarImpl::Int64(2)),
+                        Some(ScalarImpl::Int64(200)),
+                        Some(ScalarImpl::Utf8(
+                            r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":5},"isHeartbeat":false}"#
+                                .into(),
+                        )),
+                    ]),
+                ),
+            ],
+            &[DataType::Int64, DataType::Int64, DataType::Varchar],
+        )];
+
+        let (_, drained_row_count, drained_offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut upstream_chunk_buffer,
+                Some(&OwnedRow::new(vec![Some(ScalarImpl::Int64(6))])),
+                PkCompareInfo {
+                    indices: &[0],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                },
+                &Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 3))),
+                &[0, 1],
+            )
+            .unwrap();
+
+        assert_eq!(drained_row_count, 2);
+        assert_eq!(
+            drained_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 5)))
+        );
+        assert!(upstream_chunk_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cdc_backfill_persists_buffered_offset_on_checkpoint() {
+        let memory_state_store = MemoryStateStore::new();
+        let state_table = create_cdc_state_table(memory_state_store.clone()).await;
+
+        let (mut tx, executor) = create_mock_cdc_backfill(
+            create_mock_external_table(),
+            state_table,
+            CdcScanOptions {
+                snapshot_barrier_interval: 10,
+                ..Default::default()
+            },
+        );
+        let executor = executor.execute_inner();
+        pin_mut!(executor);
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(1)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+
+        tx.push_chunk(create_raw_cdc_chunk(&[
+            (
+                r#"{ "payload": { "before": null, "after": { "id": 1, "price": 10.01 }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002" }, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":3},"isHeartbeat":false}"#,
+            ),
+            (
+                r#"{ "payload": { "before": null, "after": { "id": 6, "price": 66.06 }, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002" }, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
+                r#"{"sourcePartition":{},"sourceOffset":{"file":"1.binlog","pos":4},"isHeartbeat":false}"#,
+            ),
+        ]));
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)));
+
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        let mut restored_state = CdcBackfillState::new(
+            TableId::new(1234),
+            create_cdc_state_table(memory_state_store).await,
+            5,
+        );
+        restored_state
+            .init_epoch(Barrier::new_test_barrier(test_epoch(3)).epoch)
+            .await
+            .unwrap();
+        let state = restored_state.restore_state().await.unwrap();
+        assert_eq!(
+            state.last_cdc_offset,
+            Some(CdcOffset::Mysql(MysqlOffset::new("1.binlog".to_owned(), 4)))
+        );
     }
 }

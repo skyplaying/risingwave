@@ -12,17 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_expr::bail;
+use risingwave_pb::plan_common::{AsOfJoinDesc, AsOfJoinInequalityType};
+
+use crate::error::StreamResult;
+
+pub mod asof_join;
 pub mod builder;
 pub mod hash_join;
 pub mod join_row_set;
 pub mod row;
+
+pub(crate) type JoinOpPrimitive = bool;
+
+#[expect(non_snake_case, non_upper_case_globals)]
+pub(crate) mod JoinOp {
+    use super::JoinOpPrimitive;
+
+    pub const Insert: JoinOpPrimitive = true;
+    pub const Delete: JoinOpPrimitive = false;
+}
 
 /// The `JoinType` and `SideType` are to mimic a enum, because currently
 /// enum is not supported in const generic.
 // TODO: Use enum to replace this once [feature(adt_const_params)](https://github.com/rust-lang/rust/issues/95174) get completed.
 pub type JoinTypePrimitive = u8;
 
-#[allow(non_snake_case, non_upper_case_globals)]
+#[expect(non_snake_case, non_upper_case_globals)]
 pub mod JoinType {
     use super::JoinTypePrimitive;
     pub const Inner: JoinTypePrimitive = 0;
@@ -35,12 +51,53 @@ pub mod JoinType {
     pub const RightAnti: JoinTypePrimitive = 7;
 }
 
+pub type AsOfJoinTypePrimitive = u8;
+
+#[expect(non_snake_case, non_upper_case_globals)]
+pub mod AsOfJoinType {
+    use super::AsOfJoinTypePrimitive;
+    pub const Inner: AsOfJoinTypePrimitive = 0;
+    pub const LeftOuter: AsOfJoinTypePrimitive = 1;
+}
+
 pub type SideTypePrimitive = u8;
-#[allow(non_snake_case, non_upper_case_globals)]
+#[expect(non_snake_case, non_upper_case_globals)]
 pub mod SideType {
     use super::SideTypePrimitive;
     pub const Left: SideTypePrimitive = 0;
     pub const Right: SideTypePrimitive = 1;
+}
+
+pub enum AsOfInequalityType {
+    Le,
+    Lt,
+    Ge,
+    Gt,
+}
+
+pub struct AsOfDesc {
+    pub left_idx: usize,
+    pub right_idx: usize,
+    pub inequality_type: AsOfInequalityType,
+}
+
+impl AsOfDesc {
+    pub fn from_protobuf(desc_proto: &AsOfJoinDesc) -> StreamResult<Self> {
+        let typ = match desc_proto.inequality_type() {
+            AsOfJoinInequalityType::AsOfInequalityTypeLt => AsOfInequalityType::Lt,
+            AsOfJoinInequalityType::AsOfInequalityTypeLe => AsOfInequalityType::Le,
+            AsOfJoinInequalityType::AsOfInequalityTypeGt => AsOfInequalityType::Gt,
+            AsOfJoinInequalityType::AsOfInequalityTypeGe => AsOfInequalityType::Ge,
+            AsOfJoinInequalityType::AsOfInequalityTypeUnspecified => {
+                bail!("unspecified AsOf join inequality type")
+            }
+        };
+        Ok(Self {
+            left_idx: desc_proto.left_idx as usize,
+            right_idx: desc_proto.right_idx as usize,
+            inequality_type: typ,
+        })
+    }
 }
 
 pub const fn is_outer_side(join_type: JoinTypePrimitive, side_type: SideTypePrimitive) -> bool {
@@ -105,4 +162,8 @@ pub const fn need_right_degree(join_type: JoinTypePrimitive) -> bool {
         || join_type == JoinType::RightOuter
         || join_type == JoinType::RightAnti
         || join_type == JoinType::RightSemi
+}
+
+pub const fn is_as_of_left_outer(join_type: AsOfJoinTypePrimitive) -> bool {
+    join_type == AsOfJoinType::LeftOuter
 }

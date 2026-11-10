@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,15 +13,19 @@
 // limitations under the License.
 
 //! Value encoding is an encoding format which converts the data into a binary form (not
-//! memcomparable).
+//! memcomparable, i.e., Key encoding).
+
+use std::sync::LazyLock;
+
 use bytes::{Buf, BufMut};
 use chrono::{Datelike, Timelike};
-use either::{for_both, Either};
+use either::{Either, for_both};
 use enum_as_inner::EnumAsInner;
 use risingwave_pb::data::PbDatum;
 
 use crate::array::ArrayImpl;
-use crate::row::{Row, RowDeserializer as BasicDeserializer};
+use crate::log::LogSuppressor;
+use crate::row::Row;
 use crate::types::*;
 
 pub mod error;
@@ -29,6 +33,9 @@ use error::ValueEncodingError;
 
 use self::column_aware_row_encoding::ColumnAwareSerde;
 pub mod column_aware_row_encoding;
+
+pub use crate::row::RowDeserializer as BasicDeserializer;
+use crate::vector::{decode_vector_payload, encode_vector_payload};
 
 pub type Result<T> = std::result::Result<T, ValueEncodingError>;
 
@@ -214,16 +221,21 @@ fn serialize_scalar(value: ScalarRefImpl<'_>, buf: &mut impl BufMut) {
         ScalarRefImpl::Decimal(v) => serialize_decimal(&v, buf),
         ScalarRefImpl::Interval(v) => serialize_interval(&v, buf),
         ScalarRefImpl::Date(v) => serialize_date(v.0.num_days_from_ce(), buf),
-        ScalarRefImpl::Timestamp(v) => {
-            serialize_timestamp(v.0.timestamp(), v.0.timestamp_subsec_nanos(), buf)
-        }
+        ScalarRefImpl::Timestamp(v) => serialize_timestamp(
+            v.0.and_utc().timestamp(),
+            v.0.and_utc().timestamp_subsec_nanos(),
+            buf,
+        ),
         ScalarRefImpl::Timestamptz(v) => buf.put_i64_le(v.timestamp_micros()),
         ScalarRefImpl::Time(v) => {
             serialize_time(v.0.num_seconds_from_midnight(), v.0.nanosecond(), buf)
         }
         ScalarRefImpl::Jsonb(v) => serialize_str(&v.value_serialize(), buf),
+        ScalarRefImpl::Variant(v) => serialize_str(v.as_bytes(), buf),
         ScalarRefImpl::Struct(s) => serialize_struct(s, buf),
         ScalarRefImpl::List(v) => serialize_list(v, buf),
+        ScalarRefImpl::Map(m) => serialize_list(m.into_inner(), buf),
+        ScalarRefImpl::Vector(v) => serialize_vector(v, buf),
     }
 }
 
@@ -247,8 +259,11 @@ fn estimate_serialize_scalar_size(value: ScalarRefImpl<'_>) -> usize {
         ScalarRefImpl::Time(_) => estimate_serialize_time_size(),
         // not exact as we use internal encoding size to estimate the json string size
         ScalarRefImpl::Jsonb(v) => v.capacity(),
+        ScalarRefImpl::Variant(v) => estimate_serialize_str_size(v.as_bytes()),
         ScalarRefImpl::Struct(s) => estimate_serialize_struct_size(s),
         ScalarRefImpl::List(v) => estimate_serialize_list_size(v),
+        ScalarRefImpl::Map(v) => estimate_serialize_list_size(v.into_inner()),
+        ScalarRefImpl::Vector(v) => estimate_serialize_vector_size(v),
     }
 }
 
@@ -271,6 +286,14 @@ fn serialize_list(value: ListRef<'_>, buf: &mut impl BufMut) {
 }
 fn estimate_serialize_list_size(list: ListRef<'_>) -> usize {
     4 + list.estimate_serialize_size_inner()
+}
+
+fn serialize_vector(value: VectorRef<'_>, buf: &mut impl BufMut) {
+    let elems = value.as_slice();
+    encode_vector_payload(elems, buf);
+}
+fn estimate_serialize_vector_size(v: VectorRef<'_>) -> usize {
+    size_of_val(v.as_slice())
 }
 
 fn serialize_str(bytes: &[u8], buf: &mut impl BufMut) {
@@ -342,16 +365,33 @@ fn deserialize_value(ty: &DataType, data: &mut impl Buf) -> Result<ScalarImpl> {
         DataType::Time => ScalarImpl::Time(deserialize_time(data)?),
         DataType::Timestamp => ScalarImpl::Timestamp(deserialize_timestamp(data)?),
         DataType::Timestamptz => {
-            ScalarImpl::Timestamptz(Timestamptz::from_micros(data.get_i64_le()))
+            let micros = data.get_i64_le();
+            let tz = Timestamptz::from_micros(micros).unwrap_or_else(|| {
+                // Values written before validation existed may be out of range (#26397). Keep
+                // them readable and report, so the row can still be read and deleted.
+                static LOG_SUPPRESSOR: LazyLock<LogSuppressor> =
+                    LazyLock::new(LogSuppressor::default);
+                if let Ok(suppressed_count) = LOG_SUPPRESSOR.check() {
+                    tracing::error!(suppressed_count, micros, "decoded out-of-range timestamptz");
+                }
+                Timestamptz::from_micros_uncheck(micros)
+            });
+            ScalarImpl::Timestamptz(tz)
         }
         DataType::Date => ScalarImpl::Date(deserialize_date(data)?),
         DataType::Jsonb => ScalarImpl::Jsonb(
             JsonbVal::value_deserialize(&deserialize_bytea(data))
                 .ok_or(ValueEncodingError::InvalidJsonbEncoding)?,
         ),
+        DataType::Variant => ScalarImpl::Variant(
+            VariantVal::value_deserialize(&deserialize_bytea(data))
+                .ok_or(ValueEncodingError::InvalidVariantEncoding)?,
+        ),
         DataType::Struct(struct_def) => deserialize_struct(struct_def, data)?,
         DataType::Bytea => ScalarImpl::Bytea(deserialize_bytea(data).into()),
-        DataType::List(item_type) => deserialize_list(item_type, data)?,
+        DataType::Vector(dimension) => deserialize_vector(*dimension, data),
+        DataType::List(list_type) => deserialize_list(list_type, data)?,
+        DataType::Map(map_type) => deserialize_map(map_type, data)?,
     })
 }
 
@@ -364,13 +404,27 @@ fn deserialize_struct(struct_def: &StructType, data: &mut impl Buf) -> Result<Sc
     Ok(ScalarImpl::Struct(StructValue::new(field_values)))
 }
 
-fn deserialize_list(item_type: &DataType, data: &mut impl Buf) -> Result<ScalarImpl> {
+fn deserialize_list(list_type: &ListType, data: &mut impl Buf) -> Result<ScalarImpl> {
+    let elem_type = list_type.elem();
     let len = data.get_u32_le();
-    let mut builder = item_type.create_array_builder(len as usize);
+    let mut builder = elem_type.create_array_builder(len as usize);
     for _ in 0..len {
-        builder.append(inner_deserialize_datum(data, item_type)?);
+        builder.append(inner_deserialize_datum(data, elem_type)?);
     }
     Ok(ScalarImpl::List(ListValue::new(builder.finish())))
+}
+
+fn deserialize_map(map_type: &MapType, data: &mut impl Buf) -> Result<ScalarImpl> {
+    // FIXME: clone type everytime here is inefficient
+    let list = deserialize_list(&map_type.clone().into_list_type(), data)?.into_list();
+    Ok(ScalarImpl::Map(MapValue::from_entries(list)))
+}
+
+fn deserialize_vector(dimension: usize, data: &mut impl Buf) -> ScalarImpl {
+    VectorVal {
+        inner: decode_vector_payload(dimension, data).into_boxed_slice(),
+    }
+    .to_scalar_value()
 }
 
 fn deserialize_str(data: &mut impl Buf) -> Result<Box<str>> {
@@ -426,7 +480,7 @@ fn deserialize_timestamp(data: &mut impl Buf) -> Result<Timestamp> {
 
 fn deserialize_date(data: &mut impl Buf) -> Result<Date> {
     let days = data.get_i32_le();
-    Date::with_days(days).map_err(|_e| ValueEncodingError::InvalidDateEncoding(days))
+    Date::with_days_since_ce(days).map_err(|_e| ValueEncodingError::InvalidDateEncoding(days))
 }
 
 fn deserialize_decimal(data: &mut impl Buf) -> Result<Decimal> {

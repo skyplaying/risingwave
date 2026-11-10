@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2023 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ public class CassandraConfig extends CommonSinkConfig {
             @JsonProperty(value = "type") String type) {
         this.url = url;
         this.keyspace = keyspace;
-        this.table = table;
+        this.table = CassandraUtil.convertCQLIdentifiers(table);
         this.datacenter = datacenter;
         this.type = type;
     }

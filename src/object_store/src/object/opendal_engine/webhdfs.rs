@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::services::Webhdfs;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
 
-use super::{EngineType, OpendalObjectStore};
-use crate::object::opendal_engine::ATOMIC_WRITE_DIR;
+use super::{MediaType, OpendalObjectStore, new_operator};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
+use crate::object::opendal_engine::ATOMIC_WRITE_DIR;
 
 impl OpendalObjectStore {
     /// create opendal webhdfs engine.
@@ -29,24 +30,28 @@ impl OpendalObjectStore {
         endpoint: String,
         root: String,
         config: Arc<ObjectStoreConfig>,
+        metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Create webhdfs backend builder.
         let mut builder = Webhdfs::default();
         // Set the name node for webhdfs.
-        builder.endpoint(&endpoint);
+        builder = builder.endpoint(&endpoint);
         // Set the root for hdfs, all operations will happen under this root.
         // NOTE: the root must be absolute path.
-        builder.root(&root);
+        builder = builder.root(&root);
 
         let atomic_write_dir = format!("{}/{}", root, ATOMIC_WRITE_DIR);
-        builder.atomic_write_dir(&atomic_write_dir);
-        let op: Operator = Operator::new(builder)?
-            .layer(LoggingLayer::default())
-            .finish();
+        builder = builder.atomic_write_dir(&atomic_write_dir);
+        let op = new_operator(
+            &config,
+            Operator::new(builder)?.layer(LoggingLayer::default()),
+        );
+
         Ok(Self {
             op,
-            engine_type: EngineType::Webhdfs,
+            media_type: MediaType::Webhdfs,
             config,
+            metrics,
         })
     }
 }

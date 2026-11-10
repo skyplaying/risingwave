@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,16 +20,17 @@ use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::ScalarImpl;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_sqlparser::ast::{
-    DataType as AstDataType, Distinct, Expr, Select, SelectItem, Value,
+    DataType as AstDataType, Distinct, Expr, Select, SelectItem, Value, WindowSpec,
 };
 
 use super::bind_context::{Clause, ColumnBinding};
 use super::statement::RewriteExprsRecursive;
-use super::UNNAMED_COLUMN;
+use super::{BoundShareInput, UNNAMED_COLUMN};
 use crate::binder::{Binder, Relation};
-use crate::catalog::check_valid_column_name;
+use crate::catalog::check_column_name_not_reserved;
 use crate::error::{ErrorCode, Result, RwError};
-use crate::expr::{CorrelatedId, Depth, Expr as _, ExprImpl, ExprType, FunctionCall, InputRef};
+use crate::expr::{CorrelatedId, Expr as _, ExprImpl, ExprType, FunctionCall, InputRef, ScopeId};
+use crate::optimizer::plan_node::generic::CHANGELOG_OP;
 use crate::utils::group_by::GroupBy;
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct BoundSelect {
     pub where_clause: Option<ExprImpl>,
     pub group_by: GroupBy,
     pub having: Option<ExprImpl>,
+    pub window: HashMap<String, WindowSpec>,
     pub schema: Schema,
 }
 
@@ -127,30 +129,39 @@ impl BoundSelect {
             .chain(self.having.iter_mut())
     }
 
-    pub fn is_correlated(&self, depth: Depth) -> bool {
+    pub fn is_correlated_by_scope(&self, scope: ScopeId) -> bool {
         self.exprs()
-            .any(|expr| expr.has_correlated_input_ref_by_depth(depth))
+            .any(|expr| expr.has_correlated_input_ref_by_scope(scope))
             || match self.from.as_ref() {
-                Some(relation) => relation.is_correlated(depth),
+                Some(relation) => relation.is_correlated_by_scope(scope),
                 None => false,
             }
     }
 
-    pub fn collect_correlated_indices_by_depth_and_assign_id(
+    pub fn is_correlated_by_correlated_id(&self, correlated_id: CorrelatedId) -> bool {
+        self.exprs()
+            .any(|expr| expr.has_correlated_input_ref_by_correlated_id(correlated_id))
+            || match self.from.as_ref() {
+                Some(relation) => relation.is_correlated_by_correlated_id(correlated_id),
+                None => false,
+            }
+    }
+
+    pub fn collect_correlated_indices_by_scope_and_assign_id(
         &mut self,
-        depth: Depth,
+        scope: ScopeId,
         correlated_id: CorrelatedId,
     ) -> Vec<usize> {
         let mut correlated_indices = self
             .exprs_mut()
             .flat_map(|expr| {
-                expr.collect_correlated_indices_by_depth_and_assign_id(depth, correlated_id)
+                expr.collect_correlated_indices_by_scope_and_assign_id(scope, correlated_id)
             })
             .collect_vec();
 
         if let Some(relation) = self.from.as_mut() {
             correlated_indices.extend(
-                relation.collect_correlated_indices_by_depth_and_assign_id(depth, correlated_id),
+                relation.collect_correlated_indices_by_scope_and_assign_id(scope, correlated_id),
             );
         }
 
@@ -188,21 +199,40 @@ impl BoundDistinct {
 }
 
 impl Binder {
-    pub(super) fn bind_select(&mut self, select: Select) -> Result<BoundSelect> {
+    pub(super) fn bind_select(&mut self, select: &Select) -> Result<BoundSelect> {
         // Bind FROM clause.
-        let from = self.bind_vec_table_with_joins(select.from)?;
+        let from = self.bind_vec_table_with_joins(&select.from)?;
+
+        // Bind WINDOW clause early - store named window definitions for window function resolution
+        let mut named_windows = HashMap::new();
+        for named_window in &select.window {
+            let window_name = named_window.name.real_value();
+            if named_windows.contains_key(&window_name) {
+                return Err(ErrorCode::InvalidInputSyntax(format!(
+                    "window \"{}\" is already defined",
+                    window_name
+                ))
+                .into());
+            }
+            named_windows.insert(window_name, named_window.window_spec.clone());
+        }
+
+        // Store window definitions in bind context for window function resolution
+        self.context.named_windows = named_windows.clone();
 
         // Bind SELECT clause.
-        let (select_items, aliases) = self.bind_select_list(select.projection)?;
+        let (select_items, aliases) = self.bind_select_list(&select.projection)?;
         let out_name_to_index = Self::build_name_to_index(aliases.iter().filter_map(Clone::clone));
 
         // Bind DISTINCT ON.
-        let distinct = self.bind_distinct_on(select.distinct, &out_name_to_index, &select_items)?;
+        let distinct =
+            self.bind_distinct_on(&select.distinct, &out_name_to_index, &select_items)?;
 
         // Bind WHERE clause.
         self.context.clause = Some(Clause::Where);
         let selection = select
             .selection
+            .as_ref()
             .map(|expr| {
                 self.bind_expr(expr)
                     .and_then(|expr| expr.enforce_bool_clause("WHERE"))
@@ -245,14 +275,14 @@ impl Binder {
                     || matches!(expr, Expr::Cube(_))
             }) {
                 return Err(ErrorCode::BindError(
-                    "Only support one grouping item in group by clause".to_string(),
+                    "Only support one grouping item in group by clause".to_owned(),
                 )
                 .into());
             }
             GroupBy::GroupKey(
                 select
                     .group_by
-                    .into_iter()
+                    .iter()
                     .map(|expr| {
                         self.bind_group_by_expr_in_select(expr, &out_name_to_index, &select_items)
                     })
@@ -265,6 +295,7 @@ impl Binder {
         self.context.clause = Some(Clause::Having);
         let having = select
             .having
+            .as_ref()
             .map(|expr| {
                 self.bind_expr(expr)
                     .and_then(|expr| expr.enforce_bool_clause("HAVING"))
@@ -277,10 +308,21 @@ impl Binder {
             .iter()
             .zip_eq_fast(aliases.iter())
             .map(|(s, a)| {
-                let name = a.clone().unwrap_or_else(|| UNNAMED_COLUMN.to_string());
+                let name = a.clone().unwrap_or_else(|| UNNAMED_COLUMN.to_owned());
                 Ok(Field::with_name(s.return_type(), name))
             })
             .collect::<Result<Vec<Field>>>()?;
+
+        if let Some(Relation::Share(bound)) = &from
+            && matches!(bound.input, BoundShareInput::ChangeLog { .. })
+            && fields.iter().filter(|&x| x.name.eq(CHANGELOG_OP)).count() > 1
+        {
+            return Err(ErrorCode::BindError(
+                "The source table of changelog cannot have `changelog_op`, please rename it first"
+                    .to_owned(),
+            )
+            .into());
+        }
 
         Ok(BoundSelect {
             distinct,
@@ -290,39 +332,41 @@ impl Binder {
             where_clause: selection,
             group_by,
             having,
+            window: named_windows,
             schema: Schema { fields },
         })
     }
 
     pub fn bind_select_list(
         &mut self,
-        select_items: Vec<SelectItem>,
+        select_items: &[SelectItem],
     ) -> Result<(Vec<ExprImpl>, Vec<Option<String>>)> {
         let mut select_list = vec![];
         let mut aliases = vec![];
         for item in select_items {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
-                    let alias = derive_alias(&expr);
+                    let alias = derive_alias(expr);
                     let bound = self.bind_expr(expr)?;
                     select_list.push(bound);
                     aliases.push(alias);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    check_valid_column_name(&alias.real_value())?;
+                    check_column_name_not_reserved(&alias.real_value())?;
 
                     let expr = self.bind_expr(expr)?;
                     select_list.push(expr);
                     aliases.push(Some(alias.real_value()));
                 }
                 SelectItem::QualifiedWildcard(obj_name, except) => {
-                    let table_name = &obj_name.0.last().unwrap().real_value();
-                    let except_indices = self.generate_except_indices(except)?;
-                    let (begin, end) = self.context.range_of.get(table_name).ok_or_else(|| {
-                        ErrorCode::ItemNotFound(format!("relation \"{}\"", table_name))
-                    })?;
+                    let (schema_name, table_name) =
+                        Binder::resolve_schema_qualified_name(&self.db_name, obj_name)?;
+                    let except_indices = self.generate_except_indices(except.as_deref())?;
+                    let (begin, end) = self
+                        .context
+                        .resolve_relation_range(&table_name, &schema_name)?;
                     let (exprs, names) = Self::iter_bound_columns(
-                        self.context.columns[*begin..*end]
+                        self.context.columns[begin..end]
                             .iter()
                             .filter(|c| !c.is_hidden && !except_indices.contains(&c.index)),
                     );
@@ -349,7 +393,7 @@ impl Binder {
                     select_list.extend(exprs);
                     aliases.extend(names);
 
-                    let except_indices = self.generate_except_indices(except)?;
+                    let except_indices = self.generate_except_indices(except.as_deref())?;
 
                     // Bind columns that are not in groups
                     let (exprs, names) =
@@ -403,7 +447,7 @@ impl Binder {
     ///   marked with `usize::MAX`.
     fn bind_group_by_expr_in_select(
         &mut self,
-        expr: Expr,
+        expr: &Expr,
         name_to_index: &HashMap<String, usize>,
         select_items: &[ExprImpl],
     ) -> Result<ExprImpl> {
@@ -455,7 +499,7 @@ impl Binder {
                     Expr::Identifier(ident) => Some(ident.real_value()),
                     _ => None,
                 };
-                let expr_impl = match self.bind_expr(expr) {
+                let expr_impl = match self.bind_expr(&expr) {
                     Ok(ExprImpl::Literal(lit)) => match lit.get_data() {
                         Some(ScalarImpl::Int32(idx)) => idx
                             .saturating_sub(1)
@@ -497,13 +541,13 @@ impl Binder {
         &mut self,
         returning_items: Vec<SelectItem>,
     ) -> Result<(Vec<ExprImpl>, Vec<Field>)> {
-        let (returning_list, aliases) = self.bind_select_list(returning_items)?;
+        let (returning_list, aliases) = self.bind_select_list(&returning_items)?;
         if returning_list
             .iter()
             .any(|expr| expr.has_agg_call() || expr.has_window_function())
         {
             return Err(RwError::from(ErrorCode::BindError(
-                "should not have agg/window in the `RETURNING` list".to_string(),
+                "should not have agg/window in the `RETURNING` list".to_owned(),
             )));
         }
 
@@ -511,7 +555,7 @@ impl Binder {
             .iter()
             .zip_eq_fast(aliases.iter())
             .map(|(s, a)| {
-                let name = a.clone().unwrap_or_else(|| UNNAMED_COLUMN.to_string());
+                let name = a.clone().unwrap_or_else(|| UNNAMED_COLUMN.to_owned());
                 Ok::<Field, RwError>(Field::with_name(s.return_type(), name))
             })
             .try_collect()?;
@@ -582,7 +626,7 @@ impl Binder {
     ///   marked with `usize::MAX`.
     fn bind_distinct_on(
         &mut self,
-        distinct: Distinct,
+        distinct: &Distinct,
         name_to_index: &HashMap<String, usize>,
         select_items: &[ExprImpl],
     ) -> Result<BoundDistinct> {
@@ -602,7 +646,7 @@ impl Binder {
                                         "DISTINCT ON \"{}\" is ambiguous",
                                         name.real_value()
                                     ))
-                                    .into())
+                                    .into());
                                 }
                                 _ => select_items[*index].clone(),
                             }
@@ -617,7 +661,7 @@ impl Binder {
                                     "Invalid ordinal number in DISTINCT ON: {}",
                                     number
                                 ))
-                                .into())
+                                .into());
                             }
                         },
                         expr => self.bind_expr(expr)?,
@@ -629,7 +673,10 @@ impl Binder {
         })
     }
 
-    fn generate_except_indices(&mut self, except: Option<Vec<Expr>>) -> Result<HashSet<usize>> {
+    pub(super) fn generate_except_indices(
+        &mut self,
+        except: Option<&[Expr]>,
+    ) -> Result<HashSet<usize>> {
         let mut except_indices: HashSet<usize> = HashSet::new();
         if let Some(exprs) = except {
             for expr in exprs {
@@ -647,7 +694,7 @@ impl Binder {
                         return Err(ErrorCode::BindError(
                             "Only support column name in except list".into(),
                         )
-                        .into())
+                        .into());
                     }
                 }
             }
@@ -662,48 +709,50 @@ fn derive_alias(expr: &Expr) -> Option<String> {
         Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.real_value()),
         Expr::FieldIdentifier(_, idents) => idents.last().map(|ident| ident.real_value()),
         Expr::Function(func) => Some(func.name.real_value()),
-        Expr::Extract { .. } => Some("extract".to_string()),
-        Expr::Case { .. } => Some("case".to_string()),
+        Expr::Extract { .. } => Some("extract".to_owned()),
+        Expr::Case { .. } => Some("case".to_owned()),
         Expr::Cast { expr, data_type } => {
             derive_alias(&expr).or_else(|| data_type_to_alias(&data_type))
         }
         Expr::TypedString { data_type, .. } => data_type_to_alias(&data_type),
-        Expr::Value(Value::Interval { .. }) => Some("interval".to_string()),
-        Expr::Row(_) => Some("row".to_string()),
-        Expr::Array(_) => Some("array".to_string()),
-        Expr::ArrayIndex { obj, index: _ } => derive_alias(&obj),
+        Expr::Value(Value::Interval { .. }) => Some("interval".to_owned()),
+        Expr::Row(_) => Some("row".to_owned()),
+        Expr::Array(_) => Some("array".to_owned()),
+        Expr::Index { obj, index: _ } => derive_alias(&obj),
         _ => None,
     }
 }
 
 fn data_type_to_alias(data_type: &AstDataType) -> Option<String> {
     let alias = match data_type {
-        AstDataType::Char(_) => "bpchar".to_string(),
-        AstDataType::Varchar => "varchar".to_string(),
-        AstDataType::Uuid => "uuid".to_string(),
-        AstDataType::Decimal(_, _) => "numeric".to_string(),
-        AstDataType::Real | AstDataType::Float(Some(1..=24)) => "float4".to_string(),
-        AstDataType::Double | AstDataType::Float(Some(25..=53) | None) => "float8".to_string(),
+        AstDataType::Char(_) => "bpchar".to_owned(),
+        AstDataType::Varchar => "varchar".to_owned(),
+        AstDataType::Uuid => "uuid".to_owned(),
+        AstDataType::Decimal(_, _) => "numeric".to_owned(),
+        AstDataType::Real | AstDataType::Float(Some(1..=24)) => "float4".to_owned(),
+        AstDataType::Double | AstDataType::Float(Some(25..=53) | None) => "float8".to_owned(),
         AstDataType::Float(Some(0 | 54..)) => unreachable!(),
-        AstDataType::SmallInt => "int2".to_string(),
-        AstDataType::Int => "int4".to_string(),
-        AstDataType::BigInt => "int8".to_string(),
-        AstDataType::Boolean => "bool".to_string(),
-        AstDataType::Date => "date".to_string(),
+        AstDataType::SmallInt => "int2".to_owned(),
+        AstDataType::Int => "int4".to_owned(),
+        AstDataType::BigInt => "int8".to_owned(),
+        AstDataType::Boolean => "bool".to_owned(),
+        AstDataType::Date => "date".to_owned(),
         AstDataType::Time(tz) => format!("time{}", if *tz { "z" } else { "" }),
         AstDataType::Timestamp(tz) => {
             format!("timestamp{}", if *tz { "tz" } else { "" })
         }
-        AstDataType::Interval => "interval".to_string(),
-        AstDataType::Regclass => "regclass".to_string(),
-        AstDataType::Regproc => "regproc".to_string(),
-        AstDataType::Text => "text".to_string(),
-        AstDataType::Bytea => "bytea".to_string(),
-        AstDataType::Jsonb => "jsonb".to_string(),
+        AstDataType::Interval => "interval".to_owned(),
+        AstDataType::Regclass => "regclass".to_owned(),
+        AstDataType::Regproc => "regproc".to_owned(),
+        AstDataType::Text => "text".to_owned(),
+        AstDataType::Bytea => "bytea".to_owned(),
+        AstDataType::Jsonb => "jsonb".to_owned(),
+        AstDataType::Variant => "variant".to_owned(),
         AstDataType::Array(ty) => return data_type_to_alias(ty),
         AstDataType::Custom(ty) => format!("{}", ty),
-        AstDataType::Struct(_) => {
-            // Note: Postgres doesn't have anonymous structs
+        AstDataType::Vector(_) => "vector".to_owned(),
+        AstDataType::Struct(_) | AstDataType::Map(_) => {
+            // It doesn't bother to derive aliases for these types.
             return None;
         }
     };

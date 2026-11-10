@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,12 @@ use std::mem;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use risingwave_common::types::DataType;
-use risingwave_expr::aggregate::{agg_kinds, AggKind};
+use risingwave_expr::aggregate::{AggType, PbAggKind, agg_types};
 
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::expr::{CollectInputRef, ExprType, FunctionCall, InputRef, Literal};
 use crate::optimizer::plan_node::generic::Agg;
 use crate::optimizer::plan_node::{LogicalAgg, LogicalExpand, LogicalProject, PlanAggCall};
-use crate::optimizer::PlanRef;
 use crate::utils::{ColIndexMapping, Condition, IndexSet};
 
 /// Transform distinct aggregates to `LogicalAgg` -> `LogicalAgg` -> `Expand` -> `Input`.
@@ -32,7 +31,7 @@ pub struct DistinctAggRule {
     for_stream: bool,
 }
 
-impl Rule for DistinctAggRule {
+impl Rule<Logical> for DistinctAggRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let agg: &LogicalAgg = plan.as_logical_agg()?;
         let (mut agg_calls, mut agg_group_keys, grouping_sets, input, enable_two_phase) =
@@ -52,14 +51,17 @@ impl Rule for DistinctAggRule {
 
         if !agg_calls.iter().all(|c| {
             assert!(
-                !matches!(c.agg_kind, agg_kinds::rewritten!()),
+                !matches!(c.agg_type, agg_types::rewritten!()),
                 "We shouldn't see agg kind {} here",
-                c.agg_kind
+                c.agg_type
             );
-            let agg_kind_ok = !matches!(c.agg_kind, agg_kinds::simply_cannot_two_phase!());
-            let order_ok = matches!(c.agg_kind, agg_kinds::result_unaffected_by_order_by!())
-                || c.order_by.is_empty();
-            agg_kind_ok && order_ok
+            let agg_type_ok = !matches!(c.agg_type, agg_types::simply_cannot_two_phase!());
+            let order_ok = matches!(
+                c.agg_type,
+                agg_types::result_unaffected_by_order_by!()
+                    | AggType::Builtin(PbAggKind::ApproxPercentile)
+            ) || c.order_by.is_empty();
+            agg_type_ok && order_ok
         }) {
             tracing::warn!("DistinctAggRule: unsupported agg kind, fallback to backend impl");
             return None;
@@ -302,8 +304,8 @@ impl DistinctAggRule {
                 // the filter of non-distinct agg has been calculated in middle agg.
                 agg_call.filter = Condition::true_cond();
 
-                // change final agg's agg_kind just like two-phase agg.
-                agg_call.agg_kind = agg_call.agg_kind.partial_to_total().expect(
+                // change final agg's agg_type just like two-phase agg.
+                agg_call.agg_type = agg_call.agg_type.partial_to_total().expect(
                     "we should get a valid total phase agg kind here since unsupported cases have been filtered out"
                 );
 

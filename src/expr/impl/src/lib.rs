@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,22 +20,17 @@
 //! risingwave_expr_impl::enable!();
 //! ```
 
-#![allow(non_snake_case)] // for `ctor` generated code
-#![feature(let_chains)]
-#![feature(assert_matches)]
-#![feature(lint_reasons)]
 #![feature(iterator_try_collect)]
-#![feature(exclusive_range_pattern)]
-#![feature(lazy_cell)]
 #![feature(coroutines)]
-#![feature(test)]
+#![cfg_attr(test, feature(test))]
 #![feature(iter_array_chunks)]
-#![feature(result_flattening)]
 #![feature(used_with_arg)]
+#![cfg_attr(coverage, feature(coverage_attribute))]
 
 mod aggregate;
 mod scalar;
 mod table_function;
+#[cfg(feature = "udf")]
 mod udf;
 mod window_function;
 

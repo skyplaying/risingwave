@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 #![warn(clippy::explicit_into_iter_loop)]
 #![warn(clippy::explicit_iter_loop)]
 #![warn(clippy::inconsistent_struct_constructor)]
-#![warn(clippy::unused_async)]
 #![warn(clippy::map_flatten)]
 #![warn(clippy::await_holding_lock)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -27,10 +26,8 @@
 #![allow(rw::format_error)] // test code
 
 mod compaction_test_runner;
-mod delete_range_runner;
 
 use clap::Parser;
-pub use delete_range_runner::start_delete_range;
 
 use crate::compaction_test_runner::compaction_test_main;
 

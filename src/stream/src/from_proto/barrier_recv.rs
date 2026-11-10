@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use risingwave_pb::stream_plan::BarrierRecvNode;
-use tokio::sync::mpsc::unbounded_channel;
 
 use super::*;
 use crate::executor::BarrierRecvExecutor;
 
 pub struct BarrierRecvExecutorBuilder;
+
+impl_stream_node_body!(BarrierRecv(BarrierRecvNode) => BarrierRecvExecutorBuilder);
 
 impl ExecutorBuilder for BarrierRecvExecutorBuilder {
     type Node = BarrierRecvNode;
@@ -33,10 +34,9 @@ impl ExecutorBuilder for BarrierRecvExecutorBuilder {
             "barrier receiver should not have input"
         );
 
-        let (sender, barrier_receiver) = unbounded_channel();
-        params
-            .create_actor_context
-            .register_sender(params.actor_context.id, sender);
+        let barrier_receiver = params
+            .local_barrier_manager
+            .subscribe_barrier(params.actor_context.id);
 
         let exec = BarrierRecvExecutor::new(params.actor_context, barrier_receiver);
         Ok((params.info, exec).into())

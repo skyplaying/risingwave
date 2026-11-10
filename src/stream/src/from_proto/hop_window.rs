@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ use super::*;
 use crate::executor::HopWindowExecutor;
 
 pub struct HopWindowExecutorBuilder;
+
+impl_stream_node_body!(HopWindow(HopWindowNode) => HopWindowExecutorBuilder);
 
 impl ExecutorBuilder for HopWindowExecutorBuilder {
     type Node = HopWindowNode;
@@ -51,7 +53,7 @@ impl ExecutorBuilder for HopWindowExecutorBuilder {
         let window_slide = node.get_window_slide()?.into();
         let window_size = node.get_window_size()?.into();
 
-        let chunk_size = params.env.config().developer.chunk_size;
+        let chunk_size = params.config.developer.chunk_size;
 
         let exec = HopWindowExecutor::new(
             params.actor_context,

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Borrow;
 use std::cmp::max;
 use std::fmt::Debug;
 use std::vec;
 
 use itertools::Itertools;
 use risingwave_pb::catalog::PbColIndexMapping;
-use risingwave_pb::stream_plan::DispatchStrategy;
 
 /// `ColIndexMapping` is a partial mapping from usize to usize.
 ///
@@ -276,6 +276,22 @@ impl ColIndexMapping {
         self.try_map(index).unwrap()
     }
 
+    /// Map source column indices to target indices, preserving their order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any source index is out of bounds or not mapped, like [`Self::map`].
+    pub fn map_all<I>(&self, indices: I) -> Vec<usize>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<usize>,
+    {
+        indices
+            .into_iter()
+            .map(|index| self.map(*index.borrow()))
+            .collect()
+    }
+
     /// Returns the size of the target range. Target index is in the range `(0..target_size)`.
     pub fn target_size(&self) -> usize {
         self.target_size
@@ -322,28 +338,6 @@ impl ColIndexMapping {
     }
 }
 
-impl ColIndexMapping {
-    /// Rewrite the dist-key indices and output indices in the given dispatch strategy. Returns
-    /// `None` if any of the indices is not mapped to the target.
-    pub fn rewrite_dispatch_strategy(
-        &self,
-        strategy: &DispatchStrategy,
-    ) -> Option<DispatchStrategy> {
-        let map = |index: &[u32]| -> Option<Vec<u32>> {
-            index
-                .iter()
-                .map(|i| self.try_map(*i as usize).map(|i| i as u32))
-                .collect()
-        };
-
-        Some(DispatchStrategy {
-            r#type: strategy.r#type,
-            dist_key_indices: map(&strategy.dist_key_indices)?,
-            output_indices: map(&strategy.output_indices)?,
-        })
-    }
-}
-
 impl Debug for ColIndexMapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -384,7 +378,7 @@ mod tests {
         let remaining_cols = vec![3, 5];
         let col_prune_mapping = ColIndexMapping::with_remaining_columns(&remaining_cols, 6);
         let composite = add_mapping.composite(&col_prune_mapping);
-        assert_eq!(composite.map(0), 0); // 0+3 = 3， 3 -> 0
+        assert_eq!(composite.map(0), 0); // 0+3 = 3, 3 -> 0
         assert_eq!(composite.try_map(1), None);
         assert_eq!(composite.map(2), 1); // 2+3 = 5, 5 -> 1
     }

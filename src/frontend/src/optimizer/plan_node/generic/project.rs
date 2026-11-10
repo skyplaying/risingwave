@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+use educe::Educe;
 use fixedbitset::FixedBitSet;
+use itertools::Itertools;
 use pretty_xmlish::{Pretty, StrAssocArr};
 use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::util::iter_util::ZipEqFast;
 
 use super::{GenericPlanNode, GenericPlanRef};
 use crate::expr::{
-    assert_input_ref, Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor,
-    FunctionCall, InputRef,
+    Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor, FunctionCall, InputRef,
+    assert_input_ref,
 };
 use crate::optimizer::optimizer_context::OptimizerContextRef;
+use crate::optimizer::plan_node::StreamPlanRef;
 use crate::optimizer::property::FunctionalDependencySet;
 use crate::utils::{ColIndexMapping, ColIndexMappingRewriteExt};
 
@@ -45,12 +48,19 @@ fn check_expr_type(expr: &ExprImpl) -> std::result::Result<(), &'static str> {
     Ok(())
 }
 
+/// The name of the vnode column added by [`Project::with_vnode_col`], used as the group key for
+/// local phase of aggregation or top-n under two-phase optimization.
+pub const LOCAL_PHASE_VNODE_COLUMN_NAME: &str = "_vnode";
+
 /// [`Project`] computes a set of expressions from its input relation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(clippy::manual_non_exhaustive)]
+#[derive(Debug, Clone, Educe)]
+#[educe(PartialEq, Eq, Hash)]
+#[expect(clippy::manual_non_exhaustive)]
 pub struct Project<PlanRef> {
     pub exprs: Vec<ExprImpl>,
     /// Mapping from expr index to field name. May not contain all exprs.
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
     pub field_names: BTreeMap<usize, String>,
     pub input: PlanRef,
     // we need some check when construct the `Project::new`
@@ -58,6 +68,15 @@ pub struct Project<PlanRef> {
 }
 
 impl<PlanRef> Project<PlanRef> {
+    pub fn clone_with_input<OtherPlanRef>(&self, input: OtherPlanRef) -> Project<OtherPlanRef> {
+        Project {
+            exprs: self.exprs.clone(),
+            field_names: self.field_names.clone(),
+            input,
+            _private: (),
+        }
+    }
+
     pub(crate) fn rewrite_exprs(&mut self, r: &mut dyn ExprRewriter) {
         self.exprs = self
             .exprs
@@ -82,31 +101,28 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Project<PlanRef> {
             .enumerate()
             .map(|(i, expr)| {
                 // Get field info from o2i.
-                let (name, sub_fields, type_name) = match o2i.try_map(i) {
+                let name = match o2i.try_map(i) {
                     Some(input_idx) => {
-                        let mut field = input_schema.fields()[input_idx].clone();
                         if let Some(name) = self.field_names.get(&i) {
-                            field.name.clone_from(name);
+                            name.clone()
+                        } else {
+                            input_schema.fields()[input_idx].name.clone()
                         }
-                        (field.name, field.sub_fields, field.type_name)
                     }
                     None => match expr {
-                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => (
-                            format!("{:?}", ExprDisplay { expr, input_schema }),
-                            vec![],
-                            String::new(),
-                        ),
+                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => {
+                            format!("{:?}", ExprDisplay { expr, input_schema })
+                        }
                         _ => {
-                            let name = if let Some(name) = self.field_names.get(&i) {
+                            if let Some(name) = self.field_names.get(&i) {
                                 name.clone()
                             } else {
                                 format!("$expr{}", ctx.next_expr_display_id())
-                            };
-                            (name, vec![], String::new())
+                            }
                         }
                     },
                 };
-                Field::with_struct(expr.return_type(), name, sub_fields, type_name)
+                Field::with_name(expr.return_type(), name)
             })
             .collect();
         Schema { fields }
@@ -179,12 +195,17 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         Self::with_out_col_idx(input, out_fields.ones())
     }
 
+    pub fn out_col_idx_exprs<'a>(
+        input: &'a PlanRef,
+        out_fields: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = ExprImpl> + 'a {
+        let input_schema = input.schema();
+        out_fields.map(move |index| InputRef::new(index, input_schema[index].data_type()).into())
+    }
+
     /// Creates a `Project` which select some columns from the input.
     pub fn with_out_col_idx(input: PlanRef, out_fields: impl Iterator<Item = usize>) -> Self {
-        let input_schema = input.schema();
-        let exprs = out_fields
-            .map(|index| InputRef::new(index, input_schema[index].data_type()).into())
-            .collect();
+        let exprs = Self::out_col_idx_exprs(&input, out_fields).collect();
         Self::new(exprs, input)
     }
 
@@ -210,7 +231,8 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         let vnode_expr_idx = new_exprs.len() - 1;
 
         let mut new = Self::new(new_exprs, input);
-        new.field_names.insert(vnode_expr_idx, "_vnode".to_string());
+        new.field_names
+            .insert(vnode_expr_idx, LOCAL_PHASE_VNODE_COLUMN_NAME.to_owned());
         new
     }
 
@@ -298,6 +320,54 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
     }
 }
 
+impl Project<StreamPlanRef> {
+    /// Returns whether the `Project` is likely to produce noop updates. If so, the executor will
+    /// eliminate them to avoid emitting unnecessary changes.
+    pub(crate) fn likely_produces_noop_updates(&self) -> bool {
+        // 1. `NOW()` is often truncated to a granularity such as day, week, or month, which
+        //    seldom changes. Eliminate noop updates can reduce unnecessary changes.
+        if self.input.as_stream_now().is_some() {
+            return true;
+        }
+
+        // 2. If the `Project` contains jsonb access, it's very likely that the query is extracting
+        //    some fields from a jsonb payload column. In this case, a change from the input jsonb
+        //    payload may not change the output of the `Project`.
+        struct HasJsonbAccess {
+            has: bool,
+        }
+
+        impl ExprVisitor for HasJsonbAccess {
+            fn visit_function_call(&mut self, func_call: &FunctionCall) {
+                if matches!(
+                    func_call.func_type(),
+                    ExprType::JsonbAccess
+                        | ExprType::JsonbAccessStr
+                        | ExprType::JsonbExtractPath
+                        | ExprType::JsonbExtractPathVariadic
+                        | ExprType::JsonbExtractPathText
+                        | ExprType::JsonbExtractPathTextVariadic
+                        | ExprType::JsonbPathExists
+                        | ExprType::JsonbPathMatch
+                        | ExprType::JsonbPathQueryArray
+                        | ExprType::JsonbPathQueryFirst
+                ) {
+                    self.has = true;
+                }
+            }
+        }
+
+        self.exprs.iter().any(|expr| {
+            // When there's a jsonb access in the `Project`, it's very likely that the query is
+            // extracting some fields from a jsonb payload column. In this case, a change from the
+            // input jsonb payload may not change the output of the `Project`.
+            let mut visitor = HasJsonbAccess { has: false };
+            visitor.visit_expr(expr);
+            visitor.has
+        })
+    }
+}
+
 /// Construct a `Project` and dedup expressions.
 /// expressions
 #[derive(Default)]
@@ -352,5 +422,79 @@ impl fmt::Debug for AliasedExpr<'_> {
             Some(alias) => write!(f, "{:?} as {}", self.expr, alias),
             None => write!(f, "{:?}", self.expr),
         }
+    }
+}
+
+/// Given the index of required cols, return a vec of permutation index, so that after we sort the `required_cols`,
+/// and re-apply with a projection with the permutation index, we can restore the original `required_cols`.
+///
+/// For example, when the `required_cols` is `[5, 3, 10]`, the `sorted_required_cols` is `[3, 5, 10]`, and the permutation index is
+/// `[1, 0, 2]`, so that `[sorted_required_cols[1], sorted_required_cols[0], sorted_required_cols[2]]` equals the original `[5, 3, 10]`
+pub fn ensure_sorted_required_cols(
+    required_cols: &[usize],
+    schema: &Schema,
+) -> (Vec<ExprImpl>, Vec<usize>) {
+    let mut required_cols_with_output_idx = required_cols.iter().copied().enumerate().collect_vec();
+    required_cols_with_output_idx.sort_by_key(|(_, col_idx)| *col_idx);
+    let mut output_indices = vec![0; required_cols.len()];
+    let mut sorted_col_idx = Vec::with_capacity(required_cols.len());
+
+    for (sorted_input_idx, (output_idx, col_idx)) in
+        required_cols_with_output_idx.into_iter().enumerate()
+    {
+        sorted_col_idx.push(col_idx);
+        output_indices[output_idx] = sorted_input_idx;
+    }
+
+    (
+        output_indices
+            .into_iter()
+            .map(|sorted_input_idx| {
+                InputRef::new(
+                    sorted_input_idx,
+                    schema[sorted_col_idx[sorted_input_idx]].data_type(),
+                )
+                .into()
+            })
+            .collect(),
+        sorted_col_idx,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+
+    use itertools::Itertools;
+    use rand::prelude::SliceRandom;
+    use rand::rng;
+    use risingwave_common::catalog::{Field, Schema};
+    use risingwave_common::types::DataType;
+
+    use super::ensure_sorted_required_cols;
+
+    #[test]
+    fn test_ensure_sorted_required_cols() {
+        let input_len = 10;
+        let schema = Schema::new(
+            (0..input_len)
+                .map(|_| Field::unnamed(DataType::Int32))
+                .collect(),
+        );
+        let mut required_cols = (0..input_len)
+            .filter(|_| rand::random_bool(0.5))
+            .collect_vec();
+        let sorted_required_cols = required_cols.clone();
+        required_cols.shuffle(&mut rng());
+        let required_cols = required_cols;
+
+        let (output_exprs, sorted) = ensure_sorted_required_cols(&required_cols, &schema);
+        assert_eq!(sorted, sorted_required_cols);
+        assert_eq!(
+            output_exprs
+                .iter()
+                .map(|expr| sorted_required_cols[expr.as_input_ref().unwrap().index])
+                .collect_vec(),
+            required_cols
+        );
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,12 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use std::any::type_name;
 use std::fmt::Debug;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use num_traits::{CheckedShl, CheckedShr};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 // Conscious decision for shl and shr is made here to diverge from PostgreSQL.
 // If overflow happens, instead of truncated to zero, we return overflow error as this is
@@ -106,7 +107,7 @@ pub fn general_bitnot<T1: Not<Output = T1>>(expr: T1) -> T1 {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
 
     use super::*;
 

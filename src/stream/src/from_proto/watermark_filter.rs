@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
 use risingwave_common::catalog::{ColumnId, TableDesc};
 use risingwave_expr::expr::build_non_strict_from_prost;
 use risingwave_pb::stream_plan::WatermarkFilterNode;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
-use risingwave_storage::table::TableDistribution;
+use risingwave_pb::stream_plan::stream_node::PbStreamKind;
+use risingwave_storage::table::batch_table::BatchTable;
 
 use super::*;
-use crate::common::table::state_table::StateTable;
-use crate::executor::WatermarkFilterExecutor;
+use crate::common::table::state_table::{StateTableBuilder, StateTableOpConsistencyLevel};
+use crate::executor::{UpsertWatermarkFilterExecutor, WatermarkFilterExecutor};
 
 pub struct WatermarkFilterBuilder;
+
+impl_stream_node_body!(WatermarkFilter(WatermarkFilterNode) => WatermarkFilterBuilder);
 
 impl ExecutorBuilder for WatermarkFilterBuilder {
     type Node = WatermarkFilterNode;
@@ -36,6 +37,7 @@ impl ExecutorBuilder for WatermarkFilterBuilder {
         store: impl StateStore,
     ) -> StreamResult<Executor> {
         let [input]: [_; 1] = params.input.try_into().unwrap();
+        let upsert = matches!(input.stream_kind(), PbStreamKind::Upsert);
         let watermark_descs = node.get_watermark_descs().clone();
         let [watermark_desc]: [_; 1] = watermark_descs.try_into().unwrap();
         let watermark_expr = build_non_strict_from_prost(
@@ -43,11 +45,7 @@ impl ExecutorBuilder for WatermarkFilterBuilder {
             params.eval_error_report.clone(),
         )?;
         let event_time_col_idx = watermark_desc.watermark_idx as usize;
-        let vnodes = Arc::new(
-            params
-                .vnode_bitmap
-                .expect("vnodes not set for watermark filter"),
-        );
+        let vnodes = Arc::new(params.vnode_bitmap);
 
         // TODO: may use consistent op for watermark filter after we have upsert.
         let [table]: [_; 1] = node.get_tables().clone().try_into().unwrap();
@@ -57,23 +55,39 @@ impl ExecutorBuilder for WatermarkFilterBuilder {
             .iter()
             .map(|i| ColumnId::new(*i as _))
             .collect_vec();
-        let other_vnodes =
-            Arc::new((!(*vnodes).clone()) & TableDistribution::all_vnodes_ref().deref());
+        let other_vnodes = Arc::new(!(*vnodes).clone());
         let global_watermark_table =
-            StorageTable::new_partial(store.clone(), column_ids, Some(other_vnodes), &desc);
+            BatchTable::new_partial(store.clone(), column_ids, Some(other_vnodes), &desc);
 
-        let table =
-            StateTable::from_table_catalog_inconsistent_op(&table, store, Some(vnodes)).await;
+        let table = StateTableBuilder::new(&table, store, Some(vnodes))
+            .enable_preload_all_rows_by_config(&params.config)
+            .with_op_consistency_level(StateTableOpConsistencyLevel::Inconsistent)
+            .build()
+            .await;
 
-        let exec = WatermarkFilterExecutor::new(
-            params.actor_context,
-            input,
-            watermark_expr,
-            event_time_col_idx,
-            table,
-            global_watermark_table,
-            params.eval_error_report,
-        );
+        let exec: Box<dyn Execute> = if upsert {
+            UpsertWatermarkFilterExecutor::new(
+                params.actor_context,
+                input,
+                watermark_expr,
+                event_time_col_idx,
+                table,
+                global_watermark_table,
+                params.eval_error_report,
+            )
+            .boxed()
+        } else {
+            WatermarkFilterExecutor::new(
+                params.actor_context,
+                input,
+                watermark_expr,
+                event_time_col_idx,
+                table,
+                global_watermark_table,
+                params.eval_error_report,
+            )
+            .boxed()
+        };
         Ok((params.info, exec).into())
     }
 }

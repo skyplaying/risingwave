@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono_tz::Tz;
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::Row;
 
 use crate::sink::Result;
 
 mod avro;
+mod bson;
+pub mod bytes;
 mod json;
 mod proto;
 pub mod template;
 pub mod text;
 
 pub use avro::{AvroEncoder, AvroHeader};
+pub use bson::BsonEncoder;
 pub use json::JsonEncoder;
 pub use proto::{ProtoEncoder, ProtoHeader};
 
@@ -58,7 +62,7 @@ pub trait RowEncoder {
 /// * an json object
 /// * a protobuf message
 /// * an avro record
-/// into
+///   into
 /// * string (required by kinesis key)
 /// * bytes
 ///
@@ -91,11 +95,31 @@ pub enum DateHandlingMode {
     String,
 }
 
+impl DateHandlingMode {
+    pub const OPTION_KEY: &'static str = "date.handling.mode";
+
+    pub fn from_options(options: &BTreeMap<String, String>) -> Result<Self> {
+        match options.get(Self::OPTION_KEY).map(std::ops::Deref::deref) {
+            // Preserve the legacy encoding when the option is absent.
+            Some("from_ce") | None => Ok(Self::FromCe),
+            Some("from_epoch") => Ok(Self::FromEpoch),
+            Some("string") => Ok(Self::String),
+            Some(v) => Err(super::SinkError::Config(anyhow::anyhow!(
+                "unrecognized {} value {}",
+                Self::OPTION_KEY,
+                v
+            ))),
+        }
+    }
+}
+
 /// Useful for both json and protobuf
 #[derive(Clone, Copy)]
 pub enum TimestampHandlingMode {
     Milli,
     String,
+    /// ISO 8601 string without a timezone suffix.
+    Iso8601String,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +133,7 @@ pub enum TimestamptzHandlingMode {
     #[default]
     UtcString,
     UtcWithoutSuffix,
+    SpecifiedTimezoneWithoutSuffix(Tz),
     Micro,
     Milli,
 }
@@ -136,16 +161,50 @@ impl TimestamptzHandlingMode {
 }
 
 #[derive(Clone)]
+pub struct DorisJsonConfig {
+    pub decimal_scale: HashMap<String, u8>,
+    pub variant_columns: HashSet<String>,
+}
+
+#[derive(Clone)]
 pub enum CustomJsonType {
     // Doris's json need date is string.
     // The internal order of the struct should follow the insertion order.
     // The decimal needs verification and calibration.
-    Doris(HashMap<String, u8>),
+    Doris(DorisJsonConfig),
     // Es's json need jsonb is struct
     Es,
     // starrocks' need jsonb is struct
     StarRocks,
+    // turbopuffer expects serial and decimal attributes to match `int` and `float` schema types.
+    Turbopuffer,
     None,
+}
+
+/// How the jsonb type is encoded.
+///
+/// - `String`: encode jsonb as string. `[1, true, "foo"] -> "[1, true, \"foo\"]"`
+/// - `Dynamic`: encode jsonb as json type dynamically. `[1, true, "foo"] -> [1, true, "foo"]`
+#[derive(Clone, Copy)]
+pub enum JsonbHandlingMode {
+    String,
+    Dynamic,
+}
+
+impl JsonbHandlingMode {
+    pub const OPTION_KEY: &'static str = "jsonb.handling.mode";
+
+    pub fn from_options(options: &BTreeMap<String, String>) -> Result<Self> {
+        match options.get(Self::OPTION_KEY).map(std::ops::Deref::deref) {
+            Some("string") | None => Ok(Self::String),
+            Some("dynamic") => Ok(Self::Dynamic),
+            Some(v) => Err(super::SinkError::Config(anyhow::anyhow!(
+                "unrecognized {} value {}",
+                Self::OPTION_KEY,
+                v
+            ))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -174,7 +233,7 @@ impl std::fmt::Display for FieldEncodeError {
 
         write!(
             f,
-            "encode {} error: {}",
+            "encode '{}' error: {}",
             self.rev_path.iter().rev().join("."),
             self.message
         )

@@ -9,10 +9,10 @@ extern "C" {
 #endif
 /*
  * Class:     com_risingwave_java_binding_Binding
- * Method:    vnodeCount
+ * Method:    defaultVnodeCount
  * Signature: ()I
  */
-JNIEXPORT jint JNICALL Java_com_risingwave_java_binding_Binding_vnodeCount
+JNIEXPORT jint JNICALL Java_com_risingwave_java_binding_Binding_defaultVnodeCount
   (JNIEnv *, jclass);
 
 /*
@@ -246,6 +246,46 @@ JNIEXPORT jboolean JNICALL Java_com_risingwave_java_binding_Binding_sendSinkWrit
  */
 JNIEXPORT jbyteArray JNICALL Java_com_risingwave_java_binding_Binding_recvSinkCoordinatorRequestFromChannel
   (JNIEnv *, jclass, jlong);
+
+/*
+ * Class:     com_risingwave_java_binding_Binding
+ * Method:    putObject
+ * Signature: (Ljava/lang/String;Ljava/lang/String;)V
+ */
+JNIEXPORT void JNICALL Java_com_risingwave_java_binding_Binding_putObject
+  (JNIEnv *, jclass, jstring object_name, jbyteArray data);
+
+/*
+ * Class:     com_risingwave_java_binding_Binding
+ * Method:    getObject
+ * Signature: (Ljava/lang/String;Ljava/lang/String;)V
+ */
+JNIEXPORT jbyteArray JNICALL Java_com_risingwave_java_binding_Binding_getObject
+  (JNIEnv *, jclass, jstring object_name);
+
+/*
+ * Class:     com_risingwave_java_binding_Binding
+ * Method:    listObject
+ * Signature: (Ljava/lang/String;)[Ljava/lang/String;
+ */
+JNIEXPORT jobjectArray JNICALL Java_com_risingwave_java_binding_Binding_listObject
+  (JNIEnv *, jclass, jstring dir);
+
+/*
+ * Class:     com_risingwave_java_binding_Binding
+ * Method:    getObjectStoreType
+ * Signature: ()Ljava/lang/String;
+ */
+JNIEXPORT jstring JNICALL Java_com_risingwave_java_binding_Binding_getObjectStoreType
+  (JNIEnv *, jclass);
+
+/*
+ * Class:     com_risingwave_java_binding_Binding
+ * Method:    deleteObjects
+ * Signature: (Ljava/lang/String;)V
+ */
+JNIEXPORT void JNICALL Java_com_risingwave_java_binding_Binding_deleteObjects
+  (JNIEnv *, jclass, jstring dir);
 
 /*
  * Class:     com_risingwave_java_binding_Binding

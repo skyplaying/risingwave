@@ -14,20 +14,21 @@
 
 use anyhow::{anyhow, bail};
 use itertools::Itertools;
+#[cfg(madsim)]
+use rand::rngs::ChaCha20Rng;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-#[cfg(madsim)]
-use rand_chacha::ChaChaRng;
 use risingwave_sqlparser::ast::Statement;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_postgres::error::Error as PgError;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
+use crate::config::Configuration;
 use crate::utils::read_file_contents;
 use crate::validation::{is_permissible_error, is_recovery_in_progress_error};
 use crate::{
-    generate_update_statements, insert_sql_gen, mview_sql_gen, parse_create_table_statements,
-    parse_sql, session_sql_gen, sql_gen, Table,
+    Table, generate_update_statements, insert_sql_gen, mview_sql_gen,
+    parse_create_table_statements, parse_sql, session_sql_gen, sql_gen,
 };
 
 pub(super) type PgResult<A> = std::result::Result<A, PgError>;
@@ -38,8 +39,9 @@ pub(super) async fn update_base_tables<R: Rng>(
     rng: &mut R,
     base_tables: &[Table],
     inserts: &[Statement],
+    config: &Configuration,
 ) {
-    let update_statements = generate_update_statements(rng, base_tables, inserts).unwrap();
+    let update_statements = generate_update_statements(rng, base_tables, inserts, config).unwrap();
     for update_statement in update_statements {
         let sql = update_statement.to_string();
         tracing::info!("[EXECUTING UPDATES]: {}", &sql);
@@ -52,8 +54,9 @@ pub(super) async fn populate_tables<R: Rng>(
     rng: &mut R,
     base_tables: Vec<Table>,
     row_count: usize,
+    config: &Configuration,
 ) -> Vec<Statement> {
-    let inserts = insert_sql_gen(rng, base_tables, row_count);
+    let inserts = insert_sql_gen(rng, base_tables, row_count, config);
     for insert in &inserts {
         tracing::info!("[EXECUTING INSERT]: {}", insert);
         client.simple_query(insert).await.unwrap();
@@ -78,6 +81,7 @@ pub(super) async fn test_sqlsmith<R: Rng>(
     tables: Vec<Table>,
     base_tables: Vec<Table>,
     row_count: usize,
+    config: &Configuration,
 ) {
     // Test inserted rows should be at least 50% population count,
     // otherwise we don't have sufficient data in our system.
@@ -88,7 +92,7 @@ pub(super) async fn test_sqlsmith<R: Rng>(
     let threshold = 0.50; // permit at most 50% of queries to be skipped.
     let sample_size = 20;
 
-    let skipped_percentage = test_batch_queries(client, rng, tables.clone(), sample_size)
+    let skipped_percentage = test_batch_queries(client, rng, tables.clone(), sample_size, config)
         .await
         .unwrap();
     tracing::info!(
@@ -100,7 +104,7 @@ pub(super) async fn test_sqlsmith<R: Rng>(
         panic!("skipped batch queries exceeded threshold.");
     }
 
-    let skipped_percentage = test_stream_queries(client, rng, tables.clone(), sample_size)
+    let skipped_percentage = test_stream_queries(client, rng, tables.clone(), sample_size, config)
         .await
         .unwrap();
     tracing::info!(
@@ -149,11 +153,12 @@ pub(super) async fn test_batch_queries<R: Rng>(
     rng: &mut R,
     tables: Vec<Table>,
     sample_size: usize,
+    config: &Configuration,
 ) -> Result<f64> {
     let mut skipped = 0;
     for _ in 0..sample_size {
         test_session_variable(client, rng).await;
-        let sql = sql_gen(rng, tables.clone());
+        let sql = sql_gen(rng, tables.clone(), config);
         tracing::info!("[TEST BATCH]: {}", sql);
         skipped += run_query(30, client, &sql).await?;
     }
@@ -166,12 +171,13 @@ pub(super) async fn test_stream_queries<R: Rng>(
     rng: &mut R,
     tables: Vec<Table>,
     sample_size: usize,
+    config: &Configuration,
 ) -> Result<f64> {
     let mut skipped = 0;
 
     for _ in 0..sample_size {
         test_session_variable(client, rng).await;
-        let (sql, table) = mview_sql_gen(rng, tables.clone(), "stream_query");
+        let (sql, table) = mview_sql_gen(rng, tables.clone(), "stream_query", config);
         tracing::info!("[TEST STREAM]: {}", sql);
         skipped += run_query(12, client, &sql).await?;
         tracing::info!("[TEST DROP MVIEW]: {}", &format_drop_mview(&table));
@@ -191,7 +197,7 @@ pub(super) fn get_seed_table_sql(testdata: &str) -> String {
 /// Create the tables defined in testdata, along with some mviews.
 /// TODO: Generate indexes and sinks.
 pub(super) async fn create_base_tables(testdata: &str, client: &Client) -> Result<Vec<Table>> {
-    tracing::info!("Preparing tables...");
+    tracing::info!("Preparing tables");
 
     let sql = get_seed_table_sql(testdata);
     let (base_tables, statements) = parse_create_table_statements(sql);
@@ -213,13 +219,14 @@ pub(super) async fn create_mviews(
     rng: &mut impl Rng,
     mvs_and_base_tables: Vec<Table>,
     client: &Client,
+    config: &Configuration,
 ) -> Result<(Vec<Table>, Vec<Table>)> {
     let mut mvs_and_base_tables = mvs_and_base_tables;
     let mut mviews = vec![];
     // Generate some mviews
     for i in 0..20 {
         let (create_sql, table) =
-            mview_sql_gen(rng, mvs_and_base_tables.clone(), &format!("m{}", i));
+            mview_sql_gen(rng, mvs_and_base_tables.clone(), &format!("m{}", i), config);
         tracing::info!("[EXECUTING CREATE MVIEW]: {}", &create_sql);
         let skip_count = run_query(6, client, &create_sql).await?;
         if skip_count == 0 {
@@ -242,12 +249,80 @@ pub(super) async fn drop_mview_table(mview: &Table, client: &Client) {
         .unwrap();
 }
 
-/// Drops mview tables and seed tables
-pub(super) async fn drop_tables(mviews: &[Table], testdata: &str, client: &Client) {
-    tracing::info!("Cleaning tables...");
+/// Drops mview tables and seed tables.
+/// Queries the system catalog to find all existing MVs (catching any that were
+/// created server-side after a client-side timeout). Drops leaf MVs (those with
+/// no dependents) each iteration without CASCADE, so genuine dependency bugs
+/// surface as real errors rather than being silently swallowed.
+pub(super) async fn drop_tables(testdata: &str, client: &Client) {
+    tracing::info!("Cleaning tables");
 
-    for mview in mviews.iter().rev() {
-        drop_mview_table(mview, client).await;
+    // Drop MVs in the public schema using leaf-node iteration: each pass drops
+    // only MVs that no other object currently depends on. This handles inter-MV
+    // dependencies in the correct order without needing CASCADE.
+    loop {
+        let rows = client
+            .simple_query(
+                "SELECT mv.name \
+                 FROM rw_catalog.rw_materialized_views mv \
+                 JOIN rw_catalog.rw_schemas s ON mv.schema_id = s.id \
+                 WHERE s.name = 'public' \
+                   AND NOT EXISTS ( \
+                         SELECT 1 FROM rw_catalog.rw_depend d WHERE d.refobjid = mv.id \
+                       ) \
+                 ORDER BY mv.name",
+            )
+            .await
+            .unwrap();
+        let names: Vec<String> = rows
+            .into_iter()
+            .filter_map(|msg| {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    row.get(0).map(|s| s.to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if names.is_empty() {
+            // No leaf MVs remain — verify no MVs at all are left.
+            let remaining = client
+                .simple_query(
+                    "SELECT mv.name \
+                     FROM rw_catalog.rw_materialized_views mv \
+                     JOIN rw_catalog.rw_schemas s ON mv.schema_id = s.id \
+                     WHERE s.name = 'public'",
+                )
+                .await
+                .unwrap();
+            let remaining_names: Vec<String> = remaining
+                .into_iter()
+                .filter_map(|msg| {
+                    if let SimpleQueryMessage::Row(row) = msg {
+                        row.get(0).map(|s| s.to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !remaining_names.is_empty() {
+                panic!(
+                    "MV cleanup stalled: no leaf MVs but these still exist: {:?}. \
+                     This indicates an unexpected dependency on a non-MV object.",
+                    remaining_names
+                );
+            }
+            break;
+        }
+
+        for name in &names {
+            tracing::info!("Dropping materialized view: {}", name);
+            client
+                .simple_query(&format!("DROP MATERIALIZED VIEW {name}"))
+                .await
+                .unwrap();
+        }
     }
 
     let seed_files = ["drop_tpch.sql", "drop_nexmark.sql", "drop_alltypes.sql"];
@@ -336,7 +411,9 @@ pub(super) async fn run_query_inner(
                     _ => {}
                 }
             }
-            bail!("[UNEXPECTED ERROR] Failed to recover after {tries} tries with interval {interval}s")
+            bail!(
+                "[UNEXPECTED ERROR] Failed to recover after {tries} tries with interval {interval}s"
+            )
         } else {
             return validate_response(response);
         }
@@ -348,14 +425,14 @@ pub(super) async fn run_query_inner(
 pub(super) fn generate_rng(seed: Option<u64>) -> impl Rng {
     #[cfg(madsim)]
     if let Some(seed) = seed {
-        ChaChaRng::seed_from_u64(seed)
+        ChaCha20Rng::seed_from_u64(seed)
     } else {
-        ChaChaRng::from_rng(SmallRng::from_entropy()).unwrap()
+        rand::make_rng()
     }
     #[cfg(not(madsim))]
     if let Some(seed) = seed {
         SmallRng::seed_from_u64(seed)
     } else {
-        SmallRng::from_entropy()
+        rand::make_rng()
     }
 }

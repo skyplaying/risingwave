@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-#![allow(clippy::unit_arg)]
-
-use std::fmt::Write;
 
 use risingwave_common::array::*;
 use risingwave_common::types::ToText;
@@ -82,7 +78,12 @@ use risingwave_expr::function;
 /// one,*,three,four
 /// ```
 #[function("array_to_string(anyarray, varchar) -> varchar")]
-fn array_to_string(array: ListRef<'_>, delimiter: &str, ctx: &Context, writer: &mut impl Write) {
+fn array_to_string(
+    array: ListRef<'_>,
+    delimiter: &str,
+    ctx: &Context,
+    writer: &mut impl std::fmt::Write,
+) {
     let element_data_type = ctx.arg_types[0].unnest_list();
     let mut first = true;
     for element in array.flatten().iter() {
@@ -102,7 +103,7 @@ fn array_to_string_with_null(
     delimiter: &str,
     null_string: &str,
     ctx: &Context,
-    writer: &mut impl Write,
+    writer: &mut impl std::fmt::Write,
 ) {
     let element_data_type = ctx.arg_types[0].unnest_list();
     let mut first = true;

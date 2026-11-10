@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
+use std::assert_matches;
+
 use pretty_xmlish::Pretty;
 use risingwave_common::catalog::Schema;
 use risingwave_common::util::sort_util::OrderType;
@@ -22,7 +23,7 @@ use super::{GenericPlanNode, GenericPlanRef};
 use crate::expr::{ExprImpl, FunctionCall, InputRef};
 use crate::optimizer::plan_node::stream;
 use crate::optimizer::plan_node::utils::TableCatalogBuilder;
-use crate::optimizer::property::FunctionalDependencySet;
+use crate::optimizer::property::{Distribution, FunctionalDependencySet};
 use crate::utils::{Condition, ConditionDisplay};
 use crate::{OptimizerContextRef, TableCatalog};
 
@@ -31,9 +32,9 @@ pub struct DynamicFilter<PlanRef> {
     /// The predicate (formed with exactly one of < , <=, >, >=)
     comparator: ExprType,
     left_index: usize,
-    pub left: PlanRef,
+    left: PlanRef,
     /// The right input can only have one column.
-    pub right: PlanRef,
+    right: PlanRef,
 }
 impl<PlanRef> DynamicFilter<PlanRef> {
     pub fn comparator(&self) -> ExprType {
@@ -108,19 +109,6 @@ impl<PlanRef: GenericPlanRef> DynamicFilter<PlanRef> {
         }
     }
 
-    pub fn watermark_columns(&self, right_watermark: bool) -> FixedBitSet {
-        let mut watermark_columns = FixedBitSet::with_capacity(self.left.schema().len());
-        if right_watermark {
-            match self.comparator {
-                ExprType::Equal | ExprType::GreaterThan | ExprType::GreaterThanOrEqual => {
-                    watermark_columns.set(self.left_index, true)
-                }
-                _ => {}
-            }
-        }
-        watermark_columns
-    }
-
     fn condition_display(&self) -> (Condition, Schema) {
         let mut concat_schema = self.left.schema().fields.clone();
         concat_schema.extend(self.right.schema().fields.clone());
@@ -140,7 +128,7 @@ impl<PlanRef: GenericPlanRef> DynamicFilter<PlanRef> {
 }
 
 pub fn infer_left_internal_table_catalog(
-    me: impl stream::StreamPlanRef,
+    me: impl stream::StreamPlanNodeMetadata,
     left_key_index: usize,
 ) -> TableCatalog {
     let schema = me.schema();
@@ -149,7 +137,10 @@ pub fn infer_left_internal_table_catalog(
 
     // The pk of dynamic filter internal table should be left_key + input_pk.
     let mut pk_indices = vec![left_key_index];
-    let read_prefix_len_hint = pk_indices.len();
+    // The executor replays changes by scanning left-key ranges with `iter_with_vnode`
+    // when the dynamic predicate changes, so there is no fixed prefix lookup for
+    // prefix SST filters to prune.
+    let read_prefix_len_hint = 0;
 
     for i in me.stream_key().unwrap() {
         if *i != left_key_index {
@@ -170,14 +161,13 @@ pub fn infer_left_internal_table_catalog(
     internal_table_catalog_builder.build(dist_keys, read_prefix_len_hint)
 }
 
-pub fn infer_right_internal_table_catalog(input: impl stream::StreamPlanRef) -> TableCatalog {
-    let schema = input.schema();
+pub fn infer_right_internal_table_catalog(
+    right: impl stream::StreamPlanNodeMetadata,
+) -> TableCatalog {
+    let schema = right.schema();
 
-    // We require that the right table has distribution `Single`
-    assert_eq!(
-        input.distribution().dist_column_indices().to_vec(),
-        Vec::<usize>::new()
-    );
+    // Right side should be broadcast. We will use a singleton table to store the value.
+    assert_matches!(right.distribution(), Distribution::Broadcast);
 
     let mut internal_table_catalog_builder = TableCatalogBuilder::default();
 

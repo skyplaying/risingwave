@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,18 +17,19 @@ use std::pin::pin;
 use anyhow::Context;
 use either::Either;
 use futures::future::select;
-use futures::{future, StreamExt};
+use futures::{StreamExt, future};
 use futures_async_stream::try_stream;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bail;
 use risingwave_common::catalog::ColumnDesc;
 use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::ColumnOrder;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
 use risingwave_storage::StateStore;
+use risingwave_storage::row_serde::value_serde::ValueRowSerde;
 
+use crate::common::table::state_table::ReplicatedStateTable;
 use crate::executor::error::StreamExecutorError;
-use crate::executor::{Barrier, BoxedMessageStream, Executor, Message, MessageStream};
+use crate::executor::{Barrier, BoxedMessageStream, Message, MessageStream};
 
 /// Join side of Lookup Executor's stream
 pub(crate) struct StreamJoinSide {
@@ -53,7 +54,7 @@ impl std::fmt::Debug for StreamJoinSide {
 }
 
 /// Join side of Arrange Executor's stream
-pub(crate) struct ArrangeJoinSide<S: StateStore> {
+pub(crate) struct ArrangeJoinSide<S: StateStore, SD: ValueRowSerde> {
     /// The primary key indices of this side, used for state store
     pub pk_indices: Vec<usize>,
 
@@ -76,7 +77,7 @@ pub(crate) struct ArrangeJoinSide<S: StateStore> {
     /// Whether to join with the arrangement of the current epoch
     pub use_current_epoch: bool,
 
-    pub storage_table: StorageTable<S>,
+    pub state_table: ReplicatedStateTable<S, SD>,
 }
 
 /// Message from the `arrange_join_stream`.
@@ -211,8 +212,11 @@ pub async fn align_barrier(mut left: BoxedMessageStream, mut right: BoxedMessage
 /// * Barrier (prev = `[2`], current = `[3`])
 /// * `[Msg`] Arrangement (batch)
 #[try_stream(ok = ArrangeMessage, error = StreamExecutorError)]
-pub async fn stream_lookup_arrange_prev_epoch(stream: Executor, arrangement: Executor) {
-    let mut input = pin!(align_barrier(stream.execute(), arrangement.execute()));
+pub async fn stream_lookup_arrange_prev_epoch(
+    stream: BoxedMessageStream,
+    arrangement: BoxedMessageStream,
+) {
+    let mut input = pin!(align_barrier(stream, arrangement));
     let mut arrange_buf = vec![];
     let mut stream_side_end = false;
 
@@ -292,8 +296,11 @@ pub async fn stream_lookup_arrange_prev_epoch(stream: Executor, arrangement: Exe
 /// * `[Do`] lookup `a` in arrangement of epoch `[2`] (current epoch)
 /// * Barrier (prev = `[2`], current = `[3`])
 #[try_stream(ok = ArrangeMessage, error = StreamExecutorError)]
-pub async fn stream_lookup_arrange_this_epoch(stream: Executor, arrangement: Executor) {
-    let mut input = pin!(align_barrier(stream.execute(), arrangement.execute()));
+pub async fn stream_lookup_arrange_this_epoch(
+    stream: BoxedMessageStream,
+    arrangement: BoxedMessageStream,
+) {
+    let mut input = pin!(align_barrier(stream, arrangement));
     let mut stream_buf = vec![];
     let mut arrange_buf = vec![];
 
@@ -390,7 +397,7 @@ pub async fn stream_lookup_arrange_this_epoch(stream: Executor, arrangement: Exe
     }
 }
 
-impl<S: StateStore> std::fmt::Debug for ArrangeJoinSide<S> {
+impl<S: StateStore, SD: ValueRowSerde> std::fmt::Debug for ArrangeJoinSide<S, SD> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrangeJoinSide")
             .field("pk_indices", &self.pk_indices)
@@ -410,9 +417,9 @@ mod tests {
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
 
+    use crate::executor::StreamExecutorResult;
     use crate::executor::lookup::sides::stream_lookup_arrange_this_epoch;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::StreamExecutorResult;
 
     #[tokio::test]
     async fn test_stream_lookup_arrange_this_epoch() -> StreamExecutorResult<()> {
@@ -436,7 +443,8 @@ mod tests {
             .stop_on_finish(false)
             .into_executor(schema, vec![1]);
 
-        let mut stream = stream_lookup_arrange_this_epoch(source_l, source_r).boxed();
+        let mut stream =
+            stream_lookup_arrange_this_epoch(source_l.execute(), source_r.execute()).boxed();
 
         // Simulate recovery test
         drop(tx_r);

@@ -5,6 +5,8 @@
 **/*.md
 **/.next
 **/*.json
+pnpm-lock.yaml
 out/
 proto/
 public/monaco/
+next-env.d.ts

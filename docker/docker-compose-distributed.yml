@@ -1,7 +1,6 @@
 ---
-version: "3"
 x-image: &image
-  image: ${RW_IMAGE:-risingwavelabs/risingwave:v1.9.1-rc.2}
+  image: ${RW_IMAGE:-risingwavelabs/risingwave:v3.0.0}
 services:
   compactor-0:
     <<: *image
@@ -136,7 +135,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - bash -c 'printf \"GET / HTTP/1.1\n\n\" > /dev/tcp/127.0.0.1/4566; exit $$?;'
+        - bash -c '> /dev/tcp/127.0.0.1/4566; exit $$?;'
       interval: 1s
       timeout: 5s
       retries: 5
@@ -211,6 +210,7 @@ services:
       RUST_BACKTRACE: "1"
       # If ENABLE_TELEMETRY is not set, telemetry will start by default
       ENABLE_TELEMETRY: ${ENABLE_TELEMETRY:-true}
+      RW_TELEMETRY_TYPE: ${RW_TELEMETRY_TYPE:-"docker-compose"}
     container_name: meta-node-0
     healthcheck:
       test:
@@ -299,7 +299,7 @@ services:
       retries: 5
     restart: always
   message_queue:
-    image: "docker.vectorized.io/vectorized/redpanda:latest"
+    image: "redpandadata/redpanda:latest"
     command:
       - redpanda
       - start

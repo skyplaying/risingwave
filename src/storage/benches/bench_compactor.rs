@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,24 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion};
-use foyer::{CacheContext, HybridCacheBuilder};
+use criterion::{Criterion, criterion_group, criterion_main};
+use foyer::{CacheBuilder, Hint, HybridCacheBuilder};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
 use risingwave_common::config::{MetricLevel, ObjectStoreConfig};
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::DataType;
-use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_common::util::value_encoding::ValueRowSerializer;
+use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_object_store::object::{InMemObjectStore, ObjectStore, ObjectStoreImpl};
-use risingwave_pb::hummock::{compact_task, SstableInfo, TableSchema};
+use risingwave_pb::hummock::{PbSstableFilterLayout, PbTableSchema};
+use risingwave_storage::compaction_catalog_manager::CompactionCatalogAgent;
 use risingwave_storage::hummock::compactor::compactor_runner::compact_and_build_sst;
 use risingwave_storage::hummock::compactor::{
     ConcatSstableIterator, DummyCompactionFilter, TaskConfig, TaskProgress,
@@ -40,6 +43,7 @@ use risingwave_storage::hummock::iterator::{
 use risingwave_storage::hummock::multi_builder::{
     CapacitySplitTableBuilder, LocalTableBuilderFactory,
 };
+use risingwave_storage::hummock::none::NoneRecentFilter;
 use risingwave_storage::hummock::sstable::SstableIteratorReadOptions;
 use risingwave_storage::hummock::sstable_store::SstableStoreRef;
 use risingwave_storage::hummock::value::HummockValue;
@@ -48,24 +52,24 @@ use risingwave_storage::hummock::{
     SstableStoreConfig, SstableWriterOptions, Xor16FilterBuilder,
 };
 use risingwave_storage::monitor::{
-    global_hummock_state_store_metrics, CompactorMetrics, StoreLocalStatistic,
+    CompactorMetrics, StoreLocalStatistic, global_hummock_state_store_metrics,
 };
 
 pub async fn mock_sstable_store() -> SstableStoreRef {
-    let store = InMemObjectStore::new().monitored(
+    let store = InMemObjectStore::for_test().monitored(
         Arc::new(ObjectStoreMetrics::unused()),
         Arc::new(ObjectStoreConfig::default()),
     );
     let store = Arc::new(ObjectStoreImpl::InMem(store));
-    let path = "test".to_string();
-    let meta_cache_v2 = HybridCacheBuilder::new()
+    let path = "test".to_owned();
+    let meta_cache = HybridCacheBuilder::new()
         .memory(64 << 20)
         .with_shards(2)
         .storage()
         .build()
         .await
         .unwrap();
-    let block_cache_v2 = HybridCacheBuilder::new()
+    let block_cache = HybridCacheBuilder::new()
         .memory(128 << 20)
         .with_shards(2)
         .storage()
@@ -78,11 +82,15 @@ pub async fn mock_sstable_store() -> SstableStoreRef {
 
         prefetch_buffer_capacity: 64 << 20,
         max_prefetch_block_number: 16,
-        recent_filter: None,
+        recent_filter: Arc::new(NoneRecentFilter::default().into()),
         state_store_metrics: Arc::new(global_hummock_state_store_metrics(MetricLevel::Disabled)),
+        use_new_object_prefix_strategy: true,
+        skip_bloom_filter_in_serde: false,
 
-        meta_cache_v2,
-        block_cache_v2,
+        meta_cache,
+        block_cache,
+        vector_meta_cache: CacheBuilder::new(1 << 10).build(),
+        vector_block_cache: CacheBuilder::new(1 << 10).build(),
     }))
 }
 
@@ -90,7 +98,7 @@ pub fn default_writer_opts() -> SstableWriterOptions {
     SstableWriterOptions {
         capacity_hint: None,
         tracker: None,
-        policy: CachePolicy::Fill(CacheContext::Default),
+        policy: CachePolicy::Fill(Hint::Normal),
     }
 }
 
@@ -127,11 +135,18 @@ async fn build_table(
         SstableWriterOptions {
             capacity_hint: None,
             tracker: None,
-            policy: CachePolicy::Fill(CacheContext::Default),
+            policy: CachePolicy::Fill(Hint::Normal),
         },
     );
-    let mut builder =
-        SstableBuilder::<_, Xor16FilterBuilder>::for_test(sstable_object_id, writer, opt);
+    let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+    let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+    let mut builder = SstableBuilder::<_, Xor16FilterBuilder>::for_test(
+        sstable_object_id,
+        writer,
+        opt,
+        table_id_to_vnode,
+        table_id_to_watermark_serde,
+    );
     let value = b"1234567890123456789";
     let mut full_key = test_key_of(0, epoch, TableId::new(0));
     let table_key_len = full_key.user_key.table_key.len();
@@ -171,11 +186,20 @@ async fn build_table_2(
         SstableWriterOptions {
             capacity_hint: None,
             tracker: None,
-            policy: CachePolicy::Fill(CacheContext::Default),
+            policy: CachePolicy::Fill(Hint::Normal),
         },
     );
-    let mut builder =
-        SstableBuilder::<_, Xor16FilterBuilder>::for_test(sstable_object_id, writer, opt);
+
+    let table_id_to_vnode = HashMap::from_iter(vec![(table_id, VirtualNode::COUNT_FOR_TEST)]);
+    let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+
+    let mut builder = SstableBuilder::<_, Xor16FilterBuilder>::for_test(
+        sstable_object_id,
+        writer,
+        opt,
+        table_id_to_vnode,
+        table_id_to_watermark_serde,
+    );
     let mut full_key = test_key_of(0, epoch, TableId::new(table_id));
     let table_key_len = full_key.user_key.table_key.len();
 
@@ -214,7 +238,7 @@ async fn scan_all_table(info: &SstableInfo, sstable_store: SstableStoreRef) {
     let default_read_options = Arc::new(SstableIteratorReadOptions::default());
     // warm up to make them all in memory. I do not use CachePolicy::Fill because it will fetch
     // block from meta.
-    let mut iter = SstableIterator::new(table, sstable_store.clone(), default_read_options);
+    let mut iter = SstableIterator::new(table, sstable_store.clone(), default_read_options, info);
     iter.rewind().await.unwrap();
     while iter.is_valid() {
         iter.next().await.unwrap();
@@ -270,18 +294,20 @@ async fn compact<I: HummockIterator<Direction = Forward>>(
         bloom_false_positive: 0.001,
         ..Default::default()
     };
-    let mut builder =
-        CapacitySplitTableBuilder::for_test(LocalTableBuilderFactory::new(32, sstable_store, opt));
+    let compaction_catalog_agent_ref = CompactionCatalogAgent::for_test(vec![0]);
+    let mut builder = CapacitySplitTableBuilder::for_test(
+        LocalTableBuilderFactory::new(32, sstable_store, opt),
+        compaction_catalog_agent_ref,
+    );
 
-    let task_config = task_config.unwrap_or_else(|| TaskConfig {
-        key_range: KeyRange::inf(),
-        cache_policy: CachePolicy::Disable,
-        gc_delete_keys: false,
-        watermark: 0,
-        stats_target_table_ids: None,
-        task_type: compact_task::TaskType::Dynamic,
-        use_block_based_filter: true,
-        ..Default::default()
+    let task_config = task_config.unwrap_or_else(|| {
+        TaskConfig::for_test(
+            KeyRange::inf(),
+            CachePolicy::Disable,
+            false,
+            PbSstableFilterLayout::Blocked,
+            HashMap::new(),
+        )
     });
     compact_and_build_sst(
         &mut builder,
@@ -327,10 +353,10 @@ fn bench_merge_iterator_compactor(c: &mut Criterion) {
     });
     let level2 = vec![info1, info2];
     let read_options = Arc::new(SstableIteratorReadOptions {
-        cache_policy: CachePolicy::Fill(CacheContext::Default),
-        prefetch_for_large_query: false,
-        must_iterated_end_user_key: None,
-        max_preload_retry_times: 0,
+        cache_policy: CachePolicy::Fill(Hint::Normal),
+        read_table_id: None,
+        scan_end_user_key: None,
+        prefetch: false,
     });
     c.bench_function("bench_union_merge_iterator", |b| {
         b.to_async(FuturesExecutor).iter(|| {
@@ -347,7 +373,6 @@ fn bench_merge_iterator_compactor(c: &mut Criterion) {
         b.to_async(&runtime).iter(|| {
             let sub_iters = vec![
                 ConcatSstableIterator::new(
-                    vec![0],
                     level1.clone(),
                     KeyRange::inf(),
                     sstable_store.clone(),
@@ -355,7 +380,6 @@ fn bench_merge_iterator_compactor(c: &mut Criterion) {
                     0,
                 ),
                 ConcatSstableIterator::new(
-                    vec![0],
                     level2.clone(),
                     KeyRange::inf(),
                     sstable_store.clone(),
@@ -425,50 +449,59 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
     });
     let level2 = vec![info1, info2];
 
-    let task_config_no_schema = TaskConfig {
-        key_range: KeyRange::inf(),
-        cache_policy: CachePolicy::Disable,
-        gc_delete_keys: false,
-        watermark: 0,
-        stats_target_table_ids: None,
-        task_type: compact_task::TaskType::Dynamic,
-        use_block_based_filter: true,
-        table_schemas: vec![].into_iter().collect(),
-        ..Default::default()
-    };
-
-    let mut task_config_schema = task_config_no_schema.clone();
-    task_config_schema.table_schemas.insert(
-        10,
-        TableSchema {
-            column_ids: (0..column_num as i32).collect(),
-        },
-    );
-    task_config_schema.table_schemas.insert(
-        11,
-        TableSchema {
-            column_ids: (0..column_num as i32).collect(),
-        },
+    let task_config_no_schema = TaskConfig::for_test(
+        KeyRange::inf(),
+        CachePolicy::Disable,
+        false,
+        PbSstableFilterLayout::Blocked,
+        HashMap::new(),
     );
 
-    let mut task_config_schema_cause_drop = task_config_no_schema.clone();
-    task_config_schema_cause_drop.table_schemas.insert(
-        10,
-        TableSchema {
-            column_ids: (0..column_num as i32 / 2).collect(),
-        },
+    let task_config_schema = TaskConfig::for_test(
+        KeyRange::inf(),
+        CachePolicy::Disable,
+        false,
+        PbSstableFilterLayout::Blocked,
+        HashMap::from([
+            (
+                10.into(),
+                PbTableSchema {
+                    column_ids: (0..column_num as i32).collect(),
+                },
+            ),
+            (
+                11.into(),
+                PbTableSchema {
+                    column_ids: (0..column_num as i32).collect(),
+                },
+            ),
+        ]),
     );
-    task_config_schema_cause_drop.table_schemas.insert(
-        11,
-        TableSchema {
-            column_ids: (0..column_num as i32 / 2).collect(),
-        },
+
+    let task_config_schema_cause_drop = TaskConfig::for_test(
+        KeyRange::inf(),
+        CachePolicy::Disable,
+        false,
+        PbSstableFilterLayout::Blocked,
+        HashMap::from([
+            (
+                10.into(),
+                PbTableSchema {
+                    column_ids: (0..column_num as i32 / 2).collect(),
+                },
+            ),
+            (
+                11.into(),
+                PbTableSchema {
+                    column_ids: (0..column_num as i32 / 2).collect(),
+                },
+            ),
+        ]),
     );
 
     let get_iter = || {
         let sub_iters = vec![
             ConcatSstableIterator::new(
-                vec![10, 11],
                 level1.clone(),
                 KeyRange::inf(),
                 sstable_store.clone(),
@@ -476,7 +509,6 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
                 0,
             ),
             ConcatSstableIterator::new(
-                vec![10, 11],
                 level2.clone(),
                 KeyRange::inf(),
                 sstable_store.clone(),
@@ -517,8 +549,9 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
             b.to_async(&runtime).iter(|| {
                 let iter = get_iter();
                 let sstable_store1 = sstable_store.clone();
-                let mut task_config_clone = task_config_schema.clone();
-                task_config_clone.disable_drop_column_optimization = true;
+                let task_config_clone = task_config_schema
+                    .clone()
+                    .with_disable_drop_column_optimization(true);
                 async move { compact(iter, sstable_store1, Some(task_config_clone)).await }
             });
         },

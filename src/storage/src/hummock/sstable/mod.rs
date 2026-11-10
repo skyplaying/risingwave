@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,18 +18,17 @@
 mod block;
 
 use std::collections::HashSet;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Formatter};
 use std::ops::{BitXor, Bound, Range};
 
 pub use block::*;
 mod block_iterator;
 pub use block_iterator::*;
-mod bloom;
 mod xor_filter;
-pub use bloom::BloomFilterBuilder;
 use serde::{Deserialize, Serialize};
 pub use xor_filter::{
-    BlockedXor16FilterBuilder, Xor16FilterBuilder, Xor8FilterBuilder, XorFilterReader,
+    BlockedXor8FilterBuilder, BlockedXor16FilterBuilder, Xor8FilterBuilder, Xor16FilterBuilder,
+    XorFilterReader,
 };
 pub mod builder;
 pub use builder::*;
@@ -43,27 +42,20 @@ pub use forward_sstable_iterator::*;
 use tracing::warn;
 mod backward_sstable_iterator;
 pub use backward_sstable_iterator::*;
-use risingwave_hummock_sdk::key::{
-    FullKey, KeyPayloadType, PointRange, TableKey, UserKey, UserKeyRangeRef,
-};
+use risingwave_hummock_sdk::key::{FullKey, KeyPayloadType, UserKey, UserKeyRangeRef};
 use risingwave_hummock_sdk::{HummockEpoch, HummockSstableObjectId};
 
-mod delete_range_aggregator;
 mod filter;
-mod sstable_object_id_manager;
 mod utils;
 
-pub use delete_range_aggregator::{
-    get_min_delete_range_epoch_from_sstable, CompactionDeleteRangeIterator,
-    SstableDeleteRangeIterator,
+pub use filter::{
+    DEFAULT_FILTER_HASH_PREALLOC_KEY_COUNT_CAP, FilterBuilder, FilterBuilderOptions,
+    NoneFilterBuilder,
 };
-pub use filter::FilterBuilder;
-pub use sstable_object_id_manager::*;
-pub use utils::CompressionAlgorithm;
+pub use utils::{CompressionAlgorithm, xxhash64_checksum, xxhash64_verify};
 use utils::{get_length_prefixed_slice, put_length_prefixed_slice};
-use xxhash_rust::{xxh32, xxh64};
+use xxhash_rust::xxh64;
 
-use self::utils::{xxhash64_checksum, xxhash64_verify};
 use super::{HummockError, HummockResult};
 use crate::hummock::CachePolicy;
 use crate::store::ReadOptions;
@@ -71,69 +63,6 @@ use crate::store::ReadOptions;
 const MAGIC: u32 = 0x5785ab73;
 const OLD_VERSION: u32 = 1;
 const VERSION: u32 = 2;
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-// delete keys located in [start_user_key, end_user_key)
-pub struct DeleteRangeTombstone {
-    pub start_user_key: PointRange<Vec<u8>>,
-    pub end_user_key: PointRange<Vec<u8>>,
-    pub sequence: HummockEpoch,
-}
-
-impl PartialOrd for DeleteRangeTombstone {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DeleteRangeTombstone {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start_user_key
-            .cmp(&other.start_user_key)
-            .then_with(|| self.end_user_key.cmp(&other.end_user_key))
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl DeleteRangeTombstone {
-    pub fn new(
-        table_id: TableId,
-        start_table_key: Vec<u8>,
-        is_left_open: bool,
-        end_table_key: Vec<u8>,
-        is_right_close: bool,
-        sequence: HummockEpoch,
-    ) -> Self {
-        Self {
-            start_user_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(start_table_key)),
-                is_left_open,
-            ),
-            end_user_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(end_table_key)),
-                is_right_close,
-            ),
-            sequence,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new_for_test(
-        table_id: TableId,
-        start_table_key: Vec<u8>,
-        end_table_key: Vec<u8>,
-        sequence: HummockEpoch,
-    ) -> Self {
-        Self::new(
-            table_id,
-            start_table_key,
-            false,
-            end_table_key,
-            false,
-            sequence,
-        )
-    }
-}
 
 /// Assume that watermark1 is 5, watermark2 is 7, watermark3 is 11, delete ranges
 /// `{ [0, wmk1) in epoch1, [wmk1, wmk2) in epoch2, [wmk2, wmk3) in epoch3 }`
@@ -148,24 +77,14 @@ impl DeleteRangeTombstone {
 /// next event key wmk2 (7) (not inclusive).
 /// If there is no range deletes between current event key and next event key, `new_epoch` will be
 /// `HummockEpoch::MAX`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MonotonicDeleteEvent {
-    pub event_key: PointRange<Vec<u8>>,
+    pub event_key:
+        risingwave_hummock_sdk::key::range_delete_backward_compatibility_serde_struct::PointRange,
     pub new_epoch: HummockEpoch,
 }
 
 impl MonotonicDeleteEvent {
-    #[cfg(test)]
-    pub fn new(table_id: TableId, event_key: Vec<u8>, new_epoch: HummockEpoch) -> Self {
-        Self {
-            event_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(event_key)),
-                false,
-            ),
-            new_epoch,
-        }
-    }
-
     pub fn encode(&self, mut buf: impl BufMut) {
         self.event_key
             .left_user_key
@@ -179,6 +98,7 @@ impl MonotonicDeleteEvent {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Self {
+        use risingwave_hummock_sdk::key::range_delete_backward_compatibility_serde_struct::*;
         let user_key = UserKey::decode_length_prefixed(buf);
         let exclude_left_key_flag = buf.get_u8();
         let is_exclude_left_key = match exclude_left_key_flag {
@@ -188,25 +108,12 @@ impl MonotonicDeleteEvent {
         };
         let new_epoch = buf.get_u64_le();
         Self {
-            event_key: PointRange::from_user_key(user_key, is_exclude_left_key),
+            event_key: PointRange {
+                left_user_key: user_key,
+                is_exclude_left_key,
+            },
             new_epoch,
         }
-    }
-
-    #[inline]
-    pub fn encoded_size(&self) -> usize {
-        // length prefixed requires 4B more than its `encoded_len()`
-        4 + self.event_key.left_user_key.encoded_len() + 1 + 8
-    }
-}
-
-impl Display for MonotonicDeleteEvent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Event key {:?} epoch {:?}",
-            self.event_key, self.new_epoch
-        )
     }
 }
 
@@ -218,18 +125,41 @@ struct SerdeSstable {
 
 impl From<SerdeSstable> for Sstable {
     fn from(SerdeSstable { id, meta }: SerdeSstable) -> Self {
-        Sstable::new(id, meta)
+        // Set skip_bloom_filter_in_serde to false because the behavior
+        // is determined by the serializer
+        Sstable::new(id, meta, false)
     }
 }
 
 /// [`Sstable`] is a handle for accessing SST.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(from = "SerdeSstable")]
 pub struct Sstable {
     pub id: HummockSstableObjectId,
     pub meta: SstableMeta,
     #[serde(skip)]
     pub filter_reader: XorFilterReader,
+    /// SST serde happens when an SST meta is written to meta disk cache.
+    /// Excluding the SST filter from serde can reduce the meta disk cache entry size
+    /// and reduce disk IO throughput at the cost of making the SST filter useless.
+    #[serde(skip)]
+    skip_bloom_filter_in_serde: bool,
+}
+
+impl Serialize for Sstable {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut serde_sstable = SerdeSstable {
+            id: self.id,
+            meta: self.meta.clone(),
+        };
+        if !self.skip_bloom_filter_in_serde {
+            serde_sstable.meta.bloom_filter = self.filter_reader.encode_to_bytes();
+        }
+        serde_sstable.serialize(serializer)
+    }
 }
 
 impl Debug for Sstable {
@@ -242,18 +172,38 @@ impl Debug for Sstable {
 }
 
 impl Sstable {
-    pub fn new(id: HummockSstableObjectId, mut meta: SstableMeta) -> Self {
+    pub fn new(
+        id: HummockSstableObjectId,
+        mut meta: SstableMeta,
+        skip_bloom_filter_in_serde: bool,
+    ) -> Self {
         let filter_data = std::mem::take(&mut meta.bloom_filter);
         let filter_reader = XorFilterReader::new(&filter_data, &meta.block_metas);
         Self {
             id,
             meta,
             filter_reader,
+            skip_bloom_filter_in_serde,
         }
     }
 
+    /// Restore an SST handle directly from native metadata bytes.
+    pub fn from_meta_bytes(
+        id: HummockSstableObjectId,
+        bytes: &[u8],
+        skip_bloom_filter_in_serde: bool,
+    ) -> HummockResult<Self> {
+        let (meta, filter_reader) = SstableMeta::decode_with_filter(bytes, XorFilterReader::new)?;
+        Ok(Self {
+            id,
+            meta,
+            filter_reader,
+            skip_bloom_filter_in_serde,
+        })
+    }
+
     #[inline(always)]
-    pub fn has_bloom_filter(&self) -> bool {
+    pub fn has_filter(&self) -> bool {
         !self.filter_reader.is_empty()
     }
 
@@ -266,14 +216,7 @@ impl Sstable {
     }
 
     #[inline(always)]
-    pub fn hash_for_bloom_filter_u32(dist_key: &[u8], table_id: u32) -> u32 {
-        let dist_key_hash = xxh32::xxh32(dist_key, 0);
-        // congyi adds this because he aims to dedup keys in different tables
-        table_id.bitxor(dist_key_hash)
-    }
-
-    #[inline(always)]
-    pub fn hash_for_bloom_filter(dist_key: &[u8], table_id: u32) -> u64 {
+    pub fn hash_for_filter(dist_key: &[u8], table_id: u32) -> u64 {
         let dist_key_hash = xxh64::xxh64(dist_key, 0);
         // congyi adds this because he aims to dedup keys in different tables
         (table_id as u64).bitxor(dist_key_hash)
@@ -281,7 +224,8 @@ impl Sstable {
 
     #[inline(always)]
     pub fn may_match_hash(&self, user_key_range: &UserKeyRangeRef<'_>, hash: u64) -> bool {
-        self.filter_reader.may_match(user_key_range, hash)
+        self.filter_reader
+            .may_match(&self.meta.block_metas, user_key_range, hash)
     }
 
     #[inline(always)]
@@ -290,13 +234,31 @@ impl Sstable {
     }
 
     #[inline(always)]
-    pub fn estimate_size(&self) -> usize {
-        8 /* id */ + self.filter_reader.estimate_size() + self.meta.encoded_size()
+    pub fn estimated_meta_cache_memory_weight(&self) -> usize {
+        // This is for foyer's in-memory cache weighter. The disk tier uses foyer `Code`
+        // serialization and `estimated_size` instead.
+        std::mem::size_of::<Self>()
+            + self.meta.estimated_heap_size()
+            + self.filter_reader.estimated_heap_size()
+    }
+
+    /// Size of the meta disk-cache value, without cloning metadata or encoding its filter.
+    pub(crate) fn serde_encoded_size(&self) -> usize {
+        // Bincode's default format encodes a struct like a tuple and uses a fixed-width
+        // length prefix for byte vectors. Replacing the bloom payload changes only its
+        // byte count. Keep sizing the other fields through serde as the format evolves.
+        let size = bincode::serialized_size(&(self.id, &self.meta)).unwrap() as usize;
+        if self.skip_bloom_filter_in_serde {
+            size
+        } else {
+            size - self.meta.bloom_filter.len() + self.filter_reader.serialized_len()
+        }
     }
 }
 
 #[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockMeta {
+    #[serde(with = "serde_bytes")]
     pub smallest_key: Vec<u8>,
     pub offset: u32,
     pub len: u32,
@@ -363,15 +325,22 @@ impl BlockMeta {
     pub fn table_id(&self) -> TableId {
         FullKey::decode(&self.smallest_key).user_key.table_id
     }
+
+    fn estimated_heap_size(&self) -> usize {
+        self.smallest_key.capacity()
+    }
 }
 
 #[derive(Default, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SstableMeta {
     pub block_metas: Vec<BlockMeta>,
+    #[serde(with = "serde_bytes")]
     pub bloom_filter: Vec<u8>,
     pub estimated_size: u32,
     pub key_count: u32,
+    #[serde(with = "serde_bytes")]
     pub smallest_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub largest_key: Vec<u8>,
     pub meta_offset: u64,
     /// Assume that watermark1 is 5, watermark2 is 7, watermark3 is 11, delete ranges
@@ -387,6 +356,7 @@ pub struct SstableMeta {
     /// key wmk1 (5) and till the next event key wmk2 (7) (not inclusive).
     /// If there is no range deletes between current event key and next event key, `new_epoch` will
     /// be `HummockEpoch::MAX`.
+    #[deprecated]
     pub monotonic_tombstone_events: Vec<MonotonicDeleteEvent>,
     /// Format version, for further compatibility.
     pub version: u32,
@@ -398,7 +368,7 @@ impl SstableMeta {
     /// ```plain
     /// | N (4B) |
     /// | block meta 0 | ... | block meta N-1 |
-    /// | bloom filter len (4B) | bloom filter |
+    /// | SST filter len (4B) | SST filter |
     /// | estimated size (4B) | key count (4B) |
     /// | smallest key len (4B) | smallest key |
     /// | largest key len (4B) | largest key |
@@ -435,6 +405,7 @@ impl SstableMeta {
         buf.put_u32_le(self.key_count);
         put_length_prefixed_slice(&mut buf, &self.smallest_key);
         put_length_prefixed_slice(&mut buf, &self.largest_key);
+        #[expect(deprecated)]
         buf.put_u32_le(
             utils::checked_into_u32(self.monotonic_tombstone_events.len()).unwrap_or_else(|_| {
                 let tmp_full_key = FullKey::decode(&self.smallest_key);
@@ -445,6 +416,7 @@ impl SstableMeta {
                 )
             }),
         );
+        #[expect(deprecated)]
         for monotonic_tombstone_event in &self.monotonic_tombstone_events {
             monotonic_tombstone_event.encode(&mut buf);
         }
@@ -459,6 +431,15 @@ impl SstableMeta {
     }
 
     pub fn decode(buf: &[u8]) -> HummockResult<Self> {
+        let (mut meta, bloom_filter) = Self::decode_with_filter(buf, |data, _| data.to_vec())?;
+        meta.bloom_filter = bloom_filter;
+        Ok(meta)
+    }
+
+    fn decode_with_filter<F>(
+        buf: &[u8],
+        restore_filter: impl FnOnce(&[u8], &[BlockMeta]) -> F,
+    ) -> HummockResult<(Self, F)> {
         let mut cursor = buf.len();
 
         cursor -= 4;
@@ -490,7 +471,9 @@ impl SstableMeta {
             }
         }
 
-        let bloom_filter = get_length_prefixed_slice(buf);
+        let filter_len = buf.get_u32_le() as usize;
+        let filter_data = &buf[..filter_len];
+        buf.advance(filter_len);
         let estimated_size = buf.get_u32_le();
         let key_count = buf.get_u32_le();
         let smallest_key = get_length_prefixed_slice(buf);
@@ -513,9 +496,11 @@ impl SstableMeta {
                 "read non-empty range tombstones");
         }
 
-        Ok(Self {
+        let filter = restore_filter(filter_data, &block_metas);
+        #[expect(deprecated)]
+        let meta = Self {
             block_metas,
-            bloom_filter,
+            bloom_filter: Vec::new(),
             estimated_size,
             key_count,
             smallest_key,
@@ -523,7 +508,8 @@ impl SstableMeta {
             meta_offset,
             monotonic_tombstone_events,
             version,
-        })
+        };
+        Ok((meta, filter))
     }
 
     #[inline]
@@ -535,12 +521,7 @@ impl SstableMeta {
             .map(|block_meta| block_meta.encoded_size())
             .sum::<usize>()
             + 4 // monotonic tombstone events len
-            + self
-            .monotonic_tombstone_events
-            .iter()
-            .map(|event| event.encoded_size())
-            .sum::<usize>()
-            + 4 // bloom filter len
+            + 4 // SST filter len
             + self.bloom_filter.len()
             + 4 // estimated size
             + 4 // key count
@@ -553,23 +534,48 @@ impl SstableMeta {
             + 4 // version
             + 4 // magic
     }
+
+    #[expect(
+        deprecated,
+        reason = "monotonic_tombstone_events is deprecated but still contributes to decoded meta heap size"
+    )]
+    fn estimated_heap_size(&self) -> usize {
+        self.block_metas.capacity() * std::mem::size_of::<BlockMeta>()
+            + self
+                .block_metas
+                .iter()
+                .map(BlockMeta::estimated_heap_size)
+                .sum::<usize>()
+            + self.bloom_filter.capacity()
+            + self.smallest_key.capacity()
+            + self.largest_key.capacity()
+            + self.monotonic_tombstone_events.capacity()
+                * std::mem::size_of::<MonotonicDeleteEvent>()
+    }
 }
 
 #[derive(Default)]
 pub struct SstableIteratorReadOptions {
     pub cache_policy: CachePolicy,
-    pub must_iterated_end_user_key: Option<Bound<UserKey<KeyPayloadType>>>,
-    pub max_preload_retry_times: usize,
-    pub prefetch_for_large_query: bool,
+    /// The table being read by the state-store request. When present in the SST's table IDs,
+    /// SST iterators can avoid blocks for other tables colocated in the same physical SST.
+    /// Otherwise, they use the SST's full table ID range.
+    pub read_table_id: Option<TableId>,
+    /// The only hard upper bound of this scan. It limits the iterator's block window.
+    pub scan_end_user_key: Option<Bound<UserKey<KeyPayloadType>>>,
+    /// Whether to prefetch blocks within the already-bounded scan window.
+    pub prefetch: bool,
 }
 
 impl SstableIteratorReadOptions {
+    /// Builds options with prefetch disabled. Range scans enable it explicitly after setting the
+    /// scan bound, while point gets retain the default to avoid creating a prefetch stream.
     pub fn from_read_options(read_options: &ReadOptions) -> Self {
         Self {
             cache_policy: read_options.cache_policy,
-            must_iterated_end_user_key: None,
-            max_preload_retry_times: 0,
-            prefetch_for_large_query: read_options.prefetch_options.for_large_query,
+            read_table_id: None,
+            scan_end_user_key: None,
+            prefetch: false,
         }
     }
 }
@@ -577,14 +583,28 @@ impl SstableIteratorReadOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hummock::HummockValue;
     use crate::hummock::iterator::test_utils::{
         default_builder_opt_for_test, iterator_test_key_of,
     };
     use crate::hummock::test_utils::gen_test_sstable_data;
-    use crate::hummock::HummockValue;
+    use crate::store::PrefetchOptions;
+
+    #[test]
+    fn test_iterator_read_options_do_not_enable_prefetch_for_point_get() {
+        let read_options = ReadOptions {
+            prefetch_options: PrefetchOptions::prefetch_for_large_range_scan(),
+            ..Default::default()
+        };
+
+        let iterator_options = SstableIteratorReadOptions::from_read_options(&read_options);
+        assert!(!iterator_options.prefetch);
+        assert!(iterator_options.scan_end_user_key.is_none());
+    }
 
     #[test]
     fn test_sstable_meta_enc_dec() {
+        #[expect(deprecated)]
         let meta = SstableMeta {
             block_metas: vec![
                 BlockMeta {
@@ -614,11 +634,46 @@ mod tests {
         let decoded_meta = SstableMeta::decode(&buf[..]).unwrap();
         assert_eq!(decoded_meta, meta);
 
-        println!("buf: {}", buf.len());
+        // Bincode encodes structs like tuples. Plain Vec<u8> fields here reproduce the
+        // meta disk-cache format before serde_bytes, including nested block metadata.
+        let legacy_block_metas: Vec<_> = meta
+            .block_metas
+            .iter()
+            .map(|block| {
+                (
+                    &block.smallest_key,
+                    block.offset,
+                    block.len,
+                    block.uncompressed_size,
+                    block.total_key_count,
+                    block.stale_key_count,
+                )
+            })
+            .collect();
+        #[expect(deprecated)]
+        let legacy_meta = (
+            legacy_block_metas,
+            &meta.bloom_filter,
+            meta.estimated_size,
+            meta.key_count,
+            &meta.smallest_key,
+            &meta.largest_key,
+            meta.meta_offset,
+            &meta.monotonic_tombstone_events,
+            meta.version,
+        );
+        let legacy_bytes = bincode::serialize(&legacy_meta).unwrap();
+        assert_eq!(bincode::serialize(&meta).unwrap(), legacy_bytes);
+        let decoded_meta: SstableMeta = bincode::deserialize_from(&mut &legacy_bytes[..]).unwrap();
+        assert_eq!(decoded_meta, meta);
     }
 
     #[tokio::test]
     async fn test_sstable_serde() {
+        use foyer::Code;
+
+        use crate::hummock::SstableMetaCacheValue;
+
         let (_, meta) = gen_test_sstable_data(
             default_builder_opt_for_test(),
             (0..100).clone().map(|x| {
@@ -630,12 +685,59 @@ mod tests {
         )
         .await;
 
-        let buffer = bincode::serialize(&meta).unwrap();
+        for skip_filter in [false, true] {
+            let sstable = Sstable::new(42.into(), meta.clone(), skip_filter);
+            let legacy_bytes = bincode::serialize(&sstable).unwrap();
+            let value = SstableMetaCacheValue::from(sstable);
+            let mut bytes = Vec::new();
+            value.encode(&mut bytes).unwrap();
 
-        let m: SstableMeta = bincode::deserialize(&buffer).unwrap();
+            assert_eq!(bytes, legacy_bytes);
+            assert_eq!(value.estimated_size(), bytes.len());
 
-        assert_eq!(meta, m);
+            let decoded = SstableMetaCacheValue::decode(&mut legacy_bytes.as_slice()).unwrap();
+            assert_eq!(decoded.id, value.id);
+            assert_eq!(decoded.meta, value.meta);
+            assert!(value.has_filter());
+            if skip_filter {
+                assert!(!decoded.has_filter());
+            } else {
+                assert_eq!(
+                    decoded.filter_reader.encode_to_bytes(),
+                    value.filter_reader.encode_to_bytes()
+                );
+            }
+        }
+    }
 
-        println!("{} vs {}", buffer.len(), meta.encoded_size());
+    #[tokio::test]
+    async fn test_sstable_from_meta_bytes() {
+        let (_, meta) = gen_test_sstable_data(
+            default_builder_opt_for_test(),
+            (0..100).map(|x| (iterator_test_key_of(x), HummockValue::put(vec![42]))),
+        )
+        .await;
+        let bytes = meta.encode_to_bytes();
+        for skip in [false, true] {
+            let expected = Sstable::new(42.into(), meta.clone(), skip);
+            let restored = {
+                let temporary = bytes.clone();
+                Sstable::from_meta_bytes(42.into(), &temporary, skip).unwrap()
+            };
+            assert_eq!(restored.id, expected.id);
+            assert_eq!(restored.meta, expected.meta);
+            assert_eq!(
+                restored.filter_reader.encode_to_bytes(),
+                expected.filter_reader.encode_to_bytes()
+            );
+            assert_eq!(
+                bincode::serialize(&restored).unwrap(),
+                bincode::serialize(&expected).unwrap()
+            );
+        }
+        let mut corrupt = bytes;
+        corrupt[0] ^= 1;
+        assert!(SstableMeta::decode(&corrupt).is_err());
+        assert!(Sstable::from_meta_bytes(42.into(), &corrupt, false).is_err());
     }
 }

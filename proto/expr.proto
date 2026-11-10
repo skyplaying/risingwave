@@ -4,9 +4,17 @@ package expr;
 
 import "common.proto";
 import "data.proto";
+import "secret.proto";
 
 option java_package = "com.risingwave.proto";
 option optimize_for = SPEED;
+
+// A reference to a secret, resolved at runtime via LocalSecretManager.
+// Only secret_id is serialized — the actual value never appears in plans.
+message SecretRefNode {
+  uint32 secret_id = 1;
+  secret.SecretRef.RefAsType ref_as = 2;
+}
 
 message ExprNode {
   message NowRexNode {}
@@ -56,6 +64,7 @@ message ExprNode {
     MAKE_DATE = 113;
     MAKE_TIME = 114;
     MAKE_TIMESTAMP = 115;
+    DATE_BIN = 116;
     // From f64 to timestamp.
     // e.g. `select to_timestamp(1672044740.0)`
     SEC_TO_TIMESTAMPTZ = 104;
@@ -107,6 +116,7 @@ message ExprNode {
     CHAR_LENGTH = 225;
     REPEAT = 226;
     CONCAT_OP = 227;
+    BYTEA_CONCAT_OP = 290;
     CONCAT = 286;
     CONCAT_VARIADIC = 287;
     // BOOL_OUT is different from CAST-bool-to-varchar in PostgreSQL.
@@ -154,7 +164,9 @@ message ExprNode {
     ACOSH = 265;
     ATANH = 266;
     SINH = 267;
-    // skips 268,269,270 so that acosd, atand, atan2d are close to others
+    ACOSD = 268;
+    ATAND = 269;
+    ATAN2D = 270;
     TRUNC = 271;
     LN = 272;
     LOG10 = 273;
@@ -163,6 +175,8 @@ message ExprNode {
     SCALE = 276;
     MIN_SCALE = 277;
     TRIM_SCALE = 278;
+    GAMMA = 288;
+    LGAMMA = 289;
 
     // Boolean comparison
     IS_TRUE = 301;
@@ -196,6 +210,18 @@ message ExprNode {
     INET_NTOA = 329;
     QUOTE_LITERAL = 330;
     QUOTE_NULLABLE = 331;
+    HMAC = 332;
+    SECURE_COMPARE = 333;
+    GET_BIT = 334;
+    GET_BYTE = 335;
+    SET_BIT = 336;
+    SET_BYTE = 337;
+    BIT_COUNT = 338;
+    CRC32 = 339;
+    CRC32C = 340;
+
+    // Constraints Check
+    CHECK_NOT_NULL = 350;
 
     // Unary operators
     NEG = 401;
@@ -229,6 +255,9 @@ message ExprNode {
     ARRAY_SORT = 549;
     ARRAY_CONTAINS = 550;
     ARRAY_CONTAINED = 551;
+    ARRAY_FLATTEN = 552;
+    ARRAY_REVERSE = 553;
+    ARRAY_OVERLAPS = 554;
 
     // Int256 functions
     HEX_TO_INT256 = 560;
@@ -280,16 +309,58 @@ message ExprNode {
     JSONB_PATH_QUERY_FIRST = 623;
     JSONB_POPULATE_RECORD = 629;
     JSONB_TO_RECORD = 630;
+    JSONB_SET = 631;
+    JSONB_POPULATE_MAP = 632;
+    JSONB_TO_ARRAY = 633;
+
+    // Variant functions
+    TO_VARIANT = 641;
+    VARIANT_GET = 642;
+    TRY_VARIANT_GET = 643;
+    VARIANT_TYPEOF = 644;
+
+    // Map functions
+    MAP_FROM_ENTRIES = 700;
+    MAP_ACCESS = 701;
+    MAP_KEYS = 702;
+    MAP_VALUES = 703;
+    MAP_ENTRIES = 704;
+    MAP_FROM_KEY_VALUES = 705;
+    MAP_LENGTH = 706;
+    MAP_CONTAINS = 707;
+    MAP_CAT = 708;
+    MAP_INSERT = 709;
+    MAP_DELETE = 710;
+    MAP_FILTER = 711;
+
+    // Vector functions
+    L2_DISTANCE = 750;
+    COSINE_DISTANCE = 751;
+    L1_DISTANCE = 752;
+    INNER_PRODUCT = 753;
+    VEC_CONCAT = 754;
+    L2_NORM = 755;
+    L2_NORMALIZE = 756;
+    SUBVECTOR = 757;
+
+    // Internal function for schema change
+    COMPOSITE_CAST = 800;
 
     // Non-pure functions below (> 1000)
     // ------------------------
     // Internal functions
     VNODE = 1101;
+    TEST_FEATURE = 1102;
+    VNODE_USER = 1103;
+    LICENSE = 1104;
     // Non-deterministic functions
     PROCTIME = 2023;
     PG_SLEEP = 2024;
     PG_SLEEP_FOR = 2025;
     PG_SLEEP_UNTIL = 2026;
+    RANDOM = 2027;
+    CLOCK_TIMESTAMP = 2028;
+    GEN_RANDOM_UUID = 2029;
 
     // System administration functions
     CAST_REGCLASS = 2100;
@@ -301,12 +372,25 @@ message ExprNode {
     PG_INDEXES_SIZE = 2404;
     PG_RELATION_SIZE = 2405;
     PG_GET_SERIAL_SEQUENCE = 2406;
+    PG_INDEX_COLUMN_HAS_PROPERTY = 2410;
     HAS_TABLE_PRIVILEGE = 2407;
     HAS_ANY_COLUMN_PRIVILEGE = 2408;
     HAS_SCHEMA_PRIVILEGE = 2409;
+    PG_IS_IN_RECOVERY = 2411;
+    RW_RECOVERY_STATUS = 2412;
+    RW_EPOCH_TO_TS = 2413;
+    PG_TABLE_IS_VISIBLE = 2414;
+    HAS_FUNCTION_PRIVILEGE = 2415;
+    HAS_DATABASE_PRIVILEGE = 2416;
+    RW_CLUSTER_ID = 2417;
+    RW_FRAGMENT_VNODES = 2418;
+    RW_ACTOR_VNODES = 2419;
 
     // EXTERNAL
     ICEBERG_TRANSFORM = 2201;
+
+    // AI model functions
+    OPENAI_EMBEDDING = 2501;
   }
   // Only use this field for function call. For other types of expression, it should be UNSPECIFIED.
   Type function_type = 1;
@@ -317,6 +401,7 @@ message ExprNode {
     FunctionCall func_call = 6;
     UserDefinedFunction udf = 7;
     NowRexNode now = 8;
+    SecretRefNode secret_ref = 9;
   }
 }
 
@@ -340,6 +425,20 @@ message TableFunction {
     JSONB_PATH_QUERY = 15;
     JSONB_POPULATE_RECORDSET = 16;
     JSONB_TO_RECORDSET = 17;
+    // file scan
+    FILE_SCAN = 19;
+    // postgres query
+    POSTGRES_QUERY = 20;
+    // mysql query
+    MYSQL_QUERY = 21;
+    // mssql query
+    MSSQL_QUERY = 22;
+    // Internal backfill table function
+    INTERNAL_BACKFILL_PROGRESS = 30;
+    // Internal source backfill table function
+    INTERNAL_SOURCE_BACKFILL_PROGRESS = 31;
+    // Internal channel delta stats table function
+    INTERNAL_GET_CHANNEL_DELTA_STATS = 32;
     // User defined table function
     USER_DEFINED = 100;
   }
@@ -400,7 +499,7 @@ message FunctionCall {
 
 // Aggregate Function Calls for Aggregation
 message AggCall {
-  enum Type {
+  enum Kind {
     UNSPECIFIED = 0;
     SUM = 1;
     MIN = 2;
@@ -429,18 +528,39 @@ message AggCall {
     LAST_VALUE = 25;
     GROUPING = 26;
     INTERNAL_LAST_SEEN_VALUE = 27;
+    APPROX_PERCENTILE = 28;
+    ARG_MIN = 29;
+    ARG_MAX = 30;
     // user defined aggregate function
     USER_DEFINED = 100;
+    // wraps a scalar function that takes a list as input as an aggregate function.
+    WRAP_SCALAR = 101;
   }
-  Type type = 1;
+  Kind kind = 1;
   repeated InputRef args = 2;
   data.DataType return_type = 3;
   bool distinct = 4;
   repeated common.ColumnOrder order_by = 5;
   ExprNode filter = 6;
   repeated Constant direct_args = 7;
-  // optional. only used when the type is USER_DEFINED.
+  // optional. only used when the kind is USER_DEFINED.
   UserDefinedFunctionMetadata udf = 8;
+  // optional. only used when the kind is WRAP_SCALAR.
+  ExprNode scalar = 9;
+}
+
+// The aggregation type.
+//
+// Ideally this should be used to encode the Rust `AggCall::agg_type` field, but historically we
+// flattened it into multiple fields in proto `AggCall` - `kind` + `udf` + `scalar`. So this
+// `AggType` proto type is only used by `WindowFunction` currently.
+message AggType {
+  AggCall.Kind kind = 1;
+
+  // UDF metadata. Only present when the kind is `USER_DEFINED`.
+  optional UserDefinedFunctionMetadata udf_meta = 8;
+  // Wrapped scalar expression. Only present when the kind is `WRAP_SCALAR`.
+  optional ExprNode scalar_expr = 9;
 }
 
 message WindowFrame {
@@ -451,6 +571,7 @@ message WindowFrame {
 
     TYPE_ROWS = 5;
     TYPE_RANGE = 10;
+    TYPE_SESSION = 15;
   }
   enum BoundType {
     BOUND_TYPE_UNSPECIFIED = 0;
@@ -496,6 +617,13 @@ message WindowFrame {
     BoundType type = 1;
     optional data.Datum offset = 3;
   }
+  message SessionFrameBounds {
+    data.Datum gap = 1;
+
+    data.DataType order_data_type = 10;
+    common.OrderType order_type = 15;
+    data.DataType gap_data_type = 20;
+  }
 
   Type type = 1;
 
@@ -507,6 +635,7 @@ message WindowFrame {
   oneof bounds {
     RowsFrameBounds rows = 10;
     RangeFrameBounds range = 15;
+    SessionFrameBounds session = 20;
   }
 }
 
@@ -525,15 +654,24 @@ message WindowFunction {
 
   oneof type {
     GeneralType general = 1;
-    AggCall.Type aggregate = 2;
+    AggCall.Kind aggregate = 2 [deprecated = true]; // Deprecated since we have a new `aggregate2` variant.
+    AggType aggregate2 = 103;
   }
   repeated InputRef args = 3;
   data.DataType return_type = 4;
   WindowFrame frame = 5;
+  bool ignore_nulls = 6;
 }
 
 // Note: due to historic reasons, UserDefinedFunction is a oneof variant parallel to FunctionCall,
 // while UserDefinedFunctionMetadata is embedded as a field in TableFunction and AggCall.
+
+enum UdfExprVersion {
+  // Versions before introducing this enum.
+  UDF_EXPR_VERSION_UNSPECIFIED = 0;
+  // Begin from this version, we re-interpret `identifier` as `name_in_runtime`.
+  UDF_EXPR_VERSION_NAME_IN_RUNTIME = 1;
+}
 
 message UserDefinedFunction {
   repeated ExprNode children = 1;
@@ -543,31 +681,47 @@ message UserDefinedFunction {
   string language = 4;
   // The link to the external function service.
   optional string link = 5;
-  // An unique identifier to the function.
-  // - If `link` is not empty, the name of the function in the external function service.
-  // - If `language` is `rust` or `wasm`, the name of the function in the wasm binary file.
-  // - If `language` is `javascript`, the name of the function.
+  // This is re-interpreted as `name_in_runtime`.
   optional string identifier = 6;
-  // - If `language` is `javascript`, the source code of the function.
+  // - If `language` is `javascript` or `python`, the source code of the function.
   optional string body = 7;
   // - If `language` is `rust` or `wasm`, the zstd-compressed wasm binary.
   optional bytes compressed_binary = 10;
   bool always_retry_on_network_error = 9;
-  // The runtime used when javascript is used as the language. Could be "quickjs" or "deno".
+  // The runtime selected when multiple runtimes are available for the language. Now is not used.
   optional string runtime = 11;
-  // The function type, which is used to execute the function. Could be "sync", "async", "generator" or "async_generator"
-  optional string function_type = 12;
+  reserved 12;
+  reserved "function_type";
+  // additional options for javascript functions
+  optional bool is_async = 13;
+  optional bool is_batched = 14;
+  // Unsafe: whether to skip materializing evaluated results of this function for retractable
+  // streams. This must travel with persisted expressions, such as generated columns.
+  bool unsafe_skip_materializing_exprs = 15;
+  // Whether the function is declared `IMMUTABLE`. This must travel with persisted expressions,
+  // such as generated columns.
+  bool is_immutable = 16;
+
+  UdfExprVersion version = 1000;
 }
 
 // Additional information for user defined table/aggregate functions.
 message UserDefinedFunctionMetadata {
   repeated string arg_names = 8;
   repeated data.DataType arg_types = 3;
+  data.DataType return_type = 13;
   string language = 4;
   optional string link = 5;
+  // This is re-interpreted as `name_in_runtime`.
   optional string identifier = 6;
   optional string body = 7;
   optional bytes compressed_binary = 10;
   optional string runtime = 11;
-  optional string function_type = 12;
+  reserved 12;
+  reserved "function_type";
+  // additional options for javascript functions
+  optional bool is_async = 14;
+  optional bool is_batched = 15;
+
+  UdfExprVersion version = 1000;
 }

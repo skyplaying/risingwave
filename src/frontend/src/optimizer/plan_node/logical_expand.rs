@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 
 use super::generic::GenericPlanRef;
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchExpand, ColPrunable, ExprRewritable, Logical, PlanBase,
-    PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamExpand, ToBatch, ToStream,
+    BatchExpand, BatchPlanRef, ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef,
+    PlanBase, PlanTreeNodeUnary, PredicatePushdown, StreamExpand, StreamPlanRef, ToBatch, ToStream,
+    gen_filter_and_pushdown, generic,
 };
 use crate::error::Result;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
@@ -70,7 +72,7 @@ impl LogicalExpand {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalExpand {
+impl PlanTreeNodeUnary<Logical> for LogicalExpand {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -79,7 +81,6 @@ impl PlanTreeNodeUnary for LogicalExpand {
         Self::new(input, self.column_subsets().clone())
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -126,23 +127,40 @@ impl PlanTreeNodeUnary for LogicalExpand {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalExpand}
+impl_plan_tree_node_for_unary! { Logical, LogicalExpand}
 impl_distill_by_unit!(LogicalExpand, core, "LogicalExpand");
 
 impl ColPrunable for LogicalExpand {
     fn prune_col(&self, required_cols: &[usize], ctx: &mut ColumnPruningContext) -> PlanRef {
-        // No pruning.
-        let input_required_cols = (0..self.input().schema().len()).collect_vec();
-        LogicalProject::with_out_col_idx(
-            self.clone_with_input(self.input().prune_col(&input_required_cols, ctx))
-                .into(),
-            required_cols.iter().cloned(),
-        )
-        .into()
+        let input_len = self.input().schema().len();
+        let mut input_required_cols = FixedBitSet::with_capacity(input_len);
+        for &idx in required_cols {
+            if idx < input_len {
+                input_required_cols.insert(idx);
+            } else if idx < input_len * 2 {
+                input_required_cols.insert(idx - input_len);
+            } else {
+                assert_eq!(idx, input_len * 2);
+            }
+        }
+        let input_required_cols = input_required_cols.ones().collect_vec();
+        let input_col_change =
+            ColIndexMapping::with_remaining_columns(&input_required_cols, input_len);
+        let input = self.input().prune_col(&input_required_cols, ctx);
+        let (expand, out_col_change) = self.rewrite_with_input(input, input_col_change);
+        let output_required_cols = required_cols
+            .iter()
+            .map(|idx| {
+                out_col_change
+                    .try_map(*idx)
+                    .expect("required column should be kept")
+            })
+            .collect_vec();
+        LogicalProject::with_out_col_idx(expand.into(), output_required_cols.into_iter()).into()
     }
 }
 
-impl ExprRewritable for LogicalExpand {}
+impl ExprRewritable<Logical> for LogicalExpand {}
 
 impl ExprVisitable for LogicalExpand {}
 
@@ -158,11 +176,10 @@ impl PredicatePushdown for LogicalExpand {
 }
 
 impl ToBatch for LogicalExpand {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<BatchPlanRef> {
         let new_input = self.input().to_batch()?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        Ok(BatchExpand::new(new_logical).into())
+        let expand = self.core.clone_with_input(new_input);
+        Ok(BatchExpand::new(expand).into())
     }
 }
 
@@ -176,11 +193,10 @@ impl ToStream for LogicalExpand {
         Ok((expand.into(), out_col_change))
     }
 
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         let new_input = self.input().to_stream(ctx)?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        Ok(StreamExpand::new(new_logical).into())
+        let expand = self.core.clone_with_input(new_input);
+        Ok(StreamExpand::new(expand).into())
     }
 }
 
@@ -193,14 +209,14 @@ mod tests {
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::{LogicalExpand, LogicalValues};
 
-    // TODO(Wenzhuo): change this test according to expand's new definition.
     #[tokio::test]
     async fn fd_derivation_expand() {
         // input: [v1, v2, v3]
         // FD: v1 --> { v2, v3 }
-        // output: [v1, v2, v3, flag],
-        // FD: { v1, flag } --> { v2, v3 }
-        let ctx = OptimizerContext::mock().await;
+        // output: [v1_expanded, v2_expanded, v3_expanded, v1, v2, v3, flag].
+        // Input FDs only hold on the preserved original columns. They do not hold on expanded
+        // columns, because each expand lane can set columns outside its subset to NULL.
+        let ctx = OptimizerContext::mock();
         let fields: Vec<Field> = vec![
             Field::with_name(DataType::Int32, "v1"),
             Field::with_name(DataType::Int32, "v2"),
@@ -216,7 +232,7 @@ mod tests {
         let expand = LogicalExpand::create(values.into(), column_subsets);
         let fd = expand.functional_dependency().as_dependencies();
         assert_eq!(fd.len(), 1);
-        assert_eq!(fd[0].from().ones().collect_vec(), &[0, 6]);
-        assert_eq!(fd[0].to().ones().collect_vec(), &[1, 2]);
+        assert_eq!(fd[0].from().ones().collect_vec(), &[3]);
+        assert_eq!(fd[0].to().ones().collect_vec(), &[4, 5]);
     }
 }

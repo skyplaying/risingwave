@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,22 +38,29 @@ macro_rules! insert_and_flush {
 
 #[tokio::test]
 async fn test_table() -> Result<()> {
-    let mut cluster = Cluster::start(Configuration::for_scale()).await?;
+    let configuration = Configuration::for_scale();
+    let total_core = configuration.compute_nodes * configuration.compute_node_cores;
+
+    let mut cluster = Cluster::start(configuration).await?;
     cluster.run(ROOT_TABLE_CREATE).await?;
 
-    let fragment = cluster
-        .locate_one_fragment([identity_contains("dml"), identity_contains("source")])
+    insert_and_flush!(cluster);
+
+    cluster
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 3
+        ))
         .await?;
 
     insert_and_flush!(cluster);
 
     cluster
-        .reschedule(fragment.reschedule([0, 2, 4], []))
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 2
+        ))
         .await?;
-
-    insert_and_flush!(cluster);
-
-    cluster.reschedule(fragment.reschedule([1], [0, 4])).await?;
 
     insert_and_flush!(cluster);
 
@@ -62,20 +69,27 @@ async fn test_table() -> Result<()> {
 
 #[tokio::test]
 async fn test_mv_on_scaled_table() -> Result<()> {
-    let mut cluster = Cluster::start(Configuration::for_scale()).await?;
+    let configuration = Configuration::for_scale();
+    let total_core = configuration.compute_nodes * configuration.compute_node_cores;
+
+    let mut cluster = Cluster::start(configuration).await?;
     cluster.run(ROOT_TABLE_CREATE).await?;
 
-    let fragment = cluster
-        .locate_one_fragment([identity_contains("materialize")])
-        .await?;
-
     cluster
-        .reschedule(fragment.reschedule([0, 2, 4], []))
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 3
+        ))
         .await?;
 
     insert_and_flush!(cluster);
 
-    cluster.reschedule(fragment.reschedule([1], [0, 4])).await?;
+    cluster
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 1
+        ))
+        .await?;
 
     insert_and_flush!(cluster);
 
@@ -88,38 +102,36 @@ async fn test_mv_on_scaled_table() -> Result<()> {
 
 #[tokio::test]
 async fn test_scale_on_schema_change() -> Result<()> {
-    let mut cluster = Cluster::start(Configuration::for_scale_no_shuffle()).await?;
+    let configuration = Configuration::for_scale_no_shuffle();
+    let total_core = configuration.compute_nodes * configuration.compute_node_cores;
+    let mut cluster = Cluster::start(configuration).await?;
+
     cluster.run(ROOT_TABLE_CREATE).await?;
 
     cluster.run(MV1).await?;
 
-    let fragment = cluster
-        .locate_one_fragment([identity_contains("materialize"), identity_contains("union")])
-        .await?;
-
     cluster
-        .reschedule(fragment.reschedule([0, 2, 4], []))
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 3
+        ))
         .await?;
 
     insert_and_flush!(cluster);
 
     cluster.run("alter table t add column v2 int").await?;
 
-    let fragment = cluster
-        .locate_one_fragment([
-            identity_contains("materialize"),
-            identity_contains("StreamTableScan"),
-        ])
-        .await?;
-
     cluster
-        .reschedule_resolve_no_shuffle(fragment.reschedule([1], [0, 4]))
+        .run(format!(
+            "alter table t set parallelism = {}",
+            total_core - 2
+        ))
         .await?;
 
     let fragment = cluster
         .locate_one_fragment([identity_contains("materialize"), identity_contains("union")])
         .await?;
-    let (_, used) = fragment.parallel_unit_usage();
+    let used = fragment.used_worker_slots();
     assert_eq!(used.len(), 4);
 
     insert_and_flush!(cluster);

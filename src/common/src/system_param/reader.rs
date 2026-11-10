@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,15 +14,22 @@
 
 use std::borrow::Borrow;
 
+use risingwave_license::LicenseKeyRef;
 use risingwave_pb::meta::PbSystemParams;
 
-use super::{default, ParamValue};
+use super::{ParamValue, StateStoreUrlRef, default};
 use crate::for_all_params;
 
 /// Information about a system parameter.
+///
+/// Used to display to users through `pg_settings` system table and `SHOW PARAMETERS` command.
 pub struct ParameterInfo {
     pub name: &'static str,
     pub mutable: bool,
+    /// The [`ToString`] representation of the parameter value.
+    ///
+    /// Certain parameters, such as `license_key`, may be sensitive, and redaction is applied to them in their newtypes.
+    /// As a result, we get the redacted value here for display.
     pub value: String,
     pub description: &'static str,
 }
@@ -31,10 +38,11 @@ macro_rules! define_system_params_read_trait {
     ($({ $field:ident, $type:ty, $default:expr, $is_mutable:expr, $doc:literal, $($rest:tt)* },)*) => {
         /// The trait delegating reads on [`risingwave_pb::meta::SystemParams`].
         ///
-        /// For 2 purposes:
+        /// Purposes:
         /// - Avoid misuse of deprecated fields by hiding their getters.
         /// - Abstract fallback logic for fields that might not be provided by meta service due to backward
         ///   compatibility.
+        /// - Redact sensitive fields by returning a newtype around the original value.
         pub trait SystemParamsRead {
             $(
                 #[doc = $doc]
@@ -48,7 +56,7 @@ macro_rules! define_system_params_read_trait {
                         ParameterInfo {
                             name: stringify!($field),
                             mutable: $is_mutable,
-                            value: self.$field().to_string(),
+                            value: self.$field().to_string(), // use `to_string` to get displayable (maybe redacted) value
                             description: $doc,
                         },
                     )*
@@ -63,10 +71,32 @@ for_all_params!(define_system_params_read_trait);
 /// The wrapper delegating reads on [`risingwave_pb::meta::SystemParams`].
 ///
 /// See [`SystemParamsRead`] for more details.
-#[derive(Clone, Debug, PartialEq)]
+// TODO: should we manually impl `PartialEq` by comparing each field with read functions?
+#[derive(Clone, PartialEq)]
 pub struct SystemParamsReader<I = PbSystemParams> {
     inner: I,
 }
+
+// TODO: should ban `Debug` for inner `SystemParams`.
+// https://github.com/risingwavelabs/risingwave/pull/17906#discussion_r1705056943
+macro_rules! impl_system_params_reader_debug {
+    ($({ $field:ident, $($rest:tt)* },)*) => {
+        impl<I> std::fmt::Debug for SystemParamsReader<I>
+        where
+            I: Borrow<PbSystemParams>,
+        {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SystemParamsReader")
+                    $(
+                        .field(stringify!($field), &self.$field())
+                    )*
+                    .finish()
+            }
+        }
+    };
+}
+
+for_all_params!(impl_system_params_reader_debug);
 
 impl<I> From<I> for SystemParamsReader<I>
 where
@@ -109,6 +139,12 @@ where
         self.inner().barrier_interval_ms.unwrap()
     }
 
+    fn enforce_secret(&self) -> bool {
+        self.inner()
+            .enforce_secret
+            .unwrap_or_else(default::enforce_secret)
+    }
+
     fn checkpoint_frequency(&self) -> u64 {
         self.inner().checkpoint_frequency.unwrap()
     }
@@ -125,16 +161,25 @@ where
         self.inner().block_size_kb.unwrap()
     }
 
+    #[expect(deprecated)]
     fn bloom_false_positive(&self) -> f64 {
         self.inner().bloom_false_positive.unwrap()
     }
 
-    fn state_store(&self) -> &str {
-        self.inner().state_store.as_ref().unwrap()
+    fn state_store(&self) -> StateStoreUrlRef<'_> {
+        self.inner().state_store.as_deref().unwrap().into()
     }
 
     fn data_directory(&self) -> &str {
         self.inner().data_directory.as_ref().unwrap()
+    }
+
+    fn use_new_object_prefix_strategy(&self) -> bool {
+        *self
+            .inner()
+            .use_new_object_prefix_strategy
+            .as_ref()
+            .unwrap()
     }
 
     fn backup_storage_url(&self) -> &str {
@@ -159,5 +204,25 @@ where
         self.inner()
             .enable_tracing
             .unwrap_or_else(default::enable_tracing)
+    }
+
+    fn license_key(&self) -> LicenseKeyRef<'_> {
+        self.inner()
+            .license_key
+            .as_deref()
+            .unwrap_or_default()
+            .into()
+    }
+
+    fn time_travel_retention_ms(&self) -> u64 {
+        self.inner()
+            .time_travel_retention_ms
+            .unwrap_or_else(default::time_travel_retention_ms)
+    }
+
+    fn per_database_isolation(&self) -> <bool as ParamValue>::Borrowed<'_> {
+        self.inner()
+            .per_database_isolation
+            .unwrap_or_else(default::per_database_isolation)
     }
 }

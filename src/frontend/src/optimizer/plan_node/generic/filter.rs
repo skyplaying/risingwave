@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,6 @@ use crate::optimizer::plan_node::utils::childless_record;
 use crate::optimizer::property::FunctionalDependencySet;
 use crate::utils::{Condition, ConditionDisplay};
 
-/// [`Filter`] iterates over its input and returns elements for which `predicate` evaluates to
-/// true, filtering out the others.
-///
-/// If the condition allows nulls, then a null value is treated the same as false.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Filter<PlanRef> {
     pub predicate: Condition,
@@ -46,6 +42,13 @@ impl<PlanRef: GenericPlanRef> DistillUnit for Filter<PlanRef> {
 impl<PlanRef: GenericPlanRef> Filter<PlanRef> {
     pub fn new(predicate: Condition, input: PlanRef) -> Self {
         Filter { predicate, input }
+    }
+
+    pub fn clone_with_input<OtherPlanRef>(&self, input: OtherPlanRef) -> Filter<OtherPlanRef> {
+        Filter {
+            predicate: self.predicate.clone(),
+            input,
+        }
     }
 }
 impl<PlanRef: GenericPlanRef> GenericPlanNode for Filter<PlanRef> {

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ use std::time::Duration;
 use anyhow::Result;
 use itertools::Itertools;
 use risingwave_simulation::cluster::{Cluster, Configuration, Session};
-use risingwave_simulation::ctl_ext::predicate::{identity_contains, no_identity_contains};
 use risingwave_simulation::utils::AssertResult;
 use tokio::time::sleep;
 
@@ -30,12 +29,15 @@ const SHOW_INTERNAL_TABLES: &str = "SHOW INTERNAL TABLES;";
 
 static EXPECTED_NO_BACKFILL: LazyLock<String> = LazyLock::new(|| {
     (0..=255)
-        .map(|vnode| format!("{} NULL t 0", vnode))
+        .map(|vnode| format!("{} NULL t", vnode))
         .join("\n")
 });
 
 fn select_all(table: impl AsRef<str>) -> String {
-    format!("SELECT * FROM {} ORDER BY vnode", table.as_ref())
+    format!(
+        "SELECT vnode, _row_id, is_epoch_finished FROM {} ORDER BY vnode",
+        table.as_ref()
+    )
 }
 
 async fn test_no_backfill_state(session: &mut Session) -> Result<()> {
@@ -74,22 +76,17 @@ async fn test_snapshot_mv() -> Result<()> {
     // After startup with no backfill, with data inserted after, should be NO_BACKFILL state.
     test_no_backfill_state(&mut session).await?;
 
-    let fragment = cluster
-        .locate_one_fragment([
-            identity_contains("materialize"),
-            no_identity_contains("StreamTableScan"),
-        ])
-        .await?;
+    // prev cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 1").await?;
 
-    let id = fragment.id();
-
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
     sleep(Duration::from_secs(3)).await;
 
     // Before complete recovery should be NO_BACKFILL state
     test_no_backfill_state(&mut session).await?;
 
-    cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    // prev cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 6").await?;
+
     sleep(Duration::from_secs(3)).await;
 
     // After recovery should be NO_BACKFILL state
@@ -121,16 +118,9 @@ async fn test_backfill_mv() -> Result<()> {
         .await?;
     assert_eq!(results.lines().collect_vec().len(), 256);
 
-    let fragment = cluster
-        .locate_one_fragment([
-            identity_contains("materialize"),
-            no_identity_contains("StreamTableScan"),
-        ])
-        .await?;
+    // prev cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 1").await?;
 
-    let id = fragment.id();
-
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
     sleep(Duration::from_secs(3)).await;
 
     let internal_table = session.run(SHOW_INTERNAL_TABLES).await?;
@@ -139,7 +129,9 @@ async fn test_backfill_mv() -> Result<()> {
         .await?;
     assert_eq!(results.lines().collect_vec().len(), 256);
 
-    cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    // prev cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 6").await?;
+
     sleep(Duration::from_secs(3)).await;
 
     let internal_table = session.run(SHOW_INTERNAL_TABLES).await?;
@@ -174,16 +166,9 @@ async fn test_index_backfill() -> Result<()> {
         .await?;
     assert_eq!(results.lines().collect_vec().len(), 256);
 
-    let fragment = cluster
-        .locate_one_fragment([
-            identity_contains("index"),
-            no_identity_contains("StreamTableScan"),
-        ])
-        .await?;
+    // prev cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 1").await?;
 
-    let id = fragment.id();
-
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
     sleep(Duration::from_secs(3)).await;
 
     let internal_table = session.run(SHOW_INTERNAL_TABLES).await?;
@@ -192,7 +177,9 @@ async fn test_index_backfill() -> Result<()> {
         .await?;
     assert_eq!(results.lines().collect_vec().len(), 256);
 
-    cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    // prev cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    session.run("alter table t1 set parallelism = 6").await?;
+
     sleep(Duration::from_secs(3)).await;
 
     let internal_table = session.run(SHOW_INTERNAL_TABLES).await?;

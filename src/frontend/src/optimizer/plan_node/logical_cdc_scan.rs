@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,19 +16,19 @@ use std::rc::Rc;
 
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{CdcTableDesc, ColumnDesc};
+use risingwave_connector::source::cdc::CdcScanOptions;
 
 use super::generic::GenericPlanRef;
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    generic, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PredicatePushdown, ToBatch,
-    ToStream,
+    BatchPlanRef, ColPrunable, ExprRewritable, Logical, LogicalFilter, LogicalPlanRef as PlanRef,
+    LogicalProject, PlanBase, PredicatePushdown, StreamPlanRef, ToBatch, ToStream, generic,
 };
 use crate::catalog::ColumnId;
 use crate::error::Result;
 use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::generic::CdcScanOptions;
 use crate::optimizer::plan_node::{
     ColumnPruningContext, PredicatePushdownContext, RewriteStreamContext, StreamCdcTableScan,
     ToStreamContext,
@@ -91,23 +91,12 @@ impl LogicalCdcScan {
         self.core.output_column_ids()
     }
 
-    pub fn clone_with_output_indices(&self, output_col_idx: Vec<usize>) -> Self {
-        generic::CdcScan::new(
-            self.table_name().to_string(),
-            output_col_idx,
-            self.core.cdc_table_desc.clone(),
-            self.base.ctx().clone(),
-            self.core.options.clone(),
-        )
-        .into()
-    }
-
     pub fn output_col_idx(&self) -> &Vec<usize> {
         &self.core.output_col_idx
     }
 }
 
-impl_plan_tree_node_for_leaf! {LogicalCdcScan}
+impl_plan_tree_node_for_leaf! { Logical, LogicalCdcScan}
 
 impl Distill for LogicalCdcScan {
     fn distill<'a>(&self) -> XmlNode<'a> {
@@ -132,7 +121,7 @@ impl Distill for LogicalCdcScan {
                             Pretty::from(if verbose {
                                 format!("{}.{}", self.table_name(), col_name)
                             } else {
-                                col_name.to_string()
+                                col_name.clone()
                             })
                         })
                         .collect(),
@@ -146,19 +135,14 @@ impl Distill for LogicalCdcScan {
 
 impl ColPrunable for LogicalCdcScan {
     fn prune_col(&self, required_cols: &[usize], _ctx: &mut ColumnPruningContext) -> PlanRef {
-        let output_col_idx: Vec<usize> = required_cols
-            .iter()
-            .map(|i| self.output_col_idx()[*i])
-            .collect();
-        assert!(output_col_idx
-            .iter()
-            .all(|i| self.output_col_idx().contains(i)));
-
-        self.clone_with_output_indices(output_col_idx).into()
+        // The CDC executor currently expects an identity projection over the complete external
+        // table descriptor. Keep the scan intact and let a project above it prune the user-visible
+        // columns. During stream rewrite, the project also keeps the stream key internally.
+        LogicalProject::with_out_col_idx(self.clone().into(), required_cols.iter().copied()).into()
     }
 }
 
-impl ExprRewritable for LogicalCdcScan {
+impl ExprRewritable<Logical> for LogicalCdcScan {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -183,25 +167,25 @@ impl ExprVisitable for LogicalCdcScan {
 impl PredicatePushdown for LogicalCdcScan {
     fn predicate_pushdown(
         &self,
-        _predicate: Condition,
+        predicate: Condition,
         _ctx: &mut PredicatePushdownContext,
     ) -> PlanRef {
-        self.clone().into()
+        LogicalFilter::create(self.clone().into(), predicate)
     }
 }
 
 impl ToBatch for LogicalCdcScan {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<BatchPlanRef> {
         unreachable!()
     }
 
-    fn to_batch_with_order_required(&self, _required_order: &Order) -> Result<PlanRef> {
+    fn to_batch_with_order_required(&self, _required_order: &Order) -> Result<BatchPlanRef> {
         unreachable!()
     }
 }
 
 impl ToStream for LogicalCdcScan {
-    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         Ok(StreamCdcTableScan::new(self.core.clone()).into())
     }
 
@@ -213,5 +197,58 @@ impl ToStream for LogicalCdcScan {
             self.clone().into(),
             ColIndexMapping::identity(self.schema().len()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use risingwave_common::catalog::{CdcTableDesc, ColumnDesc, ColumnId, TableId};
+    use risingwave_common::id::SourceId;
+    use risingwave_common::types::DataType;
+    use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
+    use risingwave_connector::source::cdc::CdcScanOptions;
+
+    use super::*;
+    use crate::expr::InputRef;
+    use crate::optimizer::optimizer_context::OptimizerContext;
+    use crate::optimizer::plan_node::PlanTreeNodeUnary;
+
+    #[test]
+    fn test_predicate_pushdown_preserves_filter() {
+        let desc = CdcTableDesc {
+            table_id: TableId::new(1),
+            source_id: SourceId::new(2),
+            external_table_name: "mydb.orders".to_owned(),
+            pk: vec![ColumnOrder::new(0, OrderType::ascending())],
+            pk_comparisons: vec![risingwave_common::catalog::CdcKeyComparison::Native],
+            columns: vec![
+                ColumnDesc::named("id", ColumnId::new(1), DataType::Int32),
+                ColumnDesc::named("selected", ColumnId::new(2), DataType::Boolean),
+            ],
+            stream_key: vec![0],
+            ..Default::default()
+        };
+        let scan: PlanRef = LogicalCdcScan::create(
+            "orders".to_owned(),
+            Rc::new(desc),
+            OptimizerContext::mock(),
+            CdcScanOptions {
+                disable_backfill: true,
+                ..Default::default()
+            },
+        )
+        .into();
+        let predicate = Condition::with_expr(InputRef::new(1, DataType::Boolean).into());
+        let mut ctx = PredicatePushdownContext::new(scan.clone());
+
+        let result = scan.predicate_pushdown(predicate.clone(), &mut ctx);
+
+        let filter = result
+            .as_logical_filter()
+            .expect("the predicate must remain above the CDC scan");
+        assert_eq!(filter.predicate(), &predicate);
+        assert!(filter.input().as_logical_cdc_scan().is_some());
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,55 +14,131 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use either::Either;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::acl::AclMode;
-use risingwave_common::catalog::{IndexId, TableDesc, TableId};
+use risingwave_common::catalog::{IndexId, TableId};
+use risingwave_common::types::DataType;
+use risingwave_common::util::recursive::{Recurse, tracker};
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_pb::catalog::{PbIndex, PbStreamJobStatus, PbTable};
-use risingwave_pb::stream_plan::stream_fragment_graph::Parallelism;
-use risingwave_pb::user::grant_privilege::Object;
+use risingwave_pb::catalog::{
+    CreateType, PbFlatIndexConfig, PbHnswFlatIndexConfig, PbIndex, PbIndexColumnProperties,
+    PbStreamJobStatus, PbVectorIndexInfo,
+};
+use risingwave_pb::common::PbDistanceType;
+use risingwave_pb::expr::expr_node::RexNode;
 use risingwave_sqlparser::ast;
 use risingwave_sqlparser::ast::{Ident, ObjectName, OrderByExpr};
+use thiserror_ext::AsReport;
 
 use super::RwPgResponse;
+use crate::TableCatalog;
 use crate::binder::Binder;
 use crate::catalog::root_catalog::SchemaPath;
+use crate::catalog::{DatabaseId, SchemaId};
 use crate::error::{ErrorCode, Result};
-use crate::expr::{Expr, ExprImpl, ExprRewriter, InputRef};
-use crate::handler::privilege::ObjectCheckItem;
+use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef, is_impure_func_call};
 use crate::handler::HandlerArgs;
+use crate::handler::create_mv::resolve_streaming_job_resource_type;
+use crate::handler::util::{
+    LongRunningNotificationAction, execute_with_long_running_notification,
+    reject_internal_table_dependency,
+};
 use crate::optimizer::plan_expr_rewriter::ConstEvalRewriter;
-use crate::optimizer::plan_node::{Explain, LogicalProject, LogicalScan, StreamMaterialize};
-use crate::optimizer::property::{Cardinality, Distribution, Order, RequiredDist};
-use crate::optimizer::{OptimizerContext, OptimizerContextRef, PlanRef, PlanRoot};
+use crate::optimizer::plan_node::utils::plan_can_use_background_ddl;
+use crate::optimizer::plan_node::{
+    Explain, LogicalProject, LogicalScan, StreamMaterialize, StreamPlanRef as PlanRef,
+    ensure_sync_log_store_fragment_root,
+};
+use crate::optimizer::property::{Distribution, Order, RequiredDist};
+use crate::optimizer::{LogicalPlanRoot, OptimizerContext, OptimizerContextRef, PlanRoot};
 use crate::scheduler::streaming_manager::CreatingStreamingJobInfo;
 use crate::session::SessionImpl;
-use crate::stream_fragmenter::build_graph;
-use crate::TableCatalog;
+use crate::session::current::notice_to_user;
+use crate::stream_fragmenter::{GraphJobType, build_graph};
 
 pub(crate) fn resolve_index_schema(
     session: &SessionImpl,
     index_name: ObjectName,
     table_name: ObjectName,
 ) -> Result<(String, Arc<TableCatalog>, String)> {
-    let db_name = session.database();
-    let (schema_name, table_name) = Binder::resolve_schema_qualified_name(db_name, table_name)?;
+    let db_name = &session.database();
+    let (schema_name, table_name) = Binder::resolve_schema_qualified_name(db_name, &table_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let index_table_name = Binder::resolve_index_name(index_name)?;
 
     let catalog_reader = session.env().catalog_reader();
     let read_guard = catalog_reader.read_guard();
-    let (table, schema_name) = read_guard.get_table_by_name(db_name, schema_path, &table_name)?;
-    Ok((schema_name.to_string(), table.clone(), index_table_name))
+    let (table, schema_name) =
+        read_guard.get_created_table_by_name(db_name, schema_path, &table_name)?;
+    reject_internal_table_dependency(table.as_ref(), "CREATE INDEX")?;
+    Ok((schema_name.to_owned(), table.clone(), index_table_name))
+}
+
+pub(crate) struct IndexColumnExprValidator {
+    allow_impure: bool,
+    result: Result<()>,
+}
+
+impl IndexColumnExprValidator {
+    fn unsupported_expr_err(expr: &ExprImpl) -> ErrorCode {
+        ErrorCode::NotSupported(
+            format!("unsupported index column expression type: {:?}", expr),
+            "use columns or expressions instead".into(),
+        )
+    }
+
+    pub(crate) fn validate(expr: &ExprImpl, allow_impure: bool) -> Result<()> {
+        match expr {
+            ExprImpl::InputRef(_) | ExprImpl::FunctionCall(_) => {}
+            other_expr => {
+                return Err(Self::unsupported_expr_err(other_expr).into());
+            }
+        }
+        let mut visitor = Self {
+            allow_impure,
+            result: Ok(()),
+        };
+        visitor.visit_expr(expr);
+        visitor.result
+    }
+}
+
+impl ExprVisitor for IndexColumnExprValidator {
+    fn visit_expr(&mut self, expr: &ExprImpl) {
+        if self.result.is_err() {
+            return;
+        }
+        tracker!().recurse(|t| {
+            if t.depth_reaches(crate::expr::EXPR_DEPTH_THRESHOLD) {
+                notice_to_user(crate::expr::EXPR_TOO_DEEP_NOTICE);
+            }
+
+            match expr {
+                ExprImpl::InputRef(_) | ExprImpl::Literal(_) => {}
+                ExprImpl::FunctionCall(inner) => {
+                    if !self.allow_impure && is_impure_func_call(inner) {
+                        self.result = Err(ErrorCode::NotSupported(
+                            "this expression is impure".into(),
+                            "use a pure expression instead".into(),
+                        )
+                        .into());
+                        return;
+                    }
+                    self.visit_function_call(inner)
+                }
+                other_expr => {
+                    self.result = Err(Self::unsupported_expr_err(other_expr).into());
+                }
+            }
+        })
+    }
 }
 
 pub(crate) fn gen_create_index_plan(
@@ -71,54 +147,140 @@ pub(crate) fn gen_create_index_plan(
     schema_name: String,
     table: Arc<TableCatalog>,
     index_table_name: String,
+    method: Option<Ident>,
     columns: Vec<OrderByExpr>,
     include: Vec<Ident>,
     distributed_by: Vec<ast::Expr>,
-) -> Result<(PlanRef, PbTable, PbIndex)> {
-    let table_name = table.name.clone();
-
+) -> Result<(PlanRef, TableCatalog, PbIndex)> {
     if table.is_index() {
         return Err(
             ErrorCode::InvalidInputSyntax(format!("\"{}\" is an index", table.name)).into(),
         );
     }
 
-    session.check_privileges(&[ObjectCheckItem::new(
-        table.owner,
-        AclMode::Select,
-        Object::TableId(table.id.table_id),
-    )])?;
+    // A relation without primary key holds at most one row, e.g. a materialized view of a global
+    // aggregation. The index is still created for compatibility, but the planner will never
+    // prefer it over the primary table.
+    if table.pk().is_empty() {
+        session.notice_to_user(format!(
+            "index \"{}\" will never be used by the planner: \"{}\" has no primary key and holds at most one row",
+            index_table_name, table.name
+        ));
+    }
+
+    if !session.is_super_user() && session.user_id() != table.owner {
+        return Err(ErrorCode::PermissionDenied(format!(
+            "must be owner of table \"{}\"",
+            table.name
+        ))
+        .into());
+    }
+
+    let vector_index_config = if let Some(method) = method {
+        match method.real_value().to_ascii_lowercase().as_str() {
+            "default" => None,
+            "flat" => Some(risingwave_pb::catalog::vector_index_info::PbConfig::Flat(
+                PbFlatIndexConfig {},
+            )),
+            "hnsw" => {
+                let with_options = context.with_options();
+                let parse_non_zero_u32 = |key: &str, default| {
+                    with_options
+                        .get(key)
+                        .map(|v| {
+                            let v = v.parse::<u32>().map_err(|e| {
+                                ErrorCode::InvalidInputSyntax(format!(
+                                    "invalid {} value {}: failed to parse {}",
+                                    key,
+                                    v,
+                                    e.as_report()
+                                ))
+                            })?;
+                            if v == 0 {
+                                Err(ErrorCode::InvalidInputSyntax(format!(
+                                    "invalid {} value {}: should not be zero",
+                                    key, v
+                                )))
+                            } else {
+                                Ok(v)
+                            }
+                        })
+                        .transpose()
+                        .map(|v| v.unwrap_or(default))
+                };
+                Some(
+                    risingwave_pb::catalog::vector_index_info::PbConfig::HnswFlat(
+                        PbHnswFlatIndexConfig {
+                            m: parse_non_zero_u32("m", 16)?, /* default value borrowed from pg_vector */
+                            ef_construction: parse_non_zero_u32("ef_construction", 64)?, /* default value borrowed from pg_vector */
+                            max_level: parse_non_zero_u32("max_level", 10)?,
+                        },
+                    ),
+                )
+            }
+            _ => {
+                return Err(ErrorCode::InvalidInputSyntax(format!(
+                    "invalid index method {}",
+                    method
+                ))
+                .into());
+            }
+        }
+    } else {
+        None
+    };
+
+    let is_vector_index = vector_index_config.is_some();
+
+    if is_vector_index && !table.append_only {
+        return Err(ErrorCode::InvalidInputSyntax(format!(
+            "\"{}\" is not append-only but vector index must be append-only",
+            table.name
+        ))
+        .into());
+    }
 
     let mut binder = Binder::new_for_stream(session);
-    binder.bind_table(Some(&schema_name), &table_name, None)?;
+    binder.bind_table(Some(&schema_name), &table.name)?;
 
     let mut index_columns_ordered_expr = vec![];
     let mut include_columns_expr = vec![];
     let mut distributed_columns_expr = vec![];
+    if is_vector_index && columns.len() != 1 {
+        return Err(ErrorCode::InvalidInputSyntax(format!(
+            "vector index must be defined on exactly 1 column, but got {}",
+            columns.len()
+        ))
+        .into());
+    }
+    let mut dimension = None;
     for column in columns {
+        if is_vector_index && (column.asc.is_some() || column.nulls_first.is_some()) {
+            return Err(ErrorCode::InvalidInputSyntax(
+                "vector index cannot specify order".to_owned(),
+            )
+            .into());
+        }
         let order_type = OrderType::from_bools(column.asc, column.nulls_first);
-        let expr_impl = binder.bind_expr(column.expr)?;
+        let expr_impl = binder.bind_expr(&column.expr)?;
         // Do constant folding and timezone transportation on expressions so that batch queries can match it in the same form.
         let mut const_eval = ConstEvalRewriter { error: None };
         let expr_impl = const_eval.rewrite_expr(expr_impl);
         let expr_impl = context.session_timezone().rewrite_expr(expr_impl);
-        match expr_impl {
-            ExprImpl::InputRef(_) => {}
-            ExprImpl::FunctionCall(_) => {
-                if expr_impl.is_impure() {
-                    return Err(ErrorCode::NotSupported(
-                        "this expression is impure".into(),
-                        "use a pure expression instead".into(),
-                    )
+        let allow_impure = is_vector_index;
+        IndexColumnExprValidator::validate(&expr_impl, allow_impure)?;
+        if is_vector_index {
+            match expr_impl.return_type() {
+                DataType::Vector(d) => {
+                    dimension = Some(d);
+                }
+                other => {
+                    return Err(ErrorCode::InvalidInputSyntax(format!(
+                        "vector index must be defined on column of Vector type, but got {:?}",
+                        other
+                    ))
                     .into());
                 }
-            }
-            _ => {
-                return Err(ErrorCode::NotSupported(
-                    "index columns should be columns or expressions".into(),
-                    "use columns or expressions instead".into(),
-                )
-                .into())
             }
         }
         index_columns_ordered_expr.push((expr_impl, order_type));
@@ -138,17 +300,22 @@ pub(crate) fn gen_create_index_plan(
     } else {
         for column in include {
             let expr_impl =
-                binder.bind_expr(risingwave_sqlparser::ast::Expr::Identifier(column))?;
+                binder.bind_expr(&risingwave_sqlparser::ast::Expr::Identifier(column))?;
             include_columns_expr.push(expr_impl);
         }
     };
 
-    for column in distributed_by {
-        let expr_impl = binder.bind_expr(column)?;
-        distributed_columns_expr.push(expr_impl);
+    if is_vector_index && !distributed_by.is_empty() {
+        return Err(ErrorCode::InvalidInputSyntax(
+            "vector index cannot define DISTRIBUTED BY".to_owned(),
+        )
+        .into());
     }
 
-    let table_desc = Rc::new(table.table_desc());
+    for column in distributed_by {
+        let expr_impl = binder.bind_expr(&column)?;
+        distributed_columns_expr.push(expr_impl);
+    }
 
     // Remove duplicate column of index columns
     let mut set = HashSet::new();
@@ -188,68 +355,166 @@ pub(crate) fn gen_create_index_plan(
         .starts_with(&distributed_columns_expr)
     {
         return Err(ErrorCode::InvalidInputSyntax(
-            "Distributed by columns should be a prefix of index columns".to_string(),
+            "Distributed by columns should be a prefix of index columns".to_owned(),
         )
         .into());
     }
 
-    // Manually assemble the materialization plan for the index MV.
-    let materialize = assemble_materialize(
-        table_name,
-        table.clone(),
-        context,
-        index_table_name.clone(),
-        &index_columns_ordered_expr,
-        &include_columns_expr,
-        // We use the first index column as distributed key by default if users
-        // haven't specify the distributed by columns.
-        if distributed_columns_expr.is_empty() {
-            1
-        } else {
-            distributed_columns_expr.len()
-        },
-        table.cardinality,
-    )?;
-
     let (index_database_id, index_schema_id) =
         session.get_database_and_schema_id_for_create(Some(schema_name))?;
 
-    let index_table = materialize.table();
-    let mut index_table_prost = index_table.to_prost(index_schema_id, index_database_id);
+    let (plan, mut index_table) = if let Some(vector_index_config) = vector_index_config {
+        assert!(distributed_columns_expr.is_empty());
+        assert_eq!(1, index_columns_ordered_expr.len());
+        let input = assemble_input(
+            table.clone(),
+            context.clone(),
+            &index_columns_ordered_expr,
+            &include_columns_expr,
+            RequiredDist::PhysicalDist(Distribution::Single),
+        )?;
+        let definition = context.normalized_sql().to_owned();
+        let retention_seconds = table.retention_seconds.and_then(NonZeroU32::new);
+
+        let distance_type = match context
+            .with_options()
+            .get("distance_type")
+            .ok_or_else(|| {
+                ErrorCode::InvalidInputSyntax(
+                    "vector index missing `distance_type` in with options".to_owned(),
+                )
+            })?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "l1" => PbDistanceType::L1,
+            "l2" => PbDistanceType::L2Sqr,
+            "inner_product" => PbDistanceType::InnerProduct,
+            "cosine" => PbDistanceType::Cosine,
+            other => {
+                return Err(ErrorCode::InvalidInputSyntax(format!(
+                    "unsupported vector index distance type: {}",
+                    other
+                ))
+                .into());
+            }
+        };
+
+        let vector_index_write = input.gen_vector_index_plan(
+            index_table_name.clone(),
+            index_database_id,
+            index_schema_id,
+            definition,
+            retention_seconds,
+            PbVectorIndexInfo {
+                dimension: dimension.expect("should be set for vector index") as _,
+                config: Some(vector_index_config),
+                distance_type: distance_type as _,
+            },
+        )?;
+        let index_table = vector_index_write.table().clone();
+        let plan: PlanRef = ensure_sync_log_store_fragment_root(vector_index_write.into());
+        (plan, index_table)
+    } else {
+        // Manually assemble the materialization plan for the index MV.
+        let materialize = assemble_materialize(
+            index_database_id,
+            index_schema_id,
+            table.clone(),
+            context.clone(),
+            index_table_name.clone(),
+            &index_columns_ordered_expr,
+            &include_columns_expr,
+            // We use the first index column as distributed key by default if users
+            // haven't specified the distributed by columns.
+            if distributed_columns_expr.is_empty() {
+                1
+            } else {
+                distributed_columns_expr.len()
+            },
+        )?;
+        let index_table = materialize.table().clone();
+        let plan: PlanRef = ensure_sync_log_store_fragment_root(materialize.into());
+        (plan, index_table)
+    };
+
     {
         // Inherit table properties
-        index_table_prost.retention_seconds = table.retention_seconds;
+        index_table.retention_seconds = table.retention_seconds;
     }
 
-    index_table_prost.owner = session.user_id();
-    index_table_prost.dependent_relations = vec![table.id.table_id];
+    index_table.owner = table.owner;
 
     let index_columns_len = index_columns_ordered_expr.len() as u32;
+    let index_column_properties = index_columns_ordered_expr
+        .iter()
+        .map(|(_, order)| PbIndexColumnProperties {
+            is_desc: order.is_descending(),
+            nulls_first: order.nulls_are_first(),
+        })
+        .collect();
     let index_item = build_index_item(
-        index_table.table_desc().into(),
+        &index_table,
         table.name(),
-        table_desc,
+        &table,
         index_columns_ordered_expr,
     );
 
+    // The index stores the stream key of the primary table, but the primary key can be wider, e.g.
+    // `[order_key..., stream_key...]` for an `ORDER BY` materialized view. Unless the remaining
+    // primary key columns are indexed or included, the index cannot locate rows of the primary
+    // table and only serves queries it fully covers.
+    let stored_primary_columns: HashSet<usize> = index_item
+        .iter()
+        // The first item of a vector index is the vector, not an info column.
+        .skip(if is_vector_index { 1 } else { 0 })
+        .filter_map(|item| match item.rex_node {
+            Some(RexNode::InputRef(column_index)) => Some(column_index as usize),
+            _ => None,
+        })
+        .collect();
+    let missing_pk_columns = table
+        .pk()
+        .iter()
+        .filter(|order| !stored_primary_columns.contains(&order.column_index))
+        .map(|order| format!("\"{}\"", table.columns()[order.column_index].name()))
+        .collect_vec();
+    if !missing_pk_columns.is_empty() {
+        session.notice_to_user(format!(
+            "index \"{}\" does not store primary key column(s) {} of \"{}\", so the planner can use it only for queries it fully covers; include these columns to let it look up rows of \"{}\"",
+            index_table_name,
+            missing_pk_columns.join(", "),
+            table.name,
+            table.name,
+        ));
+    }
+
+    let create_type =
+        if context.session_ctx().config().background_ddl() && plan_can_use_background_ddl(&plan) {
+            CreateType::Background
+        } else {
+            CreateType::Foreground
+        };
+
     let index_prost = PbIndex {
-        id: IndexId::placeholder().index_id,
+        id: IndexId::placeholder(),
         schema_id: index_schema_id,
         database_id: index_database_id,
         name: index_table_name,
-        owner: index_table_prost.owner,
-        index_table_id: TableId::placeholder().table_id,
-        primary_table_id: table.id.table_id,
+        owner: index_table.owner,
+        index_table_id: TableId::placeholder(),
+        primary_table_id: table.id,
         index_item,
+        index_column_properties,
         index_columns_len,
         initialized_at_epoch: None,
         created_at_epoch: None,
         stream_job_status: PbStreamJobStatus::Creating.into(),
         initialized_at_cluster_version: None,
         created_at_cluster_version: None,
+        create_type: create_type.into(),
     };
 
-    let plan: PlanRef = materialize.into();
     let ctx = plan.ctx();
     let explain_trace = ctx.is_explain_trace();
     if explain_trace {
@@ -257,16 +522,16 @@ pub(crate) fn gen_create_index_plan(
         ctx.trace(plan.explain_to_string());
     }
 
-    Ok((plan, index_table_prost, index_prost))
+    Ok((plan, index_table, index_prost))
 }
 
 fn build_index_item(
-    index_table_desc: Rc<TableDesc>,
+    index_table: &TableCatalog,
     primary_table_name: &str,
-    primary_table_desc: Rc<TableDesc>,
+    primary_table: &TableCatalog,
     index_columns: Vec<(ExprImpl, OrderType)>,
 ) -> Vec<risingwave_pb::expr::ExprNode> {
-    let primary_table_desc_map = primary_table_desc
+    let primary_table_desc_map = primary_table
         .columns
         .iter()
         .enumerate()
@@ -280,9 +545,10 @@ fn build_index_item(
         .into_iter()
         .map(|(expr, _)| expr.to_expr_proto())
         .chain(
-            index_table_desc
+            index_table
                 .columns
                 .iter()
+                .map(|c| &c.column_desc)
                 .skip(index_columns_len)
                 .map(|x| {
                     let name = if x.name.starts_with(&primary_table_name_prefix) {
@@ -294,7 +560,7 @@ fn build_index_item(
                     let column_index = *primary_table_desc_map.get(&name).unwrap();
                     InputRef {
                         index: column_index,
-                        data_type: primary_table_desc
+                        data_type: primary_table
                             .columns
                             .get(column_index)
                             .unwrap()
@@ -307,34 +573,18 @@ fn build_index_item(
         .collect_vec()
 }
 
-/// Note: distributed by columns must be a prefix of index columns, so we just use
-/// `distributed_by_columns_len` to represent distributed by columns
-fn assemble_materialize(
-    table_name: String,
+fn assemble_input(
     table_catalog: Arc<TableCatalog>,
     context: OptimizerContextRef,
-    index_name: String,
     index_columns: &[(ExprImpl, OrderType)],
     include_columns: &[ExprImpl],
-    distributed_by_columns_len: usize,
-    cardinality: Cardinality,
-) -> Result<StreamMaterialize> {
+    required_dist: RequiredDist,
+) -> Result<LogicalPlanRoot> {
     // Build logical plan and then call gen_create_index_plan
     // LogicalProject(index_columns, include_columns)
     //   LogicalScan(table_desc)
 
-    let definition = context.normalized_sql().to_owned();
-    let retention_seconds = table_catalog.retention_seconds.and_then(NonZeroU32::new);
-
-    let logical_scan = LogicalScan::create(
-        table_name,
-        table_catalog.clone(),
-        // Index table has no indexes.
-        vec![],
-        context,
-        None,
-        cardinality,
-    );
+    let logical_scan = LogicalScan::create(table_catalog.clone(), context, None);
 
     let exprs = index_columns
         .iter()
@@ -357,9 +607,9 @@ fn assemble_materialize(
                 .get(input_ref.index)
                 .unwrap()
                 .name()
-                .to_string(),
+                .to_owned(),
             ExprImpl::FunctionCall(func) => {
-                let func_name = func.func_type().as_str_name().to_string();
+                let func_name = func.func_type().as_str_name().to_owned();
                 let mut name = func_name.clone();
                 while !col_names.insert(name.clone()) {
                     count += 1;
@@ -376,19 +626,15 @@ fn assemble_materialize(
                     .get(input_ref.index)
                     .unwrap()
                     .name()
-                    .to_string(),
+                    .to_owned(),
                 _ => unreachable!(),
             }
         }))
         .collect_vec();
 
-    PlanRoot::new_with_logical_plan(
+    Ok(PlanRoot::new_with_logical_plan(
         logical_project,
-        // schema of logical_project is such that index columns come first.
-        // so we can use distributed_by_columns_len to represent distributed by columns indices.
-        RequiredDist::PhysicalDist(Distribution::HashShard(
-            (0..distributed_by_columns_len).collect(),
-        )),
+        required_dist,
         Order::new(
             index_columns
                 .iter()
@@ -398,27 +644,65 @@ fn assemble_materialize(
         ),
         project_required_cols,
         out_names,
+    ))
+}
+
+/// Note: distributed by columns must be a prefix of index columns, so we just use
+/// `distributed_by_columns_len` to represent distributed by columns
+fn assemble_materialize(
+    database_id: DatabaseId,
+    schema_id: SchemaId,
+    table_catalog: Arc<TableCatalog>,
+    context: OptimizerContextRef,
+    index_name: String,
+    index_columns: &[(ExprImpl, OrderType)],
+    include_columns: &[ExprImpl],
+    distributed_by_columns_len: usize,
+) -> Result<StreamMaterialize> {
+    let input = assemble_input(
+        table_catalog.clone(),
+        context.clone(),
+        index_columns,
+        include_columns,
+        // schema of logical_project is such that index columns come first.
+        // so we can use distributed_by_columns_len to represent distributed by columns indices.
+        RequiredDist::PhysicalDist(Distribution::HashShard(
+            (0..distributed_by_columns_len).collect(),
+        )),
+    )?;
+
+    let definition = context.normalized_sql().to_owned();
+    let retention_seconds = table_catalog.retention_seconds.and_then(NonZeroU32::new);
+
+    input.gen_index_plan(
+        index_name,
+        database_id,
+        schema_id,
+        definition,
+        retention_seconds,
     )
-    .gen_index_plan(index_name, definition, retention_seconds)
 }
 
 pub async fn handle_create_index(
-    handler_args: HandlerArgs,
+    mut handler_args: HandlerArgs,
     if_not_exists: bool,
     index_name: ObjectName,
     table_name: ObjectName,
+    method: Option<Ident>,
     columns: Vec<OrderByExpr>,
     include: Vec<Ident>,
     distributed_by: Vec<ast::Expr>,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session.clone();
+    let resource_type =
+        resolve_streaming_job_resource_type(session.as_ref(), &mut handler_args.with_options)?;
 
     let (graph, index_table, index) = {
         let (schema_name, table, index_table_name) =
             resolve_index_schema(&session, index_name, table_name)?;
         let qualified_index_name = ObjectName(vec![
-            Ident::with_quote_unchecked('"', &schema_name),
-            Ident::with_quote_unchecked('"', &index_table_name),
+            Ident::from_real_value(&schema_name),
+            Ident::from_real_value(&index_table_name),
         ]);
         if let Either::Right(resp) = session.check_relation_name_duplicated(
             qualified_index_name,
@@ -428,25 +712,20 @@ pub async fn handle_create_index(
             return Ok(resp);
         }
 
-        let context = OptimizerContext::from_handler_args(handler_args);
+        let context = OptimizerContext::from_handler_args(handler_args)?;
         let (plan, index_table, index) = gen_create_index_plan(
             &session,
             context.into(),
             schema_name,
             table,
             index_table_name,
+            method,
             columns,
             include,
             distributed_by,
         )?;
-        let mut graph = build_graph(plan)?;
-        graph.parallelism =
-            session
-                .config()
-                .streaming_parallelism()
-                .map(|parallelism| Parallelism {
-                    parallelism: parallelism.get(),
-                });
+        let graph = build_graph(plan, Some(GraphJobType::Index))?;
+
         (graph, index_table, index)
     };
 
@@ -468,9 +747,19 @@ pub async fn handle_create_index(
             ));
 
     let catalog_writer = session.catalog_writer()?;
-    catalog_writer
-        .create_index(index, index_table, graph)
-        .await?;
+    execute_with_long_running_notification(
+        catalog_writer.create_index(
+            index,
+            index_table.to_prost(),
+            graph,
+            resource_type,
+            if_not_exists,
+        ),
+        &session,
+        "CREATE INDEX",
+        LongRunningNotificationAction::MonitorBackfillJob,
+    )
+    .await?;
 
     Ok(PgResponse::empty_result(StatementType::CREATE_INDEX))
 }

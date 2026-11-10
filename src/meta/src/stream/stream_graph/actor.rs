@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,118 +13,38 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use assert_matches::assert_matches;
-use itertools::Itertools;
 use risingwave_common::bail;
-use risingwave_common::buffer::Bitmap;
-use risingwave_common::hash::{ActorId, ActorMapping, ParallelUnitId};
+use risingwave_common::catalog::TableDesc;
+use risingwave_common::hash::{IsSingleton, VnodeCount, VnodeCountCompat};
 use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_pb::meta::table_fragments::Fragment;
-use risingwave_pb::plan_common::ExprContext;
+use risingwave_common::util::stream_graph_visitor::{
+    visit_fragment, visit_iceberg_completion_tables, visit_tables,
+};
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::update_mutation::MergeUpdate;
 use risingwave_pb::stream_plan::{
-    DispatchStrategy, Dispatcher, DispatcherType, MergeNode, StreamActor, StreamNode,
-    StreamScanType,
+    DispatchStrategy, DispatcherType, MergeNode, StreamNode, StreamScanType,
 };
 
-use super::id::GlobalFragmentIdsExt;
-use super::Locations;
-use crate::manager::{IdGenManagerImpl, MetaSrvEnv, StreamingClusterInfo, StreamingJob};
-use crate::model::{DispatcherId, FragmentId};
+use crate::MetaResult;
+use crate::model::{Fragment, FragmentDownstreamRelation, FragmentId, FragmentReplaceUpstream};
 use crate::stream::stream_graph::fragment::{
-    CompleteStreamFragmentGraph, EdgeId, EitherFragment, StreamFragmentEdge,
+    CompleteStreamFragmentGraph, DownstreamExternalEdgeId, EdgeId, EitherFragment,
+    StreamFragmentEdge,
 };
-use crate::stream::stream_graph::id::{GlobalActorId, GlobalActorIdGen, GlobalFragmentId};
+use crate::stream::stream_graph::id::GlobalFragmentId;
 use crate::stream::stream_graph::schedule;
 use crate::stream::stream_graph::schedule::Distribution;
-use crate::MetaResult;
 
-/// The upstream information of an actor during the building process. This will eventually be used
-/// to create the `MergeNode`s as the leaf executor of each actor.
-#[derive(Debug, Clone)]
-struct ActorUpstream {
-    /// The ID of this edge.
-    edge_id: EdgeId,
-
-    /// Upstream actors.
-    actors: Vec<GlobalActorId>,
-
-    /// The fragment ID of this upstream.
-    fragment_id: GlobalFragmentId,
-}
-
-/// [`ActorBuilder`] builds a stream actor in a stream DAG.
-#[derive(Debug)]
-struct ActorBuilder {
-    /// The ID of this actor.
-    actor_id: GlobalActorId,
-
-    /// The fragment ID of this actor.
-    fragment_id: GlobalFragmentId,
-
-    /// The body of this actor, verbatim from the frontend.
-    ///
-    /// This cannot be directly used for execution, and it will be rewritten after we know all of
-    /// the upstreams and downstreams in the end. See `rewrite`.
-    nodes: Arc<StreamNode>,
-
-    /// The dispatchers to the downstream actors.
-    downstreams: HashMap<DispatcherId, Dispatcher>,
-
-    /// The upstream actors.
-    upstreams: HashMap<EdgeId, ActorUpstream>,
-
-    /// The virtual node bitmap, if this fragment is hash distributed.
-    vnode_bitmap: Option<Bitmap>,
-}
-
-impl ActorBuilder {
-    fn new(
-        actor_id: GlobalActorId,
-        fragment_id: GlobalFragmentId,
-        vnode_bitmap: Option<Bitmap>,
-        node: Arc<StreamNode>,
-    ) -> Self {
-        Self {
-            actor_id,
-            fragment_id,
-            nodes: node,
-            downstreams: HashMap::new(),
-            upstreams: HashMap::new(),
-            vnode_bitmap,
-        }
-    }
-
-    fn fragment_id(&self) -> GlobalFragmentId {
-        self.fragment_id
-    }
-
-    /// Add a dispatcher to this actor.
-    fn add_dispatcher(&mut self, dispatcher: Dispatcher) {
-        self.downstreams
-            .try_insert(dispatcher.dispatcher_id, dispatcher)
-            .unwrap();
-    }
-
-    /// Add an upstream to this actor.
-    fn add_upstream(&mut self, upstream: ActorUpstream) {
-        self.upstreams
-            .try_insert(upstream.edge_id, upstream)
-            .unwrap();
-    }
-
+impl FragmentActorBuilder {
     /// Rewrite the actor body.
     ///
     /// During this process, the following things will be done:
     /// 1. Replace the logical `Exchange` in node's input with `Merge`, which can be executed on the
-    /// compute nodes.
-    /// 2. Fill the upstream mview info of the `Merge` node under the other "leaf" nodes.
+    ///    compute nodes.
     fn rewrite(&self) -> MetaResult<StreamNode> {
-        self.rewrite_inner(&self.nodes, 0)
+        self.rewrite_inner(&self.node, 0)
     }
 
     fn rewrite_inner(&self, stream_node: &StreamNode, depth: usize) -> MetaResult<StreamNode> {
@@ -143,18 +63,21 @@ impl ActorBuilder {
                 assert!(stream_node.input.is_empty());
 
                 // Index the upstreams by the an internal edge ID.
-                let upstreams = &self.upstreams[&EdgeId::Internal {
-                    link_id: stream_node.get_operator_id(),
+                let (upstream_fragment_id, _) = &self.upstreams[&EdgeId::Internal {
+                    link_id: stream_node.get_operator_id().as_raw_id(),
                 }];
 
+                let upstream_fragment_id = upstream_fragment_id.as_global_id();
+
                 Ok(StreamNode {
-                    node_body: Some(NodeBody::Merge(MergeNode {
-                        upstream_actor_id: upstreams.actors.as_global_ids(),
-                        upstream_fragment_id: upstreams.fragment_id.as_global_id(),
-                        upstream_dispatcher_type: exchange.get_strategy()?.r#type,
-                        fields: stream_node.get_fields().clone(),
-                    })),
-                    identity: "MergeExecutor".to_string(),
+                    node_body: Some(NodeBody::Merge(Box::new({
+                        MergeNode {
+                            upstream_fragment_id,
+                            upstream_dispatcher_type: exchange.get_strategy()?.r#type,
+                            ..Default::default()
+                        }
+                    }))),
+                    identity: "MergeExecutor".to_owned(),
                     ..stream_node.clone()
                 })
             }
@@ -162,6 +85,12 @@ impl ActorBuilder {
             // "Leaf" node `StreamScan`.
             NodeBody::StreamScan(stream_scan) => {
                 let input = stream_node.get_input();
+                if stream_scan.stream_scan_type() == StreamScanType::CrossDbSnapshotBackfill {
+                    // CrossDbSnapshotBackfill is a special case, which doesn't have any upstream actor
+                    // and always reads from log store.
+                    assert!(input.is_empty());
+                    return Ok(stream_node.clone());
+                }
                 assert_eq!(input.len(), 2);
 
                 let merge_node = &input[0];
@@ -170,19 +99,20 @@ impl ActorBuilder {
                 assert_matches!(batch_plan_node.node_body, Some(NodeBody::BatchPlan(_)));
 
                 // Index the upstreams by the an external edge ID.
-                let upstreams = &self.upstreams[&EdgeId::UpstreamExternal {
-                    upstream_table_id: stream_scan.table_id.into(),
-                    downstream_fragment_id: self.fragment_id,
-                }];
+                let (upstream_fragment_id, upstream_no_shuffle_actor) = &self.upstreams
+                    [&EdgeId::UpstreamExternal {
+                        upstream_job_id: stream_scan.table_id.as_job_id(),
+                        downstream_fragment_id: self.fragment_id,
+                    }];
 
-                let upstream_actor_id = upstreams.actors.as_global_ids();
-                let is_arrangement_backfill =
-                    stream_scan.stream_scan_type == StreamScanType::ArrangementBackfill as i32;
-                if !is_arrangement_backfill {
-                    assert_eq!(upstream_actor_id.len(), 1);
+                let is_shuffled_backfill = stream_scan.stream_scan_type
+                    == StreamScanType::ArrangementBackfill as i32
+                    || stream_scan.stream_scan_type == StreamScanType::SnapshotBackfill as i32;
+                if !is_shuffled_backfill {
+                    assert!(*upstream_no_shuffle_actor);
                 }
 
-                let upstream_dispatcher_type = if is_arrangement_backfill {
+                let upstream_dispatcher_type = if is_shuffled_backfill {
                     // FIXME(kwannoel): Should the upstream dispatcher type depends on the upstream distribution?
                     // If singleton, use `Simple` dispatcher, otherwise use `Hash` dispatcher.
                     DispatcherType::Hash as _
@@ -190,15 +120,18 @@ impl ActorBuilder {
                     DispatcherType::NoShuffle as _
                 };
 
+                let upstream_fragment_id = upstream_fragment_id.as_global_id();
+
                 let input = vec![
                     // Fill the merge node body with correct upstream info.
                     StreamNode {
-                        node_body: Some(NodeBody::Merge(MergeNode {
-                            upstream_actor_id,
-                            upstream_fragment_id: upstreams.fragment_id.as_global_id(),
-                            upstream_dispatcher_type,
-                            fields: merge_node.fields.clone(),
-                        })),
+                        node_body: Some(NodeBody::Merge(Box::new({
+                            MergeNode {
+                                upstream_fragment_id,
+                                upstream_dispatcher_type,
+                                ..Default::default()
+                            }
+                        }))),
                         ..merge_node.clone()
                     },
                     batch_plan_node.clone(),
@@ -227,27 +160,32 @@ impl ActorBuilder {
                 };
 
                 // Index the upstreams by the an external edge ID.
-                let upstreams = &self.upstreams[&EdgeId::UpstreamExternal {
-                    upstream_table_id: upstream_source_id.into(),
-                    downstream_fragment_id: self.fragment_id,
-                }];
+                let (upstream_fragment_id, upstream_is_no_shuffle) = &self.upstreams
+                    [&EdgeId::UpstreamExternal {
+                        upstream_job_id: upstream_source_id.as_share_source_job_id(),
+                        downstream_fragment_id: self.fragment_id,
+                    }];
 
-                let upstream_actor_id = upstreams.actors.as_global_ids();
-                // Upstream Cdc Source should be singleton.
-                // SourceBackfill is NoShuffle 1-1 correspondence.
-                // So they both should have only one upstream actor.
-                assert_eq!(upstream_actor_id.len(), 1);
+                assert!(
+                    *upstream_is_no_shuffle,
+                    "Upstream Cdc Source should be singleton. \
+                    SourceBackfill is NoShuffle 1-1 correspondence. \
+                    So they both should have only one upstream actor."
+                );
+
+                let upstream_fragment_id = upstream_fragment_id.as_global_id();
 
                 // rewrite the input
                 let input = vec![
                     // Fill the merge node body with correct upstream info.
                     StreamNode {
-                        node_body: Some(NodeBody::Merge(MergeNode {
-                            upstream_actor_id,
-                            upstream_fragment_id: upstreams.fragment_id.as_global_id(),
-                            upstream_dispatcher_type: DispatcherType::NoShuffle as _,
-                            fields: merge_node.fields.clone(),
-                        })),
+                        node_body: Some(NodeBody::Merge(Box::new({
+                            MergeNode {
+                                upstream_fragment_id,
+                                upstream_dispatcher_type: DispatcherType::NoShuffle as _,
+                                ..Default::default()
+                            }
+                        }))),
                         ..merge_node.clone()
                     },
                 ];
@@ -271,34 +209,6 @@ impl ActorBuilder {
             }
         }
     }
-
-    /// Build an actor after all the upstreams and downstreams are processed.
-    fn build(self, job: &StreamingJob, expr_context: ExprContext) -> MetaResult<StreamActor> {
-        let rewritten_nodes = self.rewrite()?;
-
-        // TODO: store each upstream separately
-        let upstream_actor_id = self
-            .upstreams
-            .into_values()
-            .flat_map(|ActorUpstream { actors, .. }| actors.as_global_ids())
-            .collect();
-        // Only fill the definition when debug assertions enabled, otherwise use name instead.
-        #[cfg(not(debug_assertions))]
-        let mview_definition = job.name();
-        #[cfg(debug_assertions)]
-        let mview_definition = job.definition();
-
-        Ok(StreamActor {
-            actor_id: self.actor_id.as_global_id(),
-            fragment_id: self.fragment_id.as_global_id(),
-            nodes: Some(rewritten_nodes),
-            dispatcher: self.downstreams.into_values().collect(),
-            upstream_actor_id,
-            vnode_bitmap: self.vnode_bitmap.map(|b| b.to_protobuf()),
-            mview_definition,
-            expr_context: Some(expr_context),
-        })
-    }
 }
 
 /// The required changes to an existing external actor to build the graph of a streaming job.
@@ -306,32 +216,63 @@ impl ActorBuilder {
 /// For example, when we're creating an mview on an existing mview, we need to add new downstreams
 /// to the upstream actors, by adding new dispatchers.
 #[derive(Default)]
-struct ExternalChange {
-    /// The new downstreams to be added, indexed by the dispatcher ID.
-    new_downstreams: HashMap<DispatcherId, Dispatcher>,
-
-    /// The new upstreams to be added (replaced), indexed by the upstream fragment ID.
-    new_upstreams: HashMap<GlobalFragmentId, ActorUpstream>,
+struct UpstreamFragmentChange {
+    /// The new downstreams to be added.
+    new_downstreams: HashMap<GlobalFragmentId, DispatchStrategy>,
 }
 
-impl ExternalChange {
+#[derive(Default)]
+struct DownstreamFragmentChange {
+    /// The new upstreams to be added (replaced), indexed by the edge id to upstream fragment.
+    /// `edge_id` -> new upstream fragment id
+    new_upstreams: HashMap<DownstreamExternalEdgeId, GlobalFragmentId>,
+}
+
+impl UpstreamFragmentChange {
     /// Add a dispatcher to the external actor.
-    fn add_dispatcher(&mut self, dispatcher: Dispatcher) {
+    fn add_dispatcher(
+        &mut self,
+        downstream_fragment_id: GlobalFragmentId,
+        dispatch: DispatchStrategy,
+    ) {
         self.new_downstreams
-            .try_insert(dispatcher.dispatcher_id, dispatcher)
-            .unwrap();
-    }
-
-    /// Add an upstream to the external actor.
-    fn add_upstream(&mut self, upstream: ActorUpstream) {
-        self.new_upstreams
-            .try_insert(upstream.fragment_id, upstream)
+            .try_insert(downstream_fragment_id, dispatch)
             .unwrap();
     }
 }
 
-/// The parallel unit location of actors.
-type ActorLocations = BTreeMap<GlobalActorId, ParallelUnitId>;
+impl DownstreamFragmentChange {
+    /// Add an upstream to the external actor.
+    fn add_upstream(
+        &mut self,
+        edge_id: DownstreamExternalEdgeId,
+        new_upstream_fragment_id: GlobalFragmentId,
+    ) {
+        self.new_upstreams
+            .try_insert(edge_id, new_upstream_fragment_id)
+            .unwrap();
+    }
+}
+
+#[derive(Debug)]
+struct FragmentActorBuilder {
+    fragment_id: GlobalFragmentId,
+    node: StreamNode,
+    downstreams: HashMap<GlobalFragmentId, DispatchStrategy>,
+    // edge_id -> (upstream fragment_id, whether the edge is no shuffle)
+    upstreams: HashMap<EdgeId, (GlobalFragmentId, bool)>,
+}
+
+impl FragmentActorBuilder {
+    fn new(fragment_id: GlobalFragmentId, node: StreamNode) -> Self {
+        Self {
+            fragment_id,
+            node,
+            downstreams: Default::default(),
+            upstreams: Default::default(),
+        }
+    }
+}
 
 /// The actual mutable state of building an actor graph.
 ///
@@ -342,110 +283,43 @@ type ActorLocations = BTreeMap<GlobalActorId, ParallelUnitId>;
 #[derive(Default)]
 struct ActorGraphBuildStateInner {
     /// The builders of the actors to be built.
-    actor_builders: BTreeMap<GlobalActorId, ActorBuilder>,
+    fragment_actor_builders: BTreeMap<GlobalFragmentId, FragmentActorBuilder>,
 
-    /// The scheduled locations of the actors to be built.
-    building_locations: ActorLocations,
+    /// The required changes to the external downstream fragment. See [`DownstreamFragmentChange`].
+    /// Indexed by the `fragment_id` of fragments that have updates on its downstream.
+    downstream_fragment_changes: BTreeMap<GlobalFragmentId, DownstreamFragmentChange>,
 
-    /// The required changes to the external actors. See [`ExternalChange`].
-    external_changes: BTreeMap<GlobalActorId, ExternalChange>,
-
-    /// The actual locations of the external actors.
-    external_locations: ActorLocations,
+    /// The required changes to the external upstream fragment. See [`UpstreamFragmentChange`].
+    /// /// Indexed by the `fragment_id` of fragments that have updates on its upstream.
+    upstream_fragment_changes: BTreeMap<GlobalFragmentId, UpstreamFragmentChange>,
 }
 
 /// The information of a fragment, used for parameter passing for `Inner::add_link`.
-struct FragmentLinkNode<'a> {
+struct FragmentLinkNode {
     fragment_id: GlobalFragmentId,
-    actor_ids: &'a [GlobalActorId],
-    distribution: &'a Distribution,
 }
 
 impl ActorGraphBuildStateInner {
-    /// Insert new generated actor and record its location.
+    /// Add the new downstream fragment relation to a fragment.
     ///
-    /// The `vnode_bitmap` should be `Some` for the actors of hash-distributed fragments.
-    fn add_actor(
+    /// - If the fragment is to be built, the fragment relation will be added to the fragment actor builder.
+    /// - If the fragment is an external existing fragment, the fragment relation will be added to the external changes.
+    fn add_dispatcher(
         &mut self,
-        actor_id: GlobalActorId,
         fragment_id: GlobalFragmentId,
-        parallel_unit_id: ParallelUnitId,
-        vnode_bitmap: Option<Bitmap>,
-        node: Arc<StreamNode>,
-    ) {
-        self.actor_builders
-            .try_insert(
-                actor_id,
-                ActorBuilder::new(actor_id, fragment_id, vnode_bitmap, node),
-            )
-            .unwrap();
-
-        self.building_locations
-            .try_insert(actor_id, parallel_unit_id)
-            .unwrap();
-    }
-
-    /// Record the location of an external actor.
-    fn record_external_location(
-        &mut self,
-        actor_id: GlobalActorId,
-        parallel_unit_id: ParallelUnitId,
-    ) {
-        self.external_locations
-            .try_insert(actor_id, parallel_unit_id)
-            .unwrap();
-    }
-
-    /// Create a new hash dispatcher.
-    fn new_hash_dispatcher(
-        strategy: &DispatchStrategy,
         downstream_fragment_id: GlobalFragmentId,
-        downstream_actors: &[GlobalActorId],
-        downstream_actor_mapping: ActorMapping,
-    ) -> Dispatcher {
-        assert_eq!(strategy.r#type(), DispatcherType::Hash);
-
-        Dispatcher {
-            r#type: DispatcherType::Hash as _,
-            dist_key_indices: strategy.dist_key_indices.clone(),
-            output_indices: strategy.output_indices.clone(),
-            hash_mapping: Some(downstream_actor_mapping.to_protobuf()),
-            dispatcher_id: downstream_fragment_id.as_global_id() as u64,
-            downstream_actor_id: downstream_actors.as_global_ids(),
-        }
-    }
-
-    /// Create a new dispatcher for non-hash types.
-    fn new_normal_dispatcher(
-        strategy: &DispatchStrategy,
-        downstream_fragment_id: GlobalFragmentId,
-        downstream_actors: &[GlobalActorId],
-    ) -> Dispatcher {
-        assert_ne!(strategy.r#type(), DispatcherType::Hash);
-        assert!(strategy.dist_key_indices.is_empty());
-
-        Dispatcher {
-            r#type: strategy.r#type,
-            dist_key_indices: vec![],
-            output_indices: strategy.output_indices.clone(),
-            hash_mapping: None,
-            dispatcher_id: downstream_fragment_id.as_global_id() as u64,
-            downstream_actor_id: downstream_actors.as_global_ids(),
-        }
-    }
-
-    /// Add the new dispatcher for an actor.
-    ///
-    /// - If the actor is to be built, the dispatcher will be added to the actor builder.
-    /// - If the actor is an external actor, the dispatcher will be added to the external changes.
-    fn add_dispatcher(&mut self, actor_id: GlobalActorId, dispatcher: Dispatcher) {
-        if let Some(actor_builder) = self.actor_builders.get_mut(&actor_id) {
-            actor_builder.add_dispatcher(dispatcher);
+        dispatch: DispatchStrategy,
+    ) {
+        if let Some(builder) = self.fragment_actor_builders.get_mut(&fragment_id) {
+            builder
+                .downstreams
+                .try_insert(downstream_fragment_id, dispatch)
+                .unwrap();
         } else {
-            self.external_changes
-                .entry(actor_id)
+            self.upstream_fragment_changes
+                .entry(fragment_id)
                 .or_default()
-                .add_dispatcher(dispatcher);
+                .add_dispatcher(downstream_fragment_id, dispatch);
         }
     }
 
@@ -453,126 +327,67 @@ impl ActorGraphBuildStateInner {
     ///
     /// - If the actor is to be built, the upstream will be added to the actor builder.
     /// - If the actor is an external actor, the upstream will be added to the external changes.
-    fn add_upstream(&mut self, actor_id: GlobalActorId, upstream: ActorUpstream) {
-        if let Some(actor_builder) = self.actor_builders.get_mut(&actor_id) {
-            actor_builder.add_upstream(upstream);
+    fn add_upstream(
+        &mut self,
+        fragment_id: GlobalFragmentId,
+        edge_id: EdgeId,
+        upstream_fragment_id: GlobalFragmentId,
+        is_no_shuffle: bool,
+    ) {
+        if let Some(builder) = self.fragment_actor_builders.get_mut(&fragment_id) {
+            builder
+                .upstreams
+                .try_insert(edge_id, (upstream_fragment_id, is_no_shuffle))
+                .unwrap();
         } else {
-            self.external_changes
-                .entry(actor_id)
+            let EdgeId::DownstreamExternal(edge_id) = edge_id else {
+                unreachable!("edge from internal to external must be `DownstreamExternal`")
+            };
+            self.downstream_fragment_changes
+                .entry(fragment_id)
                 .or_default()
-                .add_upstream(upstream);
+                .add_upstream(edge_id, upstream_fragment_id);
         }
-    }
-
-    /// Get the location of an actor. Will look up the location map of both the actors to be built
-    /// and the external actors.
-    fn get_location(&self, actor_id: GlobalActorId) -> ParallelUnitId {
-        self.building_locations
-            .get(&actor_id)
-            .copied()
-            .or_else(|| self.external_locations.get(&actor_id).copied())
-            .unwrap()
     }
 
     /// Add a "link" between two fragments in the graph.
     ///
-    /// The `edge` will be expanded into multiple (downstream - upstream) pairs for the actors in
-    /// the two fragments, based on the distribution and the dispatch strategy. They will be
+    /// The `edge` will be transformed into the fragment relation (downstream - upstream) pair between two fragments,
+    /// based on the distribution and the dispatch strategy. They will be
     /// finally transformed to `Dispatcher` and `Merge` nodes when building the actors.
     ///
-    /// If there're existing (external) fragments, the info will be recorded in `external_changes`,
+    /// If there're existing (external) fragments, the info will be recorded in `upstream_fragment_changes` and `downstream_fragment_changes`,
     /// instead of the actor builders.
-    fn add_link<'a>(
+    fn add_link(
         &mut self,
-        upstream: FragmentLinkNode<'a>,
-        downstream: FragmentLinkNode<'a>,
-        edge: &'a StreamFragmentEdge,
+        upstream: FragmentLinkNode,
+        downstream: FragmentLinkNode,
+        edge: &StreamFragmentEdge,
     ) {
         let dt = edge.dispatch_strategy.r#type();
 
         match dt {
             // For `NoShuffle`, make n "1-1" links between the actors.
             DispatcherType::NoShuffle => {
-                assert_eq!(upstream.actor_ids.len(), downstream.actor_ids.len());
-                let upstream_locations: HashMap<_, _> = upstream
-                    .actor_ids
-                    .iter()
-                    .map(|id| (self.get_location(*id), *id))
-                    .collect();
-                let downstream_locations: HashMap<_, _> = downstream
-                    .actor_ids
-                    .iter()
-                    .map(|id| (self.get_location(*id), *id))
-                    .collect();
+                // Create a new dispatcher just between these two actors.
+                self.add_dispatcher(
+                    upstream.fragment_id,
+                    downstream.fragment_id,
+                    edge.dispatch_strategy.clone(),
+                );
 
-                for (location, upstream_id) in upstream_locations {
-                    let downstream_id = downstream_locations.get(&location).unwrap();
-
-                    // Create a new dispatcher just between these two actors.
-                    self.add_dispatcher(
-                        upstream_id,
-                        Self::new_normal_dispatcher(
-                            &edge.dispatch_strategy,
-                            downstream.fragment_id,
-                            &[*downstream_id],
-                        ),
-                    );
-
-                    // Also record the upstream for the downstream actor.
-                    self.add_upstream(
-                        *downstream_id,
-                        ActorUpstream {
-                            edge_id: edge.id,
-                            actors: vec![upstream_id],
-                            fragment_id: upstream.fragment_id,
-                        },
-                    );
-                }
+                // Also record the upstream for the downstream actor.
+                self.add_upstream(downstream.fragment_id, edge.id, upstream.fragment_id, true);
             }
 
             // Otherwise, make m * n links between the actors.
             DispatcherType::Hash | DispatcherType::Broadcast | DispatcherType::Simple => {
-                // Add dispatchers for the upstream actors.
-                let dispatcher = if let DispatcherType::Hash = dt {
-                    // Transform the `ParallelUnitMapping` from the downstream distribution to the
-                    // `ActorMapping`, used for the `HashDispatcher` for the upstream actors.
-                    let downstream_locations: HashMap<ParallelUnitId, ActorId> = downstream
-                        .actor_ids
-                        .iter()
-                        .map(|&actor_id| (self.get_location(actor_id), actor_id.as_global_id()))
-                        .collect();
-                    let actor_mapping = downstream
-                        .distribution
-                        .as_hash()
-                        .unwrap()
-                        .to_actor(&downstream_locations);
-
-                    Self::new_hash_dispatcher(
-                        &edge.dispatch_strategy,
-                        downstream.fragment_id,
-                        downstream.actor_ids,
-                        actor_mapping,
-                    )
-                } else {
-                    Self::new_normal_dispatcher(
-                        &edge.dispatch_strategy,
-                        downstream.fragment_id,
-                        downstream.actor_ids,
-                    )
-                };
-                for upstream_id in upstream.actor_ids {
-                    self.add_dispatcher(*upstream_id, dispatcher.clone());
-                }
-
-                // Add upstreams for the downstream actors.
-                let actor_upstream = ActorUpstream {
-                    edge_id: edge.id,
-                    actors: upstream.actor_ids.to_vec(),
-                    fragment_id: upstream.fragment_id,
-                };
-                for downstream_id in downstream.actor_ids {
-                    self.add_upstream(*downstream_id, actor_upstream.clone());
-                }
+                self.add_dispatcher(
+                    upstream.fragment_id,
+                    downstream.fragment_id,
+                    edge.dispatch_strategy.clone(),
+                );
+                self.add_upstream(downstream.fragment_id, edge.id, upstream.fragment_id, false);
             }
 
             DispatcherType::Unspecified => unreachable!(),
@@ -584,41 +399,18 @@ impl ActorGraphBuildStateInner {
 struct ActorGraphBuildState {
     /// The actual state.
     inner: ActorGraphBuildStateInner,
-
-    /// The actor IDs of each fragment.
-    fragment_actors: HashMap<GlobalFragmentId, Vec<GlobalActorId>>,
-
-    /// The next local actor id to use.
-    next_local_id: u32,
-
-    /// The global actor id generator.
-    actor_id_gen: GlobalActorIdGen,
 }
 
 impl ActorGraphBuildState {
     /// Create an empty state with the given id generator.
-    fn new(actor_id_gen: GlobalActorIdGen) -> Self {
+    fn new() -> Self {
         Self {
             inner: Default::default(),
-            fragment_actors: Default::default(),
-            next_local_id: 0,
-            actor_id_gen,
         }
-    }
-
-    /// Get the next global actor id.
-    fn next_actor_id(&mut self) -> GlobalActorId {
-        let local_id = self.next_local_id;
-        self.next_local_id += 1;
-
-        self.actor_id_gen.to_global_id(local_id)
     }
 
     /// Finish the build and return the inner state.
     fn finish(self) -> ActorGraphBuildStateInner {
-        // Assert that all the actors are built.
-        assert_eq!(self.actor_id_gen.len(), self.next_local_id);
-
         self.inner
     }
 }
@@ -628,210 +420,221 @@ impl ActorGraphBuildState {
 pub struct ActorGraphBuildResult {
     /// The graph of sealed fragments, including all actors.
     pub graph: BTreeMap<FragmentId, Fragment>,
-
-    /// The scheduled locations of the actors to be built.
-    pub building_locations: Locations,
-
-    /// The actual locations of the external actors.
-    pub existing_locations: Locations,
+    /// The downstream fragments of the fragments from the new graph to be created.
+    /// Including the fragment relation to external downstream fragment.
+    pub downstream_fragment_relations: FragmentDownstreamRelation,
 
     /// The new dispatchers to be added to the upstream mview actors. Used for MV on MV.
-    pub dispatchers: HashMap<ActorId, Vec<Dispatcher>>,
+    pub upstream_fragment_downstreams: FragmentDownstreamRelation,
 
-    /// The updates to be applied to the downstream chain actors. Used for schema change (replace
+    /// The updates to be applied to the downstream fragment merge node. Used for schema change (replace
     /// table plan).
-    pub merge_updates: Vec<MergeUpdate>,
+    pub replace_upstream: FragmentReplaceUpstream,
 }
 
 /// [`ActorGraphBuilder`] builds the actor graph for the given complete fragment graph, based on the
 /// current cluster info and the required parallelism.
+#[derive(Debug)]
 pub struct ActorGraphBuilder {
     /// The pre-scheduled distribution for each building fragment.
     distributions: HashMap<GlobalFragmentId, Distribution>,
 
-    /// The actual distribution for each existing fragment.
-    existing_distributions: HashMap<GlobalFragmentId, Distribution>,
-
     /// The complete fragment graph.
     fragment_graph: CompleteStreamFragmentGraph,
-
-    /// The cluster info for creating a streaming job.
-    cluster_info: StreamingClusterInfo,
 }
 
 impl ActorGraphBuilder {
     /// Create a new actor graph builder with the given "complete" graph. Returns an error if the
     /// graph is failed to be scheduled.
-    pub fn new(
-        streaming_job_id: u32,
-        fragment_graph: CompleteStreamFragmentGraph,
-        cluster_info: StreamingClusterInfo,
-        default_parallelism: NonZeroUsize,
-    ) -> MetaResult<Self> {
-        let existing_distributions = fragment_graph.existing_distribution();
+    pub fn new(fragment_graph: CompleteStreamFragmentGraph) -> MetaResult<Self> {
+        let expected_vnode_count = fragment_graph.max_parallelism();
+        let scheduler = schedule::Scheduler::new(expected_vnode_count)?;
 
-        // Schedule the distribution of all building fragments.
-        let scheduler = schedule::Scheduler::new(
-            streaming_job_id,
-            cluster_info.parallel_units.values().cloned(),
-            default_parallelism,
-        )?;
         let distributions = scheduler.schedule(&fragment_graph)?;
+
+        // Fill the vnode count for each internal table, based on schedule result.
+        let mut fragment_graph = fragment_graph;
+        let mut fetch_tables = HashMap::new();
+        for (id, fragment) in fragment_graph.building_fragments_mut() {
+            let mut error = None;
+            let fragment_vnode_count = distributions[id].vnode_count();
+            visit_tables(fragment, |table, _| {
+                if error.is_some() {
+                    return;
+                }
+                // There are special cases where a hash-distributed fragment contains singleton
+                // internal tables, e.g., the state table of `Source` executors.
+                let vnode_count = if table.is_singleton() {
+                    if fragment_vnode_count > 1 {
+                        tracing::info!(
+                            table.name,
+                            "found singleton table in hash-distributed fragment"
+                        );
+                    }
+                    1
+                } else {
+                    fragment_vnode_count
+                };
+                match table.vnode_count_inner().value_opt() {
+                    // Vnode count of this table is not set to placeholder, meaning that we are replacing
+                    // a streaming job, and the existing state table requires a specific vnode count.
+                    // Check if it's the same with what we derived from the schedule result.
+                    //
+                    // Typically, inconsistency should not happen as we force to align the vnode count
+                    // when planning the new streaming job in the frontend.
+                    Some(required_vnode_count) if required_vnode_count != vnode_count => {
+                        error = Some(format!(
+                            "failed to align vnode count for table {}({}): required {}, but got {}",
+                            table.id, table.name, required_vnode_count, vnode_count
+                        ));
+                    }
+                    // Normal cases.
+                    _ => table.maybe_vnode_count = VnodeCount::set(vnode_count).to_protobuf(),
+                }
+            });
+            if let Some(error) = error {
+                bail!(error);
+            }
+            visit_fragment(fragment, |body| {
+                if let NodeBody::StreamFsFetch(node) = body
+                    && let Some(table) = node
+                        .node_inner
+                        .as_ref()
+                        .and_then(|source| source.state_table.as_ref())
+                {
+                    fetch_tables.insert(table.id, table.clone());
+                }
+            });
+        }
+        // The frontend only references the Fetch state table by ID. Derive the descriptor here,
+        // after vnode counts are resolved, so it always matches the persisted Fetch catalog.
+        for fragment in fragment_graph.building_fragments_mut().values_mut() {
+            let mut result = Ok(());
+            visit_iceberg_completion_tables(fragment, |desc| {
+                if result.is_err() {
+                    return;
+                }
+                result = match fetch_tables.get(&desc.table_id) {
+                    Some(fetch) => TableDesc::from_pb_table(fetch)
+                        .try_to_protobuf()
+                        .map(|filled| *desc = filled),
+                    None => Err(anyhow::anyhow!(
+                        "Iceberg completion table {} must reference a Fetch state table in this ingestion graph",
+                        desc.table_id
+                    )),
+                };
+            });
+            result?;
+        }
 
         Ok(Self {
             distributions,
-            existing_distributions,
             fragment_graph,
-            cluster_info,
         })
-    }
-
-    /// Get the distribution of the given fragment. Will look up the distribution map of both the
-    /// building and existing fragments.
-    fn get_distribution(&self, fragment_id: GlobalFragmentId) -> &Distribution {
-        self.distributions
-            .get(&fragment_id)
-            .or_else(|| self.existing_distributions.get(&fragment_id))
-            .unwrap()
-    }
-
-    /// Convert the actor location map to the [`Locations`] struct.
-    fn build_locations(&self, actor_locations: ActorLocations) -> Locations {
-        let actor_locations = actor_locations
-            .into_iter()
-            .map(|(id, p)| {
-                (
-                    id.as_global_id(),
-                    self.cluster_info.parallel_units[&p].clone(),
-                )
-            })
-            .collect();
-
-        let worker_locations = self.cluster_info.worker_nodes.clone();
-
-        Locations {
-            actor_locations,
-            worker_locations,
-        }
     }
 
     /// Build a stream graph by duplicating each fragment as parallel actors. Returns
     /// [`ActorGraphBuildResult`] that will be further used to build actors on the compute nodes.
-    pub async fn generate_graph(
-        self,
-        env: &MetaSrvEnv,
-        job: &StreamingJob,
-        expr_context: ExprContext,
-    ) -> MetaResult<ActorGraphBuildResult> {
-        // Pre-generate IDs for all actors.
-        let actor_len = self
-            .distributions
-            .values()
-            .map(|d| d.parallelism())
-            .sum::<usize>() as u64;
-        let id_gen = match env.id_gen_manager() {
-            IdGenManagerImpl::Kv(mgr) => GlobalActorIdGen::new(mgr, actor_len).await?,
-            IdGenManagerImpl::Sql(mgr) => GlobalActorIdGen::new_v2(mgr, actor_len),
-        };
-
+    pub fn generate_graph(self) -> MetaResult<ActorGraphBuildResult> {
         // Build the actor graph and get the final state.
         let ActorGraphBuildStateInner {
-            actor_builders,
-            building_locations,
-            external_changes,
-            external_locations,
-        } = self.build_actor_graph(id_gen)?;
+            fragment_actor_builders,
+            downstream_fragment_changes,
+            upstream_fragment_changes,
+        } = self.build_actor_graph()?;
 
-        for parallel_unit_id in external_locations.values() {
-            if let Some(parallel_unit) = self
-                .cluster_info
-                .unschedulable_parallel_units
-                .get(parallel_unit_id)
-            {
-                bail!(
-                    "The worker {} where the associated upstream is located is unscheduable",
-                    parallel_unit.worker_node_id
-                );
-            }
-        }
-
-        // Serialize the graph into a map of sealed fragments.
+        let mut downstream_fragment_relations: FragmentDownstreamRelation = HashMap::new();
+        // Serialize the graph into sealed fragments.
         let graph = {
-            let mut actors: HashMap<GlobalFragmentId, Vec<StreamActor>> = HashMap::new();
+            // As all fragments are processed, we can now `rewrite` the stream nodes where the
+            // `Exchange` and `Chain` are rewritten.
+            let mut fragment_nodes: HashMap<GlobalFragmentId, StreamNode> = HashMap::new();
 
-            // As all fragments are processed, we can now `build` the actors where the `Exchange`
-            // and `Chain` are rewritten.
-            for builder in actor_builders.into_values() {
-                let fragment_id = builder.fragment_id();
-                let actor = builder.build(job, expr_context.clone())?;
-                actors.entry(fragment_id).or_default().push(actor);
+            for (fragment_id, builder) in fragment_actor_builders {
+                let global_fragment_id = fragment_id.as_global_id();
+                let node = builder.rewrite()?;
+                downstream_fragment_relations
+                    .try_insert(
+                        global_fragment_id,
+                        builder
+                            .downstreams
+                            .into_iter()
+                            .map(|(id, dispatch)| (id.as_global_id(), dispatch).into())
+                            .collect(),
+                    )
+                    .expect("non-duplicate");
+                fragment_nodes
+                    .try_insert(fragment_id, node)
+                    .expect("non-duplicate");
             }
 
-            actors
-                .into_iter()
-                .map(|(fragment_id, actors)| {
-                    let distribution = self.distributions[&fragment_id].clone();
-                    let fragment =
-                        self.fragment_graph
-                            .seal_fragment(fragment_id, actors, distribution);
-                    let fragment_id = fragment_id.as_global_id();
-                    (fragment_id, fragment)
-                })
-                .collect()
+            let mut graph = BTreeMap::new();
+            for (fragment_id, stream_node) in fragment_nodes {
+                let distribution = self.distributions[&fragment_id].clone();
+                let fragment =
+                    self.fragment_graph
+                        .seal_fragment(fragment_id, distribution, stream_node);
+                let fragment_id = fragment_id.as_global_id();
+                graph.insert(fragment_id, fragment);
+            }
+            graph
         };
 
-        // Convert the actor location map to the `Locations` struct.
-        let building_locations = self.build_locations(building_locations);
-        let existing_locations = self.build_locations(external_locations);
-
-        // Extract the new dispatchers from the external changes.
-        let dispatchers = external_changes
-            .iter()
-            .map(|(actor_id, change)| {
+        // Extract the new fragment relation from the external changes.
+        let upstream_fragment_downstreams = upstream_fragment_changes
+            .into_iter()
+            .map(|(fragment_id, changes)| {
                 (
-                    actor_id.as_global_id(),
-                    change.new_downstreams.values().cloned().collect_vec(),
+                    fragment_id.as_global_id(),
+                    changes
+                        .new_downstreams
+                        .into_iter()
+                        .map(|(downstream_fragment_id, new_dispatch)| {
+                            (downstream_fragment_id.as_global_id(), new_dispatch).into()
+                        })
+                        .collect(),
                 )
             })
-            .filter(|(_, v)| !v.is_empty())
             .collect();
 
         // Extract the updates for merge executors from the external changes.
-        let merge_updates = external_changes
-            .iter()
-            .flat_map(|(actor_id, change)| {
-                change.new_upstreams.values().map(move |upstream| {
-                    let EdgeId::DownstreamExternal {
-                        original_upstream_fragment_id,
-                        ..
-                    } = upstream.edge_id
-                    else {
-                        unreachable!("edge from internal to external must be `DownstreamExternal`")
-                    };
-
-                    MergeUpdate {
-                        actor_id: actor_id.as_global_id(),
-                        upstream_fragment_id: original_upstream_fragment_id.as_global_id(),
-                        new_upstream_fragment_id: Some(upstream.fragment_id.as_global_id()),
-                        added_upstream_actor_id: upstream.actors.as_global_ids(),
-                        removed_upstream_actor_id: vec![],
-                    }
-                })
+        let replace_upstream = downstream_fragment_changes
+            .into_iter()
+            .map(|(fragment_id, changes)| {
+                let fragment_id = fragment_id.as_global_id();
+                (
+                    fragment_id,
+                    changes
+                        .new_upstreams
+                        .into_iter()
+                        .map(move |(edge_id, upstream_fragment_id)| {
+                            let upstream_fragment_id = upstream_fragment_id.as_global_id();
+                            let DownstreamExternalEdgeId {
+                                original_upstream_fragment_id,
+                                ..
+                            } = edge_id;
+                            (
+                                original_upstream_fragment_id.as_global_id(),
+                                upstream_fragment_id,
+                            )
+                        })
+                        .collect(),
+                )
             })
+            .filter(|(_, fragment_changes): &(_, HashMap<_, _>)| !fragment_changes.is_empty())
             .collect();
 
         Ok(ActorGraphBuildResult {
             graph,
-            building_locations,
-            existing_locations,
-            dispatchers,
-            merge_updates,
+            downstream_fragment_relations,
+            upstream_fragment_downstreams,
+            replace_upstream,
         })
     }
 
     /// Build actor graph for each fragment, using topological order.
-    fn build_actor_graph(&self, id_gen: GlobalActorIdGen) -> MetaResult<ActorGraphBuildStateInner> {
-        let mut state = ActorGraphBuildState::new(id_gen);
+    fn build_actor_graph(&self) -> MetaResult<ActorGraphBuildStateInner> {
+        let mut state = ActorGraphBuildState::new();
 
         // Use topological sort to build the graph from downstream to upstream. (The first fragment
         // popped out from the heap will be the top-most node in plan, or the sink in stream graph.)
@@ -849,86 +652,247 @@ impl ActorGraphBuilder {
         state: &mut ActorGraphBuildState,
     ) -> MetaResult<()> {
         let current_fragment = self.fragment_graph.get_fragment(fragment_id);
-        let distribution = self.get_distribution(fragment_id);
 
         // First, add or record the actors for the current fragment into the state.
-        let actor_ids = match current_fragment {
+        match current_fragment {
             // For building fragments, we need to generate the actor builders.
             EitherFragment::Building(current_fragment) => {
-                let node = Arc::new(current_fragment.node.clone().unwrap());
-                let bitmaps = distribution.as_hash().map(|m| m.to_bitmaps());
-
-                distribution
-                    .parallel_units()
-                    .map(|parallel_unit_id| {
-                        let actor_id = state.next_actor_id();
-                        let vnode_bitmap = bitmaps.as_ref().map(|m| &m[&parallel_unit_id]).cloned();
-
-                        state.inner.add_actor(
-                            actor_id,
-                            fragment_id,
-                            parallel_unit_id,
-                            vnode_bitmap,
-                            node.clone(),
-                        );
-
-                        actor_id
-                    })
-                    .collect_vec()
+                let node = current_fragment.node.clone().unwrap();
+                state
+                    .inner
+                    .fragment_actor_builders
+                    .try_insert(fragment_id, FragmentActorBuilder::new(fragment_id, node))
+                    .expect("non-duplicate");
             }
 
             // For existing fragments, we only need to record the actor locations.
-            EitherFragment::Existing(existing_fragment) => existing_fragment
-                .actors
-                .iter()
-                .map(|a| {
-                    let actor_id = GlobalActorId::new(a.actor_id);
-                    let parallel_unit_id = match &distribution {
-                        Distribution::Singleton(parallel_unit_id) => *parallel_unit_id,
-                        Distribution::Hash(mapping) => mapping
-                            .get_matched(&Bitmap::from(a.get_vnode_bitmap().unwrap()))
-                            .unwrap(),
-                    };
-
-                    state
-                        .inner
-                        .record_external_location(actor_id, parallel_unit_id);
-
-                    actor_id
-                })
-                .collect_vec(),
+            EitherFragment::Existing => {}
         };
 
         // Then, add links between the current fragment and its downstream fragments.
         for (downstream_fragment_id, edge) in self.fragment_graph.get_downstreams(fragment_id) {
-            let downstream_actors = state
-                .fragment_actors
-                .get(&downstream_fragment_id)
-                .expect("downstream fragment not processed yet");
-
-            let downstream_distribution = self.get_distribution(downstream_fragment_id);
-
             state.inner.add_link(
-                FragmentLinkNode {
-                    fragment_id,
-                    actor_ids: &actor_ids,
-                    distribution,
-                },
+                FragmentLinkNode { fragment_id },
                 FragmentLinkNode {
                     fragment_id: downstream_fragment_id,
-                    actor_ids: downstream_actors,
-                    distribution: downstream_distribution,
                 },
                 edge,
             );
         }
 
-        // Finally, record the actor IDs for the current fragment.
-        state
-            .fragment_actors
-            .try_insert(fragment_id, actor_ids)
-            .unwrap_or_else(|_| panic!("fragment {:?} is already processed", fragment_id));
+        Ok(())
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use risingwave_common::catalog::FragmentTypeFlag;
+    use risingwave_common::hash::VirtualNode;
+    use risingwave_common::types::DataType;
+    use risingwave_common::util::sort_util::OrderType;
+    use risingwave_pb::catalog::PbTable;
+    use risingwave_pb::common::PbColumnOrder;
+    use risingwave_pb::ddl_service::TableJobType;
+    use risingwave_pb::plan_common::{PbColumnCatalog, PbColumnDesc, StorageTableDesc};
+    use risingwave_pb::stream_plan::stream_fragment_graph::{
+        StreamFragment, StreamFragmentEdge as StreamFragmentEdgeProto,
+    };
+    use risingwave_pb::stream_plan::{
+        ExchangeNode, PbDispatchOutputMapping, PbStreamContext, SourceNode,
+        StreamFragmentGraph as StreamFragmentGraphProto, StreamFsFetch, StreamFsFetchNode,
+        StreamSource,
+    };
+
+    use super::*;
+    use crate::manager::{MetaSrvEnv, StreamingJob};
+    use crate::stream::StreamFragmentGraph;
+
+    const LIST_TABLE: u32 = 0;
+    const FETCH_TABLE: u32 = 1;
+
+    fn column(name: &str, data_type: DataType) -> PbColumnCatalog {
+        PbColumnCatalog {
+            column_desc: Some(PbColumnDesc {
+                name: name.to_owned(),
+                column_type: Some(data_type.to_protobuf()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A List fragment and its dedicated Fetch fragment, with the List referencing `reference`.
+    fn update_graph(reference: u32) -> StreamFragmentGraphProto {
+        let list = StreamNode {
+            node_body: Some(NodeBody::Source(Box::new(SourceNode {
+                source_inner: Some(StreamSource {
+                    state_table: Some(PbTable {
+                        id: LIST_TABLE.into(),
+                        columns: vec![column("state", DataType::Jsonb)],
+                        value_indices: vec![0],
+                        ..Default::default()
+                    }),
+                    iceberg_fetch_state_table: Some(StorageTableDesc {
+                        table_id: reference.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))),
+            ..Default::default()
+        };
+        let exchange = StreamNode {
+            node_body: Some(NodeBody::Exchange(Box::new(ExchangeNode {
+                strategy: Some(DispatchStrategy {
+                    r#type: DispatcherType::Hash as i32,
+                    dist_key_indices: vec![0],
+                    output_mapping: PbDispatchOutputMapping::simple(vec![0, 1]).into(),
+                }),
+            }))),
+            ..Default::default()
+        };
+        let fetch = StreamNode {
+            node_body: Some(NodeBody::StreamFsFetch(Box::new(StreamFsFetchNode {
+                node_inner: Some(StreamFsFetch {
+                    state_table: Some(PbTable {
+                        id: FETCH_TABLE.into(),
+                        columns: vec![
+                            column("task", DataType::Varchar),
+                            column("state", DataType::Jsonb),
+                        ],
+                        pk: vec![PbColumnOrder {
+                            column_index: 0,
+                            order_type: Some(OrderType::ascending().to_protobuf()),
+                        }],
+                        distribution_key: vec![0],
+                        stream_key: vec![0],
+                        value_indices: vec![0, 1],
+                        read_prefix_len_hint: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))),
+            input: vec![exchange],
+            ..Default::default()
+        };
+        StreamFragmentGraphProto {
+            fragments: HashMap::from([
+                (
+                    1.into(),
+                    StreamFragment {
+                        fragment_id: 1.into(),
+                        node: Some(list),
+                        fragment_type_mask: FragmentTypeFlag::Source as u32,
+                        requires_singleton: true,
+                    },
+                ),
+                (
+                    0.into(),
+                    StreamFragment {
+                        fragment_id: 0.into(),
+                        node: Some(fetch),
+                        fragment_type_mask: FragmentTypeFlag::FsFetch as u32,
+                        requires_singleton: false,
+                    },
+                ),
+            ]),
+            edges: vec![StreamFragmentEdgeProto {
+                dispatch_strategy: Some(DispatchStrategy {
+                    r#type: DispatcherType::Hash as i32,
+                    dist_key_indices: vec![0],
+                    output_mapping: PbDispatchOutputMapping::simple(vec![0, 1]).into(),
+                }),
+                link_id: 1,
+                upstream_id: 1.into(),
+                downstream_id: 0.into(),
+            }],
+            ctx: Some(PbStreamContext::default()),
+            table_ids_cnt: 2,
+            max_parallelism: VirtualNode::COUNT_FOR_TEST as _,
+            ..Default::default()
+        }
+    }
+
+    fn job() -> StreamingJob {
+        StreamingJob::Table(
+            None,
+            PbTable {
+                id: 888.into(),
+                ..Default::default()
+            },
+            TableJobType::General,
+        )
+    }
+
+    fn fetch_table_and_reference(builder: &ActorGraphBuilder) -> (PbTable, StorageTableDesc) {
+        let mut fetch = None;
+        let mut reference = None;
+        for fragment in builder.fragment_graph.building_fragments().values() {
+            visit_fragment(fragment, |body| match body {
+                NodeBody::StreamFsFetch(node) => {
+                    fetch = node.node_inner.as_ref().unwrap().state_table.clone();
+                }
+                NodeBody::Source(node) => {
+                    reference = node
+                        .source_inner
+                        .as_ref()
+                        .unwrap()
+                        .iceberg_fetch_state_table
+                        .clone();
+                }
+                _ => {}
+            });
+        }
+        (fetch.unwrap(), reference.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_completion_table_is_filled_from_fetch_table() -> MetaResult<()> {
+        let env = MetaSrvEnv::for_test().await;
+        let mut fragment_graph = StreamFragmentGraph::new(&env, update_graph(FETCH_TABLE), &job())?;
+        // Mimic catalog creation assigning new IDs; the reference must follow the Fetch table.
+        let table_id_map: HashMap<_, _> = fragment_graph
+            .incomplete_internal_tables()
+            .into_keys()
+            .map(|id| (id, (id.as_raw_id() + 1000).into()))
+            .collect();
+        fragment_graph.refill_internal_table_ids(table_id_map);
+
+        let builder =
+            ActorGraphBuilder::new(CompleteStreamFragmentGraph::for_test(fragment_graph))?;
+        let (fetch, reference) = fetch_table_and_reference(&builder);
+        assert_eq!(reference.table_id, fetch.id);
+        assert_eq!(
+            reference,
+            TableDesc::from_pb_table(&fetch).try_to_protobuf()?
+        );
+        assert_eq!(reference.columns.len(), 2);
+        assert_eq!(reference.pk, fetch.pk);
+        assert_eq!(reference.dist_key_in_pk_indices, vec![0]);
+        assert_eq!(reference.value_indices, vec![0, 1]);
+        assert_eq!(reference.stream_key, vec![0]);
+        assert_eq!(reference.read_prefix_len_hint, 1);
+        assert_eq!(reference.vnode_count(), VirtualNode::COUNT_FOR_TEST);
+        assert_eq!(reference.maybe_vnode_count, fetch.maybe_vnode_count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_completion_table_must_reference_fetch_table() -> MetaResult<()> {
+        let env = MetaSrvEnv::for_test().await;
+        let error = StreamFragmentGraph::new(&env, update_graph(LIST_TABLE), &job())
+            .expect_err("reference must resolve to a Fetch state table");
+        assert!(error.to_string().contains("Fetch state table"), "{error}");
+
+        // Also rejected when the graph reaches the actor builder with a dangling reference.
+        let mut fragment_graph = StreamFragmentGraph::new(&env, update_graph(FETCH_TABLE), &job())?;
+        for fragment in fragment_graph.fragments.values_mut() {
+            visit_iceberg_completion_tables(fragment, |desc| desc.table_id = 4242.into());
+        }
+        let error = ActorGraphBuilder::new(CompleteStreamFragmentGraph::for_test(fragment_graph))
+            .expect_err("dangling reference must be rejected");
+        assert!(error.to_string().contains("Fetch state table"), "{error}");
         Ok(())
     }
 }
